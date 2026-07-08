@@ -168,7 +168,17 @@ function Composer() {
   }, [reportMode]);
 
   useEffect(() => {
-    const handler = () => setReportMode(false);
+    const handler = () => {
+      setReportMode(false);
+      // Also clear the window global DIRECTLY. setReportMode(false) is a no-op
+      // when reportMode is already false — which is exactly the case for report
+      // flows that set window.__chatMode from page.tsx (template generate,
+      // adhoc report) without flipping this component's state. In that case the
+      // reportMode effect below never re-runs, so the global would stay stuck at
+      // "report" and the NEXT (normal) turn would wrongly render as a report.
+      // Clearing here guarantees the reset regardless of React state.
+      if (typeof window !== "undefined") window.__chatMode = null;
+    };
     window.addEventListener("chat-stream-done", handler);
     return () => window.removeEventListener("chat-stream-done", handler);
   }, []);
