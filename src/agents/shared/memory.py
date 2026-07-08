@@ -92,6 +92,9 @@ def load_history(
                 text = re.sub(
                     r"\n?<session-title>.*?</session-title>", "", text, flags=re.DOTALL
                 )
+                # Frontend-only report-mode marker on user turns — the model
+                # must never see it (it's not content, just a UI badge signal).
+                text = re.sub(r"\n?<report-request/>", "", text)
                 text = text.strip()
                 if not text:
                     continue
@@ -114,18 +117,28 @@ def save_user_message(
     actor_id: str,
     prompt: str,
     region: str = "us-east-1",
+    is_report: bool = False,
 ) -> None:
-    """Save user message to Memory immediately (before streaming starts)."""
+    """Save user message to Memory immediately (before streaming starts).
+
+    When ``is_report`` is True, a ``<report-request/>`` sentinel is appended to
+    the saved text. It is a FRONTEND-ONLY marker (like ``<artifact>`` etc.):
+    ``load_history`` strips it before the model ever sees it, and the browser
+    REST path (core-api ``_get_session_history``) turns it into an ``is_report``
+    flag it strips from the content, so the UI can badge the user's prompt
+    bubble as a report request — and that badge survives a reload.
+    """
     if not memory_id or not session_id or not actor_id:
         return
     try:
+        text = prompt + "\n<report-request/>" if is_report else prompt
         client = _get_client(region)
         client.create_event(
             memoryId=memory_id,
             actorId=actor_id,
             sessionId=session_id,
             eventTimestamp=datetime.now(timezone.utc),
-            payload=[{"conversational": {"content": {"text": prompt}, "role": "USER"}}],
+            payload=[{"conversational": {"content": {"text": text}, "role": "USER"}}],
         )
     except Exception as exc:
         logger.warning("Failed to save user message: %s", exc)

@@ -236,6 +236,21 @@ variable "guardrail_mode" {
   }
 }
 
+variable "redact_identifiers" {
+  description = <<-EOT
+    Redact AWS IDENTIFIERS — bare 12-digit account IDs and IAM/resource ARNs —
+    from PERSISTED output (AgentCore Memory + saved reports). Default false:
+    this platform's reports and findings are ABOUT the user's own resources
+    (e.g. "Top accounts by spend", "which role is over-permissioned",
+    tag-governance breakdowns), so blanking account IDs and ARNs makes that
+    data meaningless. Set true for deployments that persist/share transcripts
+    and want identifiers scrubbed too. Genuine SECRETS — access keys, external
+    IDs, and role-session names — are ALWAYS redacted regardless of this flag.
+  EOT
+  type        = bool
+  default     = false
+}
+
 variable "log_retention_days" {
   description = <<-EOT
     CloudWatch Logs retention (days) applied to all platform log groups:

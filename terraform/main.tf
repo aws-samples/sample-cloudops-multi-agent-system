@@ -253,6 +253,7 @@ module "agentcore_runtime" {
   bedrock_guardrail_id       = module.guardrail.guardrail_id
   bedrock_guardrail_version  = module.guardrail.guardrail_version
   guardrail_mode             = var.guardrail_mode
+  redact_identifiers         = var.redact_identifiers
   kms_key_arn                = module.kms.key_arn
 }
 

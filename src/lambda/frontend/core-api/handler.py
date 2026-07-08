@@ -44,6 +44,10 @@ _ddb_client = None
 _SESSION_TITLE_RE = re.compile(
     r"\n?<session-title>.*?</session-title>", re.DOTALL
 )
+# Frontend-only marker appended to a user turn saved in report mode. We strip
+# it from the content and surface it as an ``is_report`` flag so the UI can
+# badge the prompt bubble (persists across reload). See memory.save_user_message.
+_REPORT_REQUEST_RE = re.compile(r"\n?<report-request/>")
 
 
 def _get_memory_client():
@@ -228,6 +232,9 @@ def _list_sessions(actor_id: str) -> dict:
                             conv = item.get("conversational", {})
                             if conv.get("role") == "USER":
                                 text = conv.get("content", {}).get("text", "")
+                                # Strip the frontend-only report-mode marker so
+                                # it never shows up in the sidebar preview.
+                                text = _REPORT_REQUEST_RE.sub("", text).strip()
                                 preview = text[:50] + (
                                     "..." if len(text) > 50 else ""
                                 )
@@ -325,6 +332,13 @@ def _get_session_history(session_id: str, actor_id: str) -> dict:
                     else str(content)
                 )
                 role = "assistant" if conv.get("role") == "ASSISTANT" else "user"
+                # Report-request badge marker lives on user turns. Detect +
+                # strip before any downstream parsing so it never reaches the
+                # content the UI renders.
+                is_report = False
+                if role == "user" and "<report-request/>" in text:
+                    is_report = True
+                    text = _REPORT_REQUEST_RE.sub("", text)
                 try:
                     parsed = json.loads(text)
                     if isinstance(parsed, dict) and "message" in parsed:
@@ -367,6 +381,8 @@ def _get_session_history(session_id: str, actor_id: str) -> dict:
                         msg = {"role": role, "content": text}
                         if tool_invocations:
                             msg["tool_invocations"] = tool_invocations
+                        if is_report:
+                            msg["is_report"] = True
                         messages.append(msg)
                         continue
                 except (json.JSONDecodeError, TypeError):
@@ -375,7 +391,10 @@ def _get_session_history(session_id: str, actor_id: str) -> dict:
                     text = _SESSION_TITLE_RE.sub("", text).strip()
                 if not text.strip():
                     continue
-                messages.append({"role": role, "content": text})
+                msg = {"role": role, "content": text}
+                if is_report:
+                    msg["is_report"] = True
+                messages.append(msg)
         return _response(200, {"messages": messages})
     except Exception as exc:
         return _response(500, {"error": str(exc)})

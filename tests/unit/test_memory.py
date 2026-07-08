@@ -160,6 +160,32 @@ class TestLoadHistory:
         assert "<report-body>" in msgs[0]["content"][0]["text"]
 
     @patch("agents.shared.memory._get_client")
+    def test_strips_report_request_marker(self, mock_get):
+        # The frontend-only report-mode marker on a USER turn must never reach
+        # the model — load_history strips it (like <artifact>/<suggestions>).
+        client = MagicMock()
+        client.list_events.return_value = {
+            "events": [
+                {
+                    "payload": [
+                        {
+                            "conversational": {
+                                "role": "USER",
+                                "content": {"text": "What are my costs?\n<report-request/>"},
+                            }
+                        }
+                    ]
+                }
+            ]
+        }
+        mock_get.return_value = client
+        msgs = load_history("mem", "sess", "actor")
+        assert len(msgs) == 1
+        text = msgs[0]["content"][0]["text"]
+        assert "<report-request/>" not in text
+        assert text == "What are my costs?"
+
+    @patch("agents.shared.memory._get_client")
     def test_returns_empty_on_not_found(self, mock_get):
         client = MagicMock()
         client.list_events.side_effect = Exception("Session not found")
@@ -182,6 +208,23 @@ class TestSaveUserMessage:
     def test_skips_when_no_memory_id(self):
         # Should not raise
         save_user_message("", "sess", "actor", "hello")
+
+    @patch("agents.shared.memory._get_client")
+    def test_no_report_marker_by_default(self, mock_get):
+        client = MagicMock()
+        mock_get.return_value = client
+        save_user_message("mem", "sess", "actor", "hello")
+        saved = client.create_event.call_args[1]["payload"][0]["conversational"]["content"]["text"]
+        assert saved == "hello"
+        assert "<report-request/>" not in saved
+
+    @patch("agents.shared.memory._get_client")
+    def test_appends_report_marker_when_is_report(self, mock_get):
+        client = MagicMock()
+        mock_get.return_value = client
+        save_user_message("mem", "sess", "actor", "hello", is_report=True)
+        saved = client.create_event.call_args[1]["payload"][0]["conversational"]["content"]["text"]
+        assert saved == "hello\n<report-request/>"
 
 
 class TestSaveAssistantMessage:

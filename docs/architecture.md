@@ -25,7 +25,7 @@ src/agents/
     memory.py                # Manual memory management (create_event/list_events)
     suggestions.py           # Follow-up question generation
     reports.py               # Report generation engine (parallel sections, dependencies)
-    redact.py                # Output redaction (account IDs, ARNs, keys) before persistence
+    redact.py                # Output redaction (secrets: keys/external-ids/sessions) before persistence
     tracing.py               # TracingCallbackHandler
     registry.py              # Agent registry + @tool delegation wrappers
     gateway.py               # SigV4 MCP gateway client

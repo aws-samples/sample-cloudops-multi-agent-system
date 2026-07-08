@@ -178,6 +178,10 @@ export default function Home() {
         // Three-way mutual exclusion — only one right-panel mode at a time.
         setActiveTraceMessageId(null);
         setActiveVisualizerMessageId(null);
+        // Open reports in split view by default; the user opts into full-width
+        // via the panel's expand toggle. Reset any lingering collapse from a
+        // prior full-width report/visualizer session.
+        setChatCollapsed(false);
       }
     };
     window.addEventListener("open-artifact", handler);
@@ -192,6 +196,9 @@ export default function Home() {
         setActiveTraceMessageId(detail.messageId);
         setActiveArtifactMessageId(null);
         setActiveVisualizerMessageId(null);
+        // Trace panel has no full-width mode — make sure a prior report/viz
+        // full-width session doesn't leave the chat collapsed behind it.
+        setChatCollapsed(false);
       }
     };
     window.addEventListener("open-trace", handler);
@@ -510,6 +517,19 @@ export default function Home() {
             }
           }
 
+          // User turn sent in report mode → carry a hidden marker part so the
+          // UserMessage renderer can badge the bubble (survives reload). The
+          // renderer filters this part out of the visible text.
+          if (m.role === "user" && m.is_report) {
+            return {
+              role: "user" as const,
+              content: [
+                { type: "text" as const, text: mainContent },
+                { type: "text" as const, text: "<report-request/>" },
+              ],
+            };
+          }
+
           const extraParts = [
             ...(artifactPart ? [artifactPart] : []),
             ...(suggestionsPart ? [suggestionsPart] : []),
@@ -727,9 +747,14 @@ export default function Home() {
         <ReportPanel
           messageId={activeArtifactMessageId}
           reportId={activeArtifactReportId || undefined}
+          fullBleed={chatCollapsed}
+          onToggleFullBleed={() => setChatCollapsed((v) => !v)}
           onClose={() => {
             setActiveArtifactMessageId(null);
             setActiveArtifactReportId(null);
+            // Restore the chat when the report closes so we never leave the
+            // user on a collapsed-chat layout with no panel.
+            setChatCollapsed(false);
           }}
         />
       )}
