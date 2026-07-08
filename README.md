@@ -189,6 +189,17 @@ make destroy        # Tear down infrastructure
 make destroy-all    # Nuclear: infra + ECR + memory + state backend
 ```
 
+> **Local dev & the Cognito allow-list.** `make run-local` temporarily adds
+> `http://localhost:3000/` to the Cognito app client's callback/logout URLs on
+> start and removes it on a clean exit (see `scripts/run-local.sh`). If the
+> process is terminated uncleanly (SIGKILL, closed terminal, crash), that
+> localhost entry can linger in the allow-list. It's harmless to the deployed
+> site — production auth uses the CloudFront callback, not localhost — but it's
+> good hygiene to keep a `localhost` redirect out of a long-lived app client.
+> Remove a stale entry by re-running `make run-local` and exiting it cleanly
+> (Ctrl-C), or delete it from the Cognito console. Never commit `localhost` as a
+> permanent Terraform-managed callback URL.
+
 ---
 
 ## Deployment options

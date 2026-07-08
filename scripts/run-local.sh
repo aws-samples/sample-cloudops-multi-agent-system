@@ -16,6 +16,13 @@ TERRAFORM_DIR="$PROJECT_ROOT/terraform"
 FRONTEND_DIR="$PROJECT_ROOT/src/frontend"
 LOCALHOST_URL="http://localhost:3000/"
 
+# Absolute path to the venv Python. MUST be absolute: this script cd's into
+# $FRONTEND_DIR before launching `next dev`, so the Cognito-cleanup trap runs
+# with cwd=src/frontend. A relative ".venv/bin/python" would fail there with
+# "No such file or directory", silently skipping the localhost allow-list
+# removal and leaving a stale localhost callback in the app client on exit.
+PYTHON="$PROJECT_ROOT/.venv/bin/python"
+
 # Source .env for AWS_PROFILE, AWS_REGION, PROJECT_PREFIX, etc.
 if [ -f "$PROJECT_ROOT/.env" ]; then
   set -a
@@ -84,7 +91,7 @@ _list_contains() {
   # here-string silently replaces the heredoc script) and Python would try
   # to run the JSON as source, failing on `true`/`false` literals.
   local needle="$1" haystack_json="$2"
-  .venv/bin/python - "$needle" "$haystack_json" <<'PY'
+  "$PYTHON" - "$needle" "$haystack_json" <<'PY'
 import json, sys
 needle = sys.argv[1]
 try:
@@ -104,7 +111,7 @@ _update_cognito_urls() {
   # client's config by posting a minimal update. Pass the Cognito
   # describe-client response as argv[7] — two stdin redirects collide and
   # Python would try to run the JSON as source.
-  .venv/bin/python - "$COGNITO_USER_POOL_ID" "$COGNITO_APP_CLIENT_ID" \
+  "$PYTHON" - "$COGNITO_USER_POOL_ID" "$COGNITO_APP_CLIENT_ID" \
     "$AWS_REGION" "${AWS_PROFILE:-default}" \
     "$callbacks_json" "$logouts_json" "$current" <<'PY'
 import json, subprocess, sys
@@ -144,12 +151,12 @@ _cognito_whitelist_add() {
   local json
   json=$(_get_cognito_client_json)
   local current_cb current_lo
-  current_cb=$(.venv/bin/python -c "import json,sys; d=json.load(sys.stdin).get('UserPoolClient',{}); print(json.dumps(d.get('CallbackURLs',[])))" <<<"$json")
-  current_lo=$(.venv/bin/python -c "import json,sys; d=json.load(sys.stdin).get('UserPoolClient',{}); print(json.dumps(d.get('LogoutURLs',[])))" <<<"$json")
+  current_cb=$("$PYTHON" -c "import json,sys; d=json.load(sys.stdin).get('UserPoolClient',{}); print(json.dumps(d.get('CallbackURLs',[])))" <<<"$json")
+  current_lo=$("$PYTHON" -c "import json,sys; d=json.load(sys.stdin).get('UserPoolClient',{}); print(json.dumps(d.get('LogoutURLs',[])))" <<<"$json")
 
   local new_cb new_lo
-  new_cb=$(.venv/bin/python -c "import json,sys; u='$LOCALHOST_URL'; lst=json.loads(sys.stdin.read()); print(json.dumps(lst if u in lst else lst+[u]))" <<<"$current_cb")
-  new_lo=$(.venv/bin/python -c "import json,sys; u='$LOCALHOST_URL'; lst=json.loads(sys.stdin.read()); print(json.dumps(lst if u in lst else lst+[u]))" <<<"$current_lo")
+  new_cb=$("$PYTHON" -c "import json,sys; u='$LOCALHOST_URL'; lst=json.loads(sys.stdin.read()); print(json.dumps(lst if u in lst else lst+[u]))" <<<"$current_cb")
+  new_lo=$("$PYTHON" -c "import json,sys; u='$LOCALHOST_URL'; lst=json.loads(sys.stdin.read()); print(json.dumps(lst if u in lst else lst+[u]))" <<<"$current_lo")
 
   if [ "$new_cb" != "$current_cb" ]; then WE_ADDED_CALLBACK=1; fi
   if [ "$new_lo" != "$current_lo" ]; then WE_ADDED_LOGOUT=1; fi
@@ -175,15 +182,15 @@ _cognito_whitelist_remove() {
   local json
   json=$(_get_cognito_client_json)
   local current_cb current_lo new_cb new_lo
-  current_cb=$(.venv/bin/python -c "import json,sys; d=json.load(sys.stdin).get('UserPoolClient',{}); print(json.dumps(d.get('CallbackURLs',[])))" <<<"$json")
-  current_lo=$(.venv/bin/python -c "import json,sys; d=json.load(sys.stdin).get('UserPoolClient',{}); print(json.dumps(d.get('LogoutURLs',[])))" <<<"$json")
+  current_cb=$("$PYTHON" -c "import json,sys; d=json.load(sys.stdin).get('UserPoolClient',{}); print(json.dumps(d.get('CallbackURLs',[])))" <<<"$json")
+  current_lo=$("$PYTHON" -c "import json,sys; d=json.load(sys.stdin).get('UserPoolClient',{}); print(json.dumps(d.get('LogoutURLs',[])))" <<<"$json")
   if [ "$WE_ADDED_CALLBACK" = 1 ]; then
-    new_cb=$(.venv/bin/python -c "import json,sys; u='$LOCALHOST_URL'; print(json.dumps([x for x in json.loads(sys.stdin.read()) if x!=u]))" <<<"$current_cb")
+    new_cb=$("$PYTHON" -c "import json,sys; u='$LOCALHOST_URL'; print(json.dumps([x for x in json.loads(sys.stdin.read()) if x!=u]))" <<<"$current_cb")
   else
     new_cb="$current_cb"
   fi
   if [ "$WE_ADDED_LOGOUT" = 1 ]; then
-    new_lo=$(.venv/bin/python -c "import json,sys; u='$LOCALHOST_URL'; print(json.dumps([x for x in json.loads(sys.stdin.read()) if x!=u]))" <<<"$current_lo")
+    new_lo=$("$PYTHON" -c "import json,sys; u='$LOCALHOST_URL'; print(json.dumps([x for x in json.loads(sys.stdin.read()) if x!=u]))" <<<"$current_lo")
   else
     new_lo="$current_lo"
   fi
