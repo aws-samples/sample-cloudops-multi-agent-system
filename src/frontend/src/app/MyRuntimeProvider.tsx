@@ -40,6 +40,19 @@ const MyModelAdapter: ChatModelAdapter = {
     const reportTemplateId = (typeof window !== "undefined" && window.__reportTemplateId) || null;
     if (typeof window !== "undefined") window.__reportTemplateId = null;
 
+    // Fire the end-of-turn signal exactly once, no matter how this generator
+    // exits (normal finish, HTTP error, stream read failure, backend error
+    // event, or abort). Listeners use it to reset one-shot composer state —
+    // report mode and edit target. If ANY exit path skips it, that state stays
+    // stuck and the NEXT normal turn wrongly renders as a report. Idempotent so
+    // it's safe to call from a finally AND leave existing explicit calls in.
+    let streamDoneFired = false;
+    const streamDone = () => {
+      if (streamDoneFired) return;
+      streamDoneFired = true;
+      if (typeof window !== "undefined") window.dispatchEvent(new Event("chat-stream-done"));
+    };
+
     // Show thinking indicator immediately. The "Generating report…" artifact
     // card is no longer pre-emitted — we wait for the backend's first signal
     // (<report-pending> for templated, <report-body>/artifact_meta for
@@ -94,7 +107,9 @@ const MyModelAdapter: ChatModelAdapter = {
     });
 
     if (!res.ok) {
-      yield { content: [{ type: "text" as const, text: `Error: ${await res.text()}` }] };
+      const errText = await res.text();
+      streamDone();
+      yield { content: [{ type: "text" as const, text: `Error: ${errText}` }] };
       return;
     }
 
@@ -104,6 +119,8 @@ const MyModelAdapter: ChatModelAdapter = {
         detail: { sessionId, prompt },
       }));
     }
+
+    try {
 
     const reader = res.body!.getReader();
     const decoder = new TextDecoder();
@@ -308,7 +325,7 @@ const MyModelAdapter: ChatModelAdapter = {
               }
             }
             yield { content: buildContent(segments, false, isReportMode) };
-            if (typeof window !== "undefined") window.dispatchEvent(new Event("chat-stream-done"));
+            streamDone();
             return;
           }
 
@@ -383,7 +400,13 @@ const MyModelAdapter: ChatModelAdapter = {
     yield { content: buildContent(segments, true, isReportMode) };
     yield { content: buildContent(segments, false, isReportMode) };
 
-    if (typeof window !== "undefined") window.dispatchEvent(new Event("chat-stream-done"));
+    } finally {
+      // Runs on every exit from the streaming block: normal finish, the
+      // RUN_FINISHED/error `return`s, a `reader.read()` throw, or generator
+      // abort (assistant-ui calls .return() on the iterator when the user
+      // stops or navigates). Guarantees one-shot composer state is reset.
+      streamDone();
+    }
   },
 };
 
