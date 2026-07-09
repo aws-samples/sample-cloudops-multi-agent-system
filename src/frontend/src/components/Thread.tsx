@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useCallback, useEffect, useRef } from "react";
+import { useState, useCallback, useEffect, useRef, useSyncExternalStore } from "react";
 import {
   ThreadPrimitive,
   ComposerPrimitive,
@@ -37,6 +37,7 @@ import { VisualizerCard } from "@/components/visualizer/VisualizerCard";
 import { ReportCard } from "@/components/ReportCard";
 import { useThreadBusyRemote } from "@/lib/thread-busy-context";
 import { useEditingReport } from "@/lib/editing-report-context";
+import { isReportModeMessage, subscribeReportModeMessages } from "@/lib/report-mode-messages";
 
 /* ── Suggestion cards for empty state ──
  * Each card launches one of the 4 pre-loaded report templates with no
@@ -456,8 +457,34 @@ function Composer() {
 /* ── User message — right-aligned bubble ── */
 
 function UserMessage() {
+  // Badge a report-mode prompt two ways:
+  //  1. LIVE (immediately on send): the adapter records this message id in the
+  //     report-mode store — covers templated, freeform, and edit turns.
+  //  2. RELOAD: history carries a hidden <report-request/> text part.
+  // Either source lights up the "Report mode" badge; the custom Text renderer
+  // below hides the marker from the visible bubble.
+  const messageId = useMessage((m) => m.id);
+  const liveReport = useSyncExternalStore(
+    subscribeReportModeMessages,
+    () => isReportModeMessage(messageId),
+    () => false,
+  );
+  const persistedReport = useMessage((m) =>
+    m.content.some((p) => p.type === "text" && p.text.trim() === "<report-request/>")
+  );
+  const isReport = liveReport || persistedReport;
   return (
-    <MessagePrimitive.Root className="animate-msg mx-auto max-w-2xl pt-6 pb-2 flex justify-end">
+    <MessagePrimitive.Root className="animate-msg mx-auto max-w-2xl pt-6 pb-2 flex flex-col items-end gap-1">
+      {isReport && (
+        <div
+          className="flex items-center gap-1 text-[11px] font-medium px-2 py-0.5 rounded-full"
+          style={{ color: "var(--accent-ai)", background: "var(--accent-surface)" }}
+          title="Sent in report mode"
+        >
+          <NotebookText className="h-3 w-3" />
+          Report mode
+        </div>
+      )}
       <div
         className="rounded-2xl px-4 py-2.5 max-w-[80%] text-sm"
         style={{
@@ -465,7 +492,13 @@ function UserMessage() {
           color: "var(--text-primary)",
         }}
       >
-        <MessagePrimitive.Content />
+        <MessagePrimitive.Content
+          components={{
+            // Hide the internal report-request marker part from the visible bubble.
+            Text: ({ text }) =>
+              text.trim() === "<report-request/>" ? null : <>{text}</>,
+          }}
+        />
       </div>
     </MessagePrimitive.Root>
   );

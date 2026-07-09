@@ -456,14 +456,30 @@ def _extract_variables(user_prompt: str) -> dict[str, str]:
     return variables
 
 
+# Appended to every freeform report section prompt so the model always opens
+# with a single descriptive H1 title line. The leading heading is then lifted
+# into the report title (see the freeform title-derivation block in
+# `_run_report_async`), guaranteeing the sidebar entry and ReportCard get a
+# clean, report-specific name instead of falling back to the raw user prompt.
+# No curly braces — this string is passed through `str.format_map` in reports.py.
+_FREEFORM_TITLE_INSTRUCTION = (
+    "\n\nBegin the report with a single Markdown H1 title line "
+    "(a leading '# ' followed by a concise, descriptive title of the report's "
+    "subject) before any other content. Do not prefix it with 'Report:' or "
+    "restate the request verbatim — write the title as a standalone headline."
+)
+
+
 def _build_freeform_template(user_prompt: str) -> dict:
     """Build a synthetic single-section template from a user's free-form prompt.
 
     Free-form report mode (composer toggle, no template picker) reuses the
     templated report flow so persistence / reload / edit / `get_report`
-    behave uniformly. The user's prompt becomes the section's prompt
-    verbatim; the report title is derived from the first line of the prompt
-    so the sidebar entry and ReportCard show something readable.
+    behave uniformly. The user's prompt becomes the section's prompt (with a
+    title-heading instruction appended, see ``_FREEFORM_TITLE_INSTRUCTION``);
+    the report title is seeded from the first line of the prompt and then
+    upgraded to the report's own leading Markdown heading once generated (so
+    the sidebar entry and ReportCard show a clean, report-specific name).
     """
     first_line = user_prompt.strip().splitlines()[0] if user_prompt.strip() else ""
     title_seed = re.sub(r"\s+", " ", first_line).rstrip(".!?,").strip()
@@ -477,7 +493,7 @@ def _build_freeform_template(user_prompt: str) -> dict:
             {
                 "id": "report",
                 "title": "Analysis",
-                "prompt": user_prompt,
+                "prompt": user_prompt + _FREEFORM_TITLE_INSTRUCTION,
             }
         ],
         "dependencies": {},
@@ -567,8 +583,11 @@ def _handle_report_streaming(
 
     # Save the user message now — before the background thread runs, so the
     # chat transcript reflects what was asked even if generation fails later.
+    # Tag it as a report request so the UI can badge the prompt bubble (and
+    # the badge survives reload). Covers templated AND freeform reports —
+    # freeform routes through this same handler with template_id="freeform".
     if memory_enabled:
-        save_user_message(memory_id, session_id, actor_id, user_prompt, region)
+        save_user_message(memory_id, session_id, actor_id, user_prompt, region, is_report=True)
         # Persist a tiny kickoff marker for the assistant turn. This is the
         # durability anchor — on history reload, Thread.tsx sees the
         # <report-pending> tag and renders a polling ReportCard. While the
@@ -895,6 +914,29 @@ def _run_report_async(
         report_record["status"] = final_status
         report_record["current_section"] = len(section_results)
         report_record["updated_at"] = datetime.now(timezone.utc).isoformat()
+
+        # Freeform reports are titled from the user's raw prompt by default
+        # (see _build_freeform_template), which reads awkwardly as a report
+        # title (e.g. "Can you generate a new report showing..."). If the
+        # generated content leads with a Markdown H1, prefer that as the title
+        # — it's the report's own headline (e.g. "Total AWS Spend — Last 6
+        # Months"), matching what ReportPanel shows in the body. Only applied
+        # to the freeform single-section template so multi-section templated
+        # reports keep their canonical "<name> - <month> <year>" titles.
+        if template.get("description") == "User-generated free-form report":
+            for r in section_results:
+                content = (r or {}).get("content", "")
+                if content and r.get("status") == "complete":
+                    # Use the report's leading Markdown heading (H1 or H2 — the
+                    # model commonly opens with "## <Report Title>") as the
+                    # title. Strip trailing "#" and surrounding whitespace.
+                    m = re.search(r"^#{1,3}\s+(.+?)\s*#*\s*$", content, flags=re.MULTILINE)
+                    if m:
+                        heading = m.group(1).strip()
+                        if heading:
+                            report_record["title"] = heading[:120]
+                    break
+
         reports.save_report(report_record, report_table, region)
 
         # Note: we deliberately do NOT duplicate the full enriched report
@@ -981,7 +1023,7 @@ def _handle_report_edit(
     report_id = edit_record["report_id"]
 
     if memory_enabled:
-        save_user_message(memory_id, session_id, actor_id, user_prompt, region)
+        save_user_message(memory_id, session_id, actor_id, user_prompt, region, is_report=True)
         # Same kickoff-marker pattern as the create path. See
         # _handle_report_streaming for rationale on <report-pending>.
         edit_title_full = (

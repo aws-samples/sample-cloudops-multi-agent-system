@@ -221,6 +221,7 @@ resource "aws_bedrockagentcore_agent_runtime" "this" {
       AWS_REGION                 = data.aws_region.current.region
       AWS_DEFAULT_REGION         = data.aws_region.current.region
       REPORT_TABLE_NAME          = var.report_table_name
+      REDACT_IDENTIFIERS         = var.redact_identifiers ? "true" : "false"
     },
     var.bedrock_model_id != "" ? { BEDROCK_MODEL_ID = var.bedrock_model_id } : {},
     var.bedrock_guardrail_id != "" ? {

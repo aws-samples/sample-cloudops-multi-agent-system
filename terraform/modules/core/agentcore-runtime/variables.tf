@@ -138,3 +138,9 @@ variable "guardrail_mode" {
     error_message = "guardrail_mode must be 'block' or 'detect'."
   }
 }
+
+variable "redact_identifiers" {
+  description = "Redact AWS identifiers — bare 12-digit account IDs and IAM/resource ARNs — from persisted output (memory + reports). Default false: this platform's reports are about the user's own resources, so blanking account IDs and ARNs makes 'top accounts by spend', over-permissioned-role findings, etc. meaningless. Access keys, external IDs, and role-session names are always redacted regardless."
+  type        = bool
+  default     = false
+}

@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useMemo, useEffect, useRef, useCallback } from "react";
-import { X, NotebookText, ChevronDown, ChevronRight, Loader2, Wrench, Download, Image as ImageIcon, FileText, FileCode, FileType, Copy, Check } from "lucide-react";
+import { X, NotebookText, ChevronDown, ChevronRight, Loader2, Wrench, Download, Image as ImageIcon, FileText, FileCode, FileType, Copy, Check, Maximize2, Minimize2 } from "lucide-react";
 import { LoaderPinwheelIcon, type LoaderPinwheelIconHandle } from "@/components/ui/loader-pinwheel";
 import { useThreadRuntime } from "@assistant-ui/react";
 import { MarkdownText } from "@/components/MarkdownRenderer";
@@ -25,6 +25,12 @@ interface ReportPanelProps {
    */
   reportId?: string;
   onClose: () => void;
+  /** When true, the panel fills the row (chat collapsed) and the body is
+   *  rendered in a centered, capped-width "reading mode". Default (false) is
+   *  the resizable slideout that sits beside the chat — unchanged behavior. */
+  fullBleed?: boolean;
+  /** Toggle between slideout (split) and full-width reading mode. */
+  onToggleFullBleed?: () => void;
 }
 
 const REPORT_BODY_RE = /^<report-body>([\s\S]*)<\/report-body>$/;
@@ -264,7 +270,7 @@ const MIN_WIDTH = 360;
 const MAX_WIDTH_RATIO = 0.6;
 const DEFAULT_WIDTH = 480;
 
-export function ReportPanel({ messageId, reportId, onClose }: ReportPanelProps) {
+export function ReportPanel({ messageId, reportId, onClose, fullBleed = false, onToggleFullBleed }: ReportPanelProps) {
   const threadRuntime = useThreadRuntime();
   const scrollRef = useRef<HTMLDivElement>(null);
   const contentRef = useRef<HTMLDivElement>(null);
@@ -448,15 +454,27 @@ export function ReportPanel({ messageId, reportId, onClose }: ReportPanelProps) 
   return (
     <div
       ref={panelRef}
-      className="flex-shrink-0 flex flex-col relative"
-      style={{ width: panelWidth, background: "var(--bg-secondary)", borderLeft: "1px solid var(--border-subtle)" }}
+      className="flex flex-col relative"
+      style={{
+        // Full-bleed reading mode: ignore the user-resized fixed width and let
+        // flex stretch us across the row (chat is collapsed by the parent).
+        // Regular mode keeps the fixed, resizable width beside the chat.
+        ...(fullBleed
+          ? { flex: "1 1 0%", minWidth: 0, width: "auto" }
+          : { flex: "0 0 auto", width: panelWidth }),
+        background: "var(--bg-secondary)",
+        borderLeft: "1px solid var(--border-subtle)",
+      }}
     >
-      {/* Resize handle */}
-      <div
-        className={`resize-handle absolute left-0 top-0 bottom-0 z-10${isDragging ? " dragging" : ""}`}
-        style={{ width: 6 }}
-        onMouseDown={handleMouseDown}
-      />
+      {/* Resize handle — hidden in full-bleed (dragging a flex-filled panel is
+           meaningless). */}
+      {!fullBleed && (
+        <div
+          className={`resize-handle absolute left-0 top-0 bottom-0 z-10${isDragging ? " dragging" : ""}`}
+          style={{ width: 6 }}
+          onMouseDown={handleMouseDown}
+        />
+      )}
       {/* Header */}
       <div
         className="flex items-center justify-between px-4 py-3"
@@ -547,6 +565,17 @@ export function ReportPanel({ messageId, reportId, onClose }: ReportPanelProps) 
               </button>
             </>
           )}
+          {onToggleFullBleed && (
+            <button
+              onClick={onToggleFullBleed}
+              className="p-1.5 rounded-lg transition-colors"
+              style={{ color: "var(--text-muted)" }}
+              aria-label={fullBleed ? "Exit full-width reading mode" : "Expand report to full width"}
+              title={fullBleed ? "Back to split view (show chat)" : "Full-width reading mode"}
+            >
+              {fullBleed ? <Minimize2 className="h-3.5 w-3.5" /> : <Maximize2 className="h-3.5 w-3.5" />}
+            </button>
+          )}
           <button
             onClick={onClose}
             className="p-1.5 rounded-lg transition-colors"
@@ -590,8 +619,15 @@ export function ReportPanel({ messageId, reportId, onClose }: ReportPanelProps) 
           <>
             {/* Collapsed thinking summary */}
             {(reasoning || tools.length > 0) && <ThinkingSection reasoning={reasoning} tools={tools} />}
-            {/* Full report rendered as HTML */}
-            <div ref={contentRef} className="px-5 py-4 text-sm leading-relaxed prose-finops" style={{ color: "var(--text-secondary)" }}>
+            {/* Full report rendered as HTML. In full-width reading mode, cap
+                the text to a comfortable centered measure with slightly larger
+                type — a full-viewport line length hurts readability. Split view
+                keeps the original compact styling unchanged. */}
+            <div
+              ref={contentRef}
+              className={`prose-finops ${fullBleed ? "mx-auto max-w-[820px] px-8 py-8 text-[15px] leading-7 reading-mode" : "px-5 py-4 text-sm leading-relaxed"}`}
+              style={{ color: "var(--text-secondary)" }}
+            >
               <MarkdownText text={reportBody} />
             </div>
           </>

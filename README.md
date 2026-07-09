@@ -448,6 +448,7 @@ This sample includes foundational security controls (SigV4 inter-agent auth, Cog
 | **Rate limiting** | Add per-user throttling at API Gateway (token bucket) and Bedrock inference quota management. |
 | **Audit logging** | Enable CloudTrail Data Events for DynamoDB and S3 to capture item-level access. Retain audit logs for 365 days minimum. |
 | **Incident response** | Develop IR playbooks for AI-specific incidents (prompt injection, memory poisoning, model abuse). |
+| **Output redaction** | Genuine secrets (access keys, external IDs, role-session names) are **always** scrubbed from persisted memory and saved reports. AWS **account IDs and ARNs are shown by default** — they are the substance of a cloud-ops report (e.g. "top accounts by spend", over-permissioned-role findings), so blanking them makes the output meaningless. If you persist or share transcripts and want identifiers scrubbed too, set `redact_identifiers = true` (Terraform variable, wired to the supervisor runtime as `REDACT_IDENTIFIERS`). |
 
 ---
 

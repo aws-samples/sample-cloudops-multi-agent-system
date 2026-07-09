@@ -285,6 +285,64 @@ input {
   font-variant-numeric: tabular-nums;
 }
 
+/* Zebra striping for readability on dense report tables. */
+.prose-finops tbody tr:nth-child(even) {
+  background: var(--bg-surface);
+}
+
+/* Blockquote / callout — used for "Key Takeaways", notes, warnings. */
+.prose-finops blockquote {
+  margin: 0.75em 0;
+  padding: 0.5em 0.9em;
+  border-left: 3px solid var(--accent);
+  background: var(--bg-surface);
+  border-radius: 0 6px 6px 0;
+  color: var(--text-secondary);
+}
+
+.prose-finops blockquote p:last-child {
+  margin-bottom: 0;
+}
+
+/* ── Reading mode (full-width report) ──
+   Larger, more spacious typography for comfortable long-form reading. Applied
+   only when the ReportPanel is in full-bleed mode (the `reading-mode` class is
+   added alongside `prose-finops`). Split-view styling is unchanged. */
+.prose-finops.reading-mode {
+  line-height: 1.75;
+}
+
+.prose-finops.reading-mode h1 {
+  font-size: 1.6em;
+  margin: 1.4em 0 0.5em;
+}
+
+.prose-finops.reading-mode h2 {
+  font-size: 1.3em;
+  margin: 1.5em 0 0.5em;
+  padding-bottom: 0.25em;
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.prose-finops.reading-mode h3 {
+  font-size: 1.1em;
+  margin: 1.3em 0 0.4em;
+}
+
+.prose-finops.reading-mode p,
+.prose-finops.reading-mode li {
+  margin-bottom: 0.8em;
+}
+
+.prose-finops.reading-mode table {
+  font-size: 0.95em;
+}
+
+/* First heading shouldn't push the report down with a big top margin. */
+.prose-finops.reading-mode > :first-child {
+  margin-top: 0;
+}
+
 /* ── Theme toggle ── */
 .theme-toggle {
   transition: border-color 0.15s ease;

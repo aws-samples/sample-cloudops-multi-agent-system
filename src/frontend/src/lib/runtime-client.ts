@@ -42,6 +42,10 @@ export interface Message {
     role: "user" | "assistant";
     content: string;
     tool_invocations?: Array<{ tool_name: string; parameters: Record<string, unknown>; result?: string }>;
+    /** True when this user turn was sent in report mode (templated, freeform,
+     *  or edit). Set by the core-api history endpoint from the persisted
+     *  <report-request/> marker so the prompt bubble can be badged on reload. */
+    is_report?: boolean;
 }
 
 export interface Template {

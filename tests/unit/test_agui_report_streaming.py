@@ -523,11 +523,29 @@ class TestBuildFreeformTemplate:
         assert len(tpl["sections"]) == 1
         section = tpl["sections"][0]
         assert section["id"] == "report"
-        # Section prompt is the user's prompt verbatim — the agent receives
-        # exactly what the user typed, no system-injected wrapper.
-        assert section["prompt"] == "show me the top 3 cost drivers"
+        # Section prompt leads with the user's prompt verbatim, then appends a
+        # title-heading instruction so the report always opens with an H1
+        # (which the freeform title-derivation block lifts into the title).
+        assert section["prompt"].startswith("show me the top 3 cost drivers")
+        assert "Markdown H1 title" in section["prompt"]
         # Dependencies map must exist (even empty) so build_dependency_graph works.
         assert tpl["dependencies"] == {}
+
+    def test_section_prompt_appends_title_instruction(self):
+        from agents.shared.agui_server import (
+            _FREEFORM_TITLE_INSTRUCTION,
+            _build_freeform_template,
+        )
+
+        tpl = _build_freeform_template("april spend")
+        prompt = tpl["sections"][0]["prompt"]
+        # The instruction is appended after the user's prompt.
+        assert prompt == "april spend" + _FREEFORM_TITLE_INSTRUCTION
+        assert prompt.endswith(_FREEFORM_TITLE_INSTRUCTION)
+        # No curly braces — reports.py runs str.format_map on the prompt, so a
+        # stray brace in the instruction would raise KeyError at generation.
+        assert "{" not in _FREEFORM_TITLE_INSTRUCTION
+        assert "}" not in _FREEFORM_TITLE_INSTRUCTION
 
     def test_title_derived_from_first_line(self):
         from agents.shared.agui_server import _build_freeform_template
@@ -553,7 +571,10 @@ class TestBuildFreeformTemplate:
 
         tpl = _build_freeform_template("")
         assert tpl["name"] == "Custom Report"
-        assert tpl["sections"][0]["prompt"] == ""
+        # Empty user prompt still carries the appended title instruction.
+        from agents.shared.agui_server import _FREEFORM_TITLE_INSTRUCTION
+
+        assert tpl["sections"][0]["prompt"] == _FREEFORM_TITLE_INSTRUCTION
 
     def test_trailing_punctuation_stripped(self):
         from agents.shared.agui_server import _build_freeform_template

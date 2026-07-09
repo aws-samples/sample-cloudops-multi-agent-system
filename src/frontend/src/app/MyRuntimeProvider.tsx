@@ -11,6 +11,7 @@ import { v4 as uuidv4 } from "uuid";
 import { isAuthenticated, isDevBypass, login, handleCallback, getToken, getActorId } from "@/lib/auth";
 import { extractVisualizerState, extractVisualizerStateFromMemory } from "@/lib/visualizer-state";
 import { EditingReportProvider } from "@/lib/editing-report-context";
+import { markReportModeMessage } from "@/lib/report-mode-messages";
 
 const MyModelAdapter: ChatModelAdapter = {
   async *run({ messages, abortSignal }) {
@@ -98,6 +99,16 @@ const MyModelAdapter: ChatModelAdapter = {
           (typeof window !== "undefined" && window.__editingReportId) || undefined,
       },
     };
+
+    // If this turn is a report request (templated, freeform, OR an edit),
+    // badge the user's bubble IMMEDIATELY — the persisted <report-request/>
+    // marker only comes back on reload. Mark by the live message id so
+    // UserMessage re-renders the "Report mode" badge right away.
+    const isReportTurn =
+      isReportMode ||
+      !!reportTemplateId ||
+      (typeof window !== "undefined" && !!window.__editingReportId);
+    if (isReportTurn) markReportModeMessage(lastUserMessage?.id);
 
     const res = await fetch(runtimeUrl, {
       method: "POST",
