@@ -1,4 +1,4 @@
-# CloudOps Multi-Agent Platform
+# CloudOps Multi-Agent system
 
 > **Important:** This project is intended for educational and demonstration
 > purposes only. It is not intended for use in production environments without
@@ -93,7 +93,7 @@ browser. All agent behaviour is defined in a single config file —
 `src/agents/hierarchy.json` — so adding or changing agents is a JSON
 edit, not a code change.
 
-For platform internals (memory, tool tracing, build hashing, gateway
+For system internals (memory, tool tracing, build hashing, gateway
 sync), see [docs/architecture.md](docs/architecture.md).
 
 ---
@@ -287,7 +287,7 @@ src/
   frontend/                     # Next.js static export SPA + visualiser / reports / tours
 
 terraform/
-  modules/core/                 # Platform modules (runtime, gateway, memory, cognito, etc.)
+  modules/core/                 # system modules (runtime, gateway, memory, cognito, etc.)
   modules/custom/               # Optional modules (health-events, network-resilience)
 
 scripts/
@@ -296,7 +296,7 @@ scripts/
   debug/                        # Log tailer, gateway fixer, CLI invoke, NR health check
 
 docs/
-  architecture.md               # Platform internals
+  architecture.md               # system internals
 skills/
   developer-guide/SKILL.md      # Adding agents / tools / collectors (interactive)
   agents/                       # Per-leaf-agent references (deploy modes, data model, gotchas)
@@ -368,7 +368,7 @@ See `.env.example` for the canonical identity-only `.env` template and
   commands, and high-signal gotchas. Start here when contributing.
 - [skills/developer-guide/SKILL.md](skills/developer-guide/SKILL.md) — how to add
   agents, Lambda tools, and data collectors (also invocable as `/developer-guide`).
-- [docs/architecture.md](docs/architecture.md) — platform internals:
+- [docs/architecture.md](docs/architecture.md) — system internals:
   memory, tool tracing, build hashing, frontend architecture,
   gateway schema sync.
 - [docs/agents/](docs/agents/README.md) — per-leaf-agent reference
@@ -393,11 +393,11 @@ See `.env.example` for the canonical identity-only `.env` template and
 
 ## Skills (Claude Code / Kiro)
 
-Skills provide the platform's analytical capabilities as portable workflows that work across any MCP-compatible environment. They auto-detect the best execution path: MCP tools (if gateway is connected) → AWS CLI (if available) → delegate to coding agent.
+Skills provide the system's analytical capabilities as portable workflows that work across any MCP-compatible environment. They auto-detect the best execution path: MCP tools (if gateway is connected) → AWS CLI (if available) → delegate to coding agent.
 
 | Skill | Invoke with | What it does |
 |-------|------------|--------------|
-| `/developer-guide` | "how do I add an agent?" | Interactive guide for extending the platform |
+| `/developer-guide` | "how do I add an agent?" | Interactive guide for extending the system |
 | `/resilience-report` | "generate a DX resilience report" | Self-contained HTML with topology + assessment |
 | `/finops-analysis` | "what are my top costs?" | Cost breakdown, trends, forecasts, savings |
 | `/health-events-digest` | "any critical health events?" | Health event digest with risk scoring |
