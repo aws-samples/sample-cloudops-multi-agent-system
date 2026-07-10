@@ -158,6 +158,7 @@ Frontend → supervisor (AG-UI) → finops-agent (HTTP)      → cost-ops (HTTP)
                               → governance-agent (HTTP)   → tag-governance (HTTP)  → Gateway
                               → ops-excellence (HTTP)     → health-events (HTTP)   → Gateway
                                                           → network-resiliency (HTTP) → Gateway
+                                                          → lambda-runtime-upgrade (HTTP) → Gateway
 ```
 
 To switch topologies: change the `type` field in `hierarchy.json`, set
@@ -295,6 +296,7 @@ skills/
     health-events.md            # Health events feature reference
     network-resiliency.md       # Direct Connect topology + resilience rules
     tag-governance.md           # Tag governance feature reference
+    lambda-runtime-upgrade.md   # Lambda runtime upgrade discovery + migration
   observability-tuning.md       # X-Ray + Transaction Search knobs
 
 tests/unit/                     # pytest + moto
@@ -375,6 +377,8 @@ See `.env.example` for the canonical identity-only `.env` template and
   - [docs/agents/tag-governance.md](docs/agents/tag-governance.md) —
     tag governance deploy modes, Resource Explorer multi-account
     setup, tag-policy bring-up commands, read-only-by-design rationale.
+  - [docs/agents/lambda-runtime-upgrade.md](docs/agents/lambda-runtime-upgrade.md)
+    — Lambda runtime discovery, code analysis, and migration guidance.
 - [docs/observability-tuning.md](docs/observability-tuning.md) —
   X-Ray sampling and Transaction Search indexing knobs.
 

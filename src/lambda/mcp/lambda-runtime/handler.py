@@ -61,6 +61,10 @@ def handler(event, context):
 
 # ---------------------------------------------------------------------------
 # Runtime support status data (updated periodically)
+# NOTE: Refresh cadence — review these dates quarterly against the AWS Lambda
+# runtimes page (https://docs.aws.amazon.com/lambda/latest/dg/lambda-runtimes.html).
+# Last reviewed: 2025-06. Stale dates won't cause errors but may under-report
+# deprecation urgency until refreshed.
 # ---------------------------------------------------------------------------
 
 RUNTIME_SUPPORT_DATA = {
@@ -248,6 +252,7 @@ def handle_list_functions_by_runtime(event):
     """List Lambda functions, optionally filtered by runtime or region."""
     region = event.get("region")
     runtime_filter = event.get("runtime")
+    function_name_filter = event.get("function_name_filter")
     max_results = min(event.get("max_results", 100), 500)
 
     try:
@@ -259,6 +264,10 @@ def handle_list_functions_by_runtime(event):
             for fn in page.get("Functions", []):
                 runtime = fn.get("Runtime", "")
                 if runtime_filter and runtime != runtime_filter:
+                    continue
+                # Substring match on function name (case-insensitive)
+                fn_name = fn["FunctionName"]
+                if function_name_filter and function_name_filter.lower() not in fn_name.lower():
                     continue
                 runtime_info = _classify_runtime(runtime)
                 functions.append({
