@@ -1135,5 +1135,153 @@
                 }
             }
         ]
+    },
+    "lambda-runtime": {
+        "handler": "handler.handler",
+        "runtime": "python3.12",
+        "timeout": 120,
+        "memory": 512,
+        "env_vars": {
+            "CROSS_ACCOUNT_ROLE_ARN": "$CROSS_ACCOUNT_ROLE_ARN"
+        },
+        "iam_actions": [
+            "lambda:ListFunctions",
+            "lambda:GetFunction",
+            "lambda:GetFunctionConfiguration",
+            "ec2:DescribeRegions"
+        ],
+        "tools": [
+            {
+                "name": "discover_lambda_regions",
+                "description": "Discover which AWS regions have Lambda functions deployed. Scans all enabled regions in parallel and returns each region's function count plus how many are on deprecated or end-of-life runtimes. Use this FIRST to let the user choose which regions to include in a report.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {}
+                }
+            },
+            {
+                "name": "list_functions_by_runtime",
+                "description": "List Lambda functions with their runtime status. Optionally filter by runtime identifier or region. Returns function name, current runtime, support status, and recommended upgrade target.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "runtime": {
+                            "type": "string",
+                            "description": "Filter by specific runtime (e.g., python3.9, nodejs18.x, java11)"
+                        },
+                        "region": {
+                            "type": "string",
+                            "description": "AWS region to scan (default: current region)"
+                        },
+                        "max_results": {
+                            "type": "integer",
+                            "description": "Maximum functions to return (default: 100, max: 500)"
+                        }
+                    }
+                }
+            },
+            {
+                "name": "get_function_configuration",
+                "description": "Get detailed configuration for a specific Lambda function including runtime, handler, layers, memory, timeout, architecture, and environment variable keys. Use this before code analysis to understand the function's setup.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "function_name": {
+                            "type": "string",
+                            "description": "Lambda function name or ARN"
+                        },
+                        "region": {
+                            "type": "string",
+                            "description": "AWS region (optional)"
+                        }
+                    },
+                    "required": ["function_name"]
+                }
+            },
+            {
+                "name": "get_function_code",
+                "description": "Download and return the source code files from a Lambda function's deployment package. Extracts .py, .js, .ts, .java, .cs, .rb, .go files plus dependency manifests (requirements.txt, package.json, pom.xml, etc.). Skips node_modules, __pycache__, and vendor directories. Use this to analyze code for runtime compatibility issues.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "function_name": {
+                            "type": "string",
+                            "description": "Lambda function name or ARN"
+                        },
+                        "region": {
+                            "type": "string",
+                            "description": "AWS region (optional)"
+                        },
+                        "max_file_size_kb": {
+                            "type": "integer",
+                            "description": "Max size per file in KB (default: 50). Files exceeding this are skipped."
+                        },
+                        "include_patterns": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Only include files matching these substrings (e.g., ['handler', 'main'])"
+                        }
+                    },
+                    "required": ["function_name"]
+                }
+            },
+            {
+                "name": "get_runtime_support_status",
+                "description": "Get support status for all AWS Lambda runtimes including active, deprecated, and end-of-life runtimes with their deprecation dates and recommended upgrade targets. Optionally filter by runtime family.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "family": {
+                            "type": "string",
+                            "description": "Filter by runtime family: python, nodejs, java, dotnet, ruby, custom"
+                        }
+                    }
+                }
+            },
+            {
+                "name": "get_deprecated_functions",
+                "description": "Find all Lambda functions using deprecated or end-of-life runtimes in a SINGLE region. Returns functions grouped by runtime with upgrade recommendations. For multi-region scanning, use get_deprecated_functions_multi_region instead.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "region": {
+                            "type": "string",
+                            "description": "AWS region to scan (default: current region)"
+                        },
+                        "include_approaching_deprecation": {
+                            "type": "boolean",
+                            "description": "Include functions with runtimes approaching deprecation within 6 months (default: false)"
+                        },
+                        "max_results": {
+                            "type": "integer",
+                            "description": "Maximum functions to return (default: 200, max: 500)"
+                        }
+                    }
+                }
+            },
+            {
+                "name": "get_deprecated_functions_multi_region",
+                "description": "Find all Lambda functions using deprecated or end-of-life runtimes across MULTIPLE regions in parallel. Much faster than calling get_deprecated_functions repeatedly. Use this for multi-region upgrade reports.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "regions": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "List of AWS regions to scan (e.g., ['us-east-1', 'eu-west-1', 'ap-southeast-1'])"
+                        },
+                        "include_approaching_deprecation": {
+                            "type": "boolean",
+                            "description": "Include functions with runtimes approaching deprecation within 6 months (default: false)"
+                        },
+                        "max_results_per_region": {
+                            "type": "integer",
+                            "description": "Maximum functions per region (default: 100, max: 500)"
+                        }
+                    },
+                    "required": ["regions"]
+                }
+            }
+        ]
     }
 }
