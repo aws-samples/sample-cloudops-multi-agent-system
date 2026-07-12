@@ -157,8 +157,10 @@ _sync_agent() {
   agent_changed=$(get_agent_changed "$agent_name")
 
   # --- For unchanged non-frontend agents, skip the full sync ---
-  # Frontend agent always needs sync (AGUI protocol check after TF reverts to HTTP).
-  # Other agents only need sync when their image changed.
+  # The frontend agent always runs the full sync so its runtime env vars
+  # (registry table, gateway endpoint, memory ID — some known only after
+  # apply) are guaranteed current. Other agents only need sync when their
+  # image changed.
   if [ "$agent_changed" != "true" ] && [ "$agent_name" != "$FRONTEND_AGENT" ]; then
     info "${agent_name}: unchanged, skipping sync"
     return
@@ -180,10 +182,9 @@ kwargs = dict(
 )
 if rt.get('authorizerConfiguration'):
     kwargs['authorizerConfiguration'] = rt['authorizerConfiguration']
-# Frontend agent uses AGUI (TF provider doesn't support it yet); others preserve existing
-if '${agent_name}' == '${FRONTEND_AGENT}':
-    kwargs['protocolConfiguration'] = {'serverProtocol': 'AGUI'}
-elif rt.get('protocolConfiguration'):
+# Preserve the protocol Terraform set (AGUI for the frontend, HTTP for
+# others) — update_agent_runtime is not partial, so omitting it resets it.
+if rt.get('protocolConfiguration'):
     kwargs['protocolConfiguration'] = rt['protocolConfiguration']
 resp = client.update_agent_runtime(**kwargs)
 print(f'${agent_name} updated — version: {resp.get(\"agentRuntimeVersion\", \"unknown\")}')
@@ -255,40 +256,13 @@ else:
     )
     if rt.get('authorizerConfiguration'):
         kwargs['authorizerConfiguration'] = rt['authorizerConfiguration']
-    # Frontend agent uses AGUI (TF provider doesn't support it yet); others preserve existing
-    if '${agent_name}' == '${FRONTEND_AGENT}':
-        kwargs['protocolConfiguration'] = {'serverProtocol': 'AGUI'}
-    elif rt.get('protocolConfiguration'):
+    # Preserve the protocol Terraform set (AGUI for the frontend, HTTP for
+    # others) — update_agent_runtime is not partial, so omitting it resets it.
+    if rt.get('protocolConfiguration'):
         kwargs['protocolConfiguration'] = rt['protocolConfiguration']
     client.update_agent_runtime(**kwargs)
     print('${agent_name} env vars updated')
 " 2>&1 || warn "${agent_name} env var sync failed (non-fatal)"
-
-  # --- Ensure frontend agent protocol is AGUI (TF provider can't set it) ---
-  if [ "$agent_name" = "$FRONTEND_AGENT" ]; then
-    .venv/bin/python -c "
-import boto3
-client = boto3.client('bedrock-agentcore-control', region_name='${AWS_REGION}')
-rt = client.get_agent_runtime(agentRuntimeId='${runtime_id}')
-proto = rt.get('protocolConfiguration', {}).get('serverProtocol', '')
-if proto == 'AGUI':
-    print('${agent_name} protocol already AGUI')
-else:
-    print(f'${agent_name} protocol is {proto}, setting to AGUI...')
-    kwargs = dict(
-        agentRuntimeId='${runtime_id}',
-        agentRuntimeArtifact=rt['agentRuntimeArtifact'],
-        roleArn=rt['roleArn'],
-        networkConfiguration=rt['networkConfiguration'],
-        environmentVariables=rt.get('environmentVariables', {}),
-        protocolConfiguration={'serverProtocol': 'AGUI'},
-    )
-    if rt.get('authorizerConfiguration'):
-        kwargs['authorizerConfiguration'] = rt['authorizerConfiguration']
-    resp = client.update_agent_runtime(**kwargs)
-    print(f'${agent_name} protocol set to AGUI (version: {resp.get(\"agentRuntimeVersion\", \"?\")})')
-" 2>&1 || warn "${agent_name} AGUI protocol set failed (non-fatal)"
-  fi
 
   # --- Wait for READY ---
   info "Waiting for ${agent_name} runtime to be READY..."

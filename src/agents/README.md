@@ -13,7 +13,7 @@ All agents are config-driven via `hierarchy.json`. Three generic code folders �
 - `"orchestrator"` — mid-level delegator, routes to ONE child per request.
 - `"frontend"` — user-facing AG-UI entry point (adds memory, suggestions, reports).
 
-`protocol` **must** be `"http"` for every agent, even the frontend. The AGUI switch is handled post-deploy by `scripts/deploy.sh` because Terraform provider v6.36 doesn't support `AGUI` as a `server_protocol` enum.
+`protocol` **must** be `"http"` for every agent, even the frontend. This field is NOT the runtime protocol — no code reads it. The runtime protocol is set by Terraform (`protocol_configuration`): the frontend runtime serves AG-UI, all others serve HTTP.
 
 **Promoting to frontend**: any agent (orchestrator OR worker) can be `type: "frontend"`. `src/agents/frontend/server.py` derives the runtime execution mode from the promoted agent's hierarchy entry — if `children` is non-empty, it runs in mid-level mode (registry-based child delegation); otherwise it runs in leaf mode (gateway MCP tools, same code path as a regular worker). Do NOT hardcode `agent_type="mid_level"` in the frontend factory — a worker promoted to frontend that way loads zero tools and the hallucination guardrail refuses every prompt. See `test_promoted_frontend_has_either_children_or_tools` in `tests/unit/test_topology.py` for the regression guard.
 

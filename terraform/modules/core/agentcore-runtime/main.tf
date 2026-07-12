@@ -206,11 +206,13 @@ resource "aws_bedrockagentcore_agent_runtime" "this" {
     }
   }
 
-  # NOTE: protocol_configuration { server_protocol = "AGUI" } is desired but
-  # the Terraform AWS provider v6.36 doesn't support the AGUI enum yet (only
-  # MCP, HTTP, A2A). deploy.sh post-deploy sync sets AGUI via the API.
-  # Once the provider adds AGUI support, add the block here and remove the
-  # deploy.sh workaround.
+  # The supervisor is the user-facing entry point and serves the AG-UI
+  # streaming protocol. AGUI became a native server_protocol enum in the
+  # AWS provider v6.50.0 (previously only MCP, HTTP, A2A were accepted),
+  # so Terraform now manages it directly — no post-deploy API workaround.
+  protocol_configuration {
+    server_protocol = "AGUI"
+  }
 
   environment_variables = merge(
     {
@@ -238,7 +240,7 @@ resource "aws_bedrockagentcore_agent_runtime" "this" {
   })
 
   lifecycle {
-    ignore_changes = [authorizer_configuration, protocol_configuration]
+    ignore_changes = [authorizer_configuration]
   }
 }
 
