@@ -26,8 +26,9 @@ import pytest
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
+# AWS_REGION is set for the whole unit package in tests/unit/conftest.py.
+# These two are test-specific config the collector reads at import time.
 os.environ.setdefault("HEALTH_EVENTS_TABLE_NAME", "test-table")
-os.environ.setdefault("AWS_REGION", "us-east-1")
 # Disable LLM by default so tests don't hit Bedrock. Individual tests opt in.
 os.environ["ENRICHMENT_MODEL_ID"] = ""
 

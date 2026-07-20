@@ -35,7 +35,8 @@ from pathlib import Path
 
 import pytest
 
-pytestmark = pytest.mark.unit
+# The `unit` marker is applied to every test under tests/unit/ by
+# tests/unit/conftest.py — no per-file pytestmark needed.
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _HIERARCHY_PATH = _REPO_ROOT / "src" / "agents" / "hierarchy.json"
