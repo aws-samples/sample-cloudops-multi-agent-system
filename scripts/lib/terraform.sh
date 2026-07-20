@@ -173,41 +173,6 @@ run_terraform() {
   # populated/total counts. Silent on first-run / missing creds.
   shared_config_print_summary 2>/dev/null || true
 
-  # Workaround: TF provider v6.36 crashes on read if frontend agent has AGUI protocol.
-  # Temporarily revert to HTTP before Terraform runs, then deploy.sh post-deploy
-  # sync sets AGUI back. Needed for both apply and destroy.
-  # Only relevant when agents are deployed.
-  if [ "$DEPLOY_FLAG_AGENTS" = true ]; then
-  local sup_runtime_id
-  sup_runtime_id=$(tf_output agentcore_runtime_id)
-    if [ -n "$sup_runtime_id" ] && [ "$sup_runtime_id" != "" ]; then
-      .venv/bin/python -c "
-import boto3
-client = boto3.client('bedrock-agentcore-control', region_name='${AWS_REGION}')
-try:
-    rt = client.get_agent_runtime(agentRuntimeId='${sup_runtime_id}')
-    proto = rt.get('protocolConfiguration', {}).get('serverProtocol', '')
-    if proto == 'AGUI':
-        kwargs = dict(
-            agentRuntimeId='${sup_runtime_id}',
-            agentRuntimeArtifact=rt['agentRuntimeArtifact'],
-            roleArn=rt['roleArn'],
-            networkConfiguration=rt['networkConfiguration'],
-            environmentVariables=rt.get('environmentVariables', {}),
-            protocolConfiguration={'serverProtocol': 'HTTP'},
-        )
-        if rt.get('authorizerConfiguration'):
-            kwargs['authorizerConfiguration'] = rt['authorizerConfiguration']
-        client.update_agent_runtime(**kwargs)
-        print('Temporarily reverted ${FRONTEND_AGENT} protocol to HTTP for Terraform')
-    else:
-        print(f'${FRONTEND_AGENT} protocol is {proto}, no revert needed')
-except Exception as e:
-    print(f'Protocol revert skipped: {e}')
-" 2>&1 || true
-    fi
-  fi  # end DEPLOY_FLAG_AGENTS check
-
   ensure_terraform_init
 
   # `-var` beats `*.auto.tfvars.json` in Terraform's precedence chain, so

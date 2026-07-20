@@ -246,8 +246,9 @@ def test_frontend_detection_follows_the_frontend_type(hierarchy, shape):
     frontend, `_load_hierarchy` must report the new agent — NOT the
     hardcoded default `supervisor`.
 
-    A regression here silently deploys the wrong AGUI agent on any
-    non-full topology, which is the exact bug class the topology
+    A regression here mis-identifies the frontend agent on any non-full
+    topology — the wrong agent would get the AGUI runtime protocol and
+    frontend-only env vars — which is the exact bug class the topology
     optimisation entry warns about.
     """
     mutated = _build_topology(hierarchy, shape)
@@ -256,8 +257,8 @@ def test_frontend_detection_follows_the_frontend_type(hierarchy, shape):
         got = _detect_frontend_agent()
     assert got == expected_frontend, (
         f"shape={shape!r}: _load_hierarchy reported FRONTEND_AGENT="
-        f"{got!r}, expected {expected_frontend!r}. The deploy script "
-        "will perform the AGUI swap on the wrong agent."
+        f"{got!r}, expected {expected_frontend!r}. The wrong agent would "
+        "be treated as the frontend (AGUI protocol + frontend env vars)."
     )
 
 

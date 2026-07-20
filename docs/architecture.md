@@ -50,21 +50,16 @@ Each `server.py` reads `AGENT_NAME` from env, loads its config from
 - Sub-agents are **stateless**: the supervisor resolves ambiguous
   references ("this", "last month") from memory before delegating.
 
-### The AGUI protocol dance
+### Runtime protocol
 
-Terraform provider v6.36 doesn't support `"AGUI"` as a `server_protocol`
-enum. The supervisor needs AGUI at runtime. `scripts/deploy.sh` handles
-the lifecycle:
+The supervisor runtime serves the AG-UI streaming protocol; every other
+agent runtime serves HTTP. Both are set by Terraform via
+`protocol_configuration`. AGUI is a native `server_protocol` enum as of
+AWS provider v6.50.0 (pinned in `terraform/versions.tf`), so there is no
+post-deploy protocol adjustment.
 
-1. Before any terraform op (apply/plan/destroy), `run_terraform()`
-   auto-reverts the frontend agent AGUI→HTTP via boto3. The provider
-   crashes on read/refresh if it sees AGUI.
-2. Terraform applies cleanly seeing HTTP.
-3. `_sync_agent($FRONTEND_AGENT)` post-deploy sets AGUI back
-   unconditionally.
-
-Every agent in `hierarchy.json` MUST declare `"protocol": "http"` —
-including the supervisor.
+The `protocol` field in `hierarchy.json` is unrelated to the runtime
+protocol — no code reads it — so it stays `"http"` for every agent.
 
 ---
 
@@ -286,7 +281,7 @@ NOT `allowed_clients`. Cognito ID tokens carry client ID in `aud`, not
 - `build.sh` — ECR login, agent images (type-aware hashing, per-agent
   hierarchy slicing), frontend build, `.env.local` auto-generation.
 - `terraform.sh` — bootstrap, tfvars generation, plan/apply/destroy,
-  AGUI protocol workaround, fingerprinted init skip.
+  fingerprinted init skip.
 - `sync.sh` — runtime sync, gateway tool schemas, observability, S3
   deploy.
 - `teardown.sh` — ECR cleanup, memory cleanup, state backend cleanup.

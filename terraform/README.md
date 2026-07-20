@@ -6,20 +6,14 @@ Modules live under `modules/core/` (platform) and `modules/custom/` (optional ad
 
 ## Run everything through `make`, not raw `terraform`
 
-- `make plan` / `make deploy-auto` / `make destroy` / `make destroy-all` wrap `scripts/deploy.sh`, which handles: tfvars generation from `hierarchy.json` + `tools.json`, state backend bootstrap, AGUI protocol pre-revert (see below), post-apply syncs (runtime env, gateway tools, registry cleanup), and retry-safe teardown.
-- Raw `terraform apply` skips all of that and leaves you with half-deployed state, stale gateway schemas, and runtime protocol mismatches.
+- `make plan` / `make deploy-auto` / `make destroy` / `make destroy-all` wrap `scripts/deploy.sh`, which handles: tfvars generation from `hierarchy.json` + `tools.json`, state backend bootstrap, post-apply syncs (runtime env, gateway tools, registry cleanup), and retry-safe teardown.
+- Raw `terraform apply` skips all of that and leaves you with half-deployed state, stale gateway schemas, and runtime env-var drift.
 
-## The AGUI protocol dance (read this before touching runtimes)
+## Runtime protocol
 
-Terraform provider v6.36 does **not** support `"AGUI"` as a `server_protocol` enum — only `MCP`, `HTTP`, `A2A`. But our supervisor needs AGUI. The lifecycle is fully automated in `scripts/deploy.sh`:
+The supervisor runtime serves the AG-UI streaming protocol; all other agent runtimes serve HTTP. Both are set by Terraform via `protocol_configuration { server_protocol = ... }` — AGUI became a native `server_protocol` enum in AWS provider v6.50.0 (`versions.tf` pins `>= 6.50.0`), so no post-deploy protocol adjustment is needed.
 
-1. `run_terraform()` pre-step: auto-reverts the frontend agent AGUI→HTTP via boto3 before ANY terraform op (apply/plan/destroy). The provider crashes on read/refresh if it sees AGUI — and `lifecycle { ignore_changes = [protocol_configuration] }` does NOT help because the error happens before plan.
-2. Terraform applies cleanly seeing HTTP.
-3. `_sync_agent("$FRONTEND_AGENT")` post-deploy sets AGUI back via `update_agent_runtime`. Runs unconditionally (not gated on image change).
-
-Terraform `hierarchy.json` has `protocol: "http"` for ALL agents, including the supervisor. Don't change it to `"agui"` or `"a2a"` — causes silent 424 errors.
-
-When the provider adds AGUI support: add `protocol_configuration { server_protocol = "AGUI" }` to `agentcore-runtime/main.tf`, remove the pre-revert and the dedicated protocol check in `deploy.sh`.
+The `protocol` field in `hierarchy.json` is unrelated to the runtime protocol — no code reads it — so it stays `"http"` for every agent, including the supervisor.
 
 ## Modules you'll touch most
 

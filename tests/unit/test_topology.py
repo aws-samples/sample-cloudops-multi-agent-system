@@ -142,20 +142,21 @@ class TestHierarchyStructure:
             )
 
     def test_every_entry_uses_http_protocol(self, hierarchy):
-        """Terraform provider v6.36 doesn't support AGUI as a
-        `server_protocol` enum. `hierarchy.json` MUST have
-        `protocol: "http"` for every agent — even the frontend.
-        `deploy.sh` post-swaps the frontend to AGUI after apply.
+        """The `protocol` field in `hierarchy.json` is NOT the runtime
+        protocol — no code reads it. The runtime protocol is set by
+        Terraform (`protocol_configuration`): the frontend runtime serves
+        AG-UI, all others serve HTTP. The field is kept `"http"` for every
+        agent so it never misleads readers into thinking it drives the
+        runtime.
 
-        See docs/development.md "Protocol field quirk" + terraform/README.md.
+        See docs/development.md "Runtime protocol" + terraform/README.md.
         """
         for name, entry in hierarchy.items():
             assert entry["protocol"] == "http", (
                 f"agent {name!r} has protocol={entry['protocol']!r}. "
-                "It MUST be 'http' — the frontend AGUI swap is handled "
-                "post-apply by scripts/deploy.sh. Setting anything "
-                "other than 'http' crashes the Terraform provider at "
-                "plan time or produces silent 424s at runtime."
+                "It MUST be 'http'. This field is vestigial (nothing reads "
+                "it) — the runtime protocol is set by Terraform's "
+                "protocol_configuration, not by this field."
             )
 
     def test_agent_names_are_legal_runtime_identifiers(self, hierarchy):
@@ -186,8 +187,8 @@ class TestHierarchyGraph:
         frontends = [n for n, e in hierarchy.items() if e["type"] == "frontend"]
         assert len(frontends) == 1, (
             f"expected exactly one agent with type='frontend', got "
-            f"{len(frontends)}: {frontends}. The AGUI protocol swap in "
-            "deploy.sh assumes a single frontend agent."
+            f"{len(frontends)}: {frontends}. Terraform sets the AGUI runtime "
+            "protocol on the single frontend agent; more than one is ambiguous."
         )
 
     def test_every_child_reference_resolves(self, hierarchy):

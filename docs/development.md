@@ -47,12 +47,9 @@ Each generic `server.py` reads `AGENT_NAME` from env and loads config from `hier
 
 **Runtime topology.** Each agent is a container on AgentCore Runtime (port 8080). Agent-to-agent calls use `boto3.client('bedrock-agentcore').invoke_agent_runtime()` (SigV4-signed) — NOT Strands `A2AAgent`. Sub-agents are **stateless**: the supervisor resolves ambiguous references ("this", "last month") from memory before delegating. Memory lives on the supervisor only, managed manually via `create_event`/`list_events` in `shared/memory.py` — `AgentCoreMemorySessionManager` is NOT used because `ag_ui_strands.StrandsAgent` discards `session_manager`/`messages`/`callback_handler` and creates its own internal agents per thread (injected via `_agents_by_thread[thread_id]`).
 
-**Protocol field quirk.** Every agent in `hierarchy.json` MUST have `protocol: "http"` — even the supervisor. The Terraform provider v6.36 doesn't support `AGUI` as a `server_protocol` enum. `scripts/deploy.sh` handles the AGUI switch post-deploy:
-1. Before any Terraform operation, `run_terraform()` auto-reverts the frontend agent AGUI→HTTP (provider crashes on read/refresh with AGUI).
-2. Terraform applies cleanly seeing HTTP.
-3. `_sync_agent($FRONTEND_AGENT)` post-deploy sets AGUI back unconditionally.
+**Runtime protocol.** The frontend/supervisor runtime serves the AG-UI streaming protocol; every other agent runtime serves HTTP. Both are set by Terraform via `protocol_configuration { server_protocol = ... }` — AGUI is a native provider enum as of AWS provider v6.50.0 (pinned in `terraform/versions.tf`), so there's no post-deploy protocol dance. The `protocol` field in `hierarchy.json` is unrelated to the runtime protocol (nothing reads it); leave it `"http"`.
 
-If you see silent 424 errors with no useful logs: check for a protocol mismatch.
+If you see silent 424 errors with no useful logs: check for a protocol mismatch on the runtime.
 
 **Tool layer.** Lambda MCP tools live under `src/lambda/mcp/<tool>/` (one per AWS API surface). Schemas are in `src/lambda/mcp/tools.json`. Tools are registered as targets on a single AgentCore Gateway. Gateway targets reset to single-tool placeholder schemas on every `terraform apply`, so `deploy.sh` deletes `.lambda-hashes/gateway-tools.sha` immediately after apply to force `sync_gateway_tools` to re-upload the full multi-tool schemas.
 
