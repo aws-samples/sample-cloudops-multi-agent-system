@@ -1,0 +1,9 @@
+# Empty — Lambda Python 3.12 runtime provides boto3/botocore at runtime.
+# urllib3 is also bundled with botocore.
+#
+# When adding a dep, ALWAYS pin to a specific version (==X.Y.Z), not a
+# floor (>=X.Y) or unconstrained name. The build packages this file via
+# `pip install -r requirements.txt -t ./package/` — without pins, every
+# rebuild can pull a newer minor that introduces breaking changes (we
+# hit this with ag-ui-strands 0.1.4 → 0.1.9 silently changing default
+# history-replay behavior). Bump deliberately, retest, then update.
