@@ -1,1 +1,1 @@
-# CloudOps Multi-Agent Platform - Tests
+# CloudOps Multi-Agent System - Tests

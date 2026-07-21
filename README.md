@@ -1,4 +1,4 @@
-# CloudOps Multi-Agent system
+# CloudOps Multi-Agent System
 
 > **Important:** This project is intended for educational and demonstration
 > purposes only. It is not intended for use in production environments without
@@ -25,58 +25,7 @@ visualisations, and downloadable reports.
 
 ## Architecture
 
-```mermaid
-graph TB
-    User([User]) --> Frontend[Next.js SPA<br/>S3 + CloudFront]
-
-    Frontend -->|AG-UI SSE| Runtime[AgentCore Runtime<br/>AG-UI Protocol]
-    Frontend -->|REST| APIGW[API Gateway<br/>Cognito JWT]
-
-    APIGW --> FrontendAPI[Frontend API Lambda<br/>Sessions / Templates / Reports]
-    FrontendAPI --> Memory[(AgentCore Memory)]
-    FrontendAPI --> DDB[(DynamoDB)]
-
-    Runtime --> Supervisor[Supervisor Agent]
-    Supervisor --> Memory
-
-    Supervisor -->|invoke_agent_runtime| FinOps[FinOps Agent]
-    Supervisor -->|invoke_agent_runtime| Governance[Governance Agent]
-    Supervisor -->|invoke_agent_runtime| OpsEx[Ops Excellence Agent]
-
-    FinOps -->|invoke_agent_runtime| CostOps[Cost Operations Agent]
-    FinOps -->|invoke_agent_runtime| Pricing[Pricing Agent]
-    Governance -->|invoke_agent_runtime| TagGov[Tag Governance Agent]
-    OpsEx -->|invoke_agent_runtime| Health[Health Events Agent]
-    OpsEx -->|invoke_agent_runtime| NetRes[Network Resiliency Agent]
-
-    CostOps --> Gateway[AgentCore Gateway<br/>SigV4 + MCP]
-    Pricing --> Gateway
-    TagGov --> Gateway
-    Health --> Gateway
-    NetRes --> Gateway
-
-    Gateway --> Tools[8 Lambda Tools<br/>Cost Explorer, CUR, COH,<br/>Billing, Pricing, Health,<br/>Network Resilience, Tag Governance]
-
-    subgraph AgentCore Runtimes
-        Supervisor
-        FinOps
-        Governance
-        OpsEx
-        CostOps
-        Pricing
-        TagGov
-        Health
-        NetRes
-    end
-
-    style User fill:#f9f,stroke:#333
-    style Frontend fill:#4a9eff,stroke:#333,color:#fff
-    style Runtime fill:#ff9f43,stroke:#333,color:#fff
-    style APIGW fill:#26de81,stroke:#333,color:#fff
-    style Gateway fill:#a55eea,stroke:#333,color:#fff
-    style Memory fill:#fed330,stroke:#333
-    style DDB fill:#fed330,stroke:#333
-```
+![CloudOps Multi-Agent System architecture](docs/assets/cloudops-architecture.svg)
 
 Three layers:
 
@@ -102,9 +51,9 @@ sync), see [docs/architecture.md](docs/architecture.md).
 
 - **Hierarchical agent orchestration** with memory, follow-up
   suggestions, and structured reports.
-- **8 AWS tools** wired through AgentCore Gateway: Cost Explorer, CUR
+- **9 AWS tools** wired through AgentCore Gateway: Cost Explorer, CUR
   (Athena), Cost Optimization Hub, Billing/Anomalies, Pricing, Health
-  Events, Network Resilience, Tag Governance.
+  Events, Network Resilience, Tag Governance, Lambda Runtime.
 - **Health events pipeline** with rules-based risk scoring, Claude
   Haiku 4.5 narrative enrichment, and optional Organisation-wide view
   for 1000+ account orgs. See
@@ -158,7 +107,7 @@ Frontend → supervisor (AG-UI) → finops-agent (HTTP)      → cost-ops (HTTP)
                               → governance-agent (HTTP)   → tag-governance (HTTP)  → Gateway
                               → ops-excellence (HTTP)     → health-events (HTTP)   → Gateway
                                                           → network-resiliency (HTTP) → Gateway
-                                                          → lambda-runtime-upgrade (HTTP) → Gateway
+                                                          → lambda-upgrade (HTTP) → Gateway
 ```
 
 To switch topologies: change the `type` field in `hierarchy.json`, set
@@ -207,7 +156,7 @@ make destroy-all    # Nuclear: infra + ECR + memory + state backend
 
 ### Modes
 
-Set `DEPLOY_MODE` in `.env` to control scope:
+Pass `DEPLOY_MODE` as a command-line override (e.g. `DEPLOY_MODE=gateway-only make deploy-auto`) to control scope — it's a shared key, so a value in `.env` is ignored (see [Development Guide → Deploy Modes](docs/development.md)):
 
 | Mode | Agents | Gateway | Tools | Frontend | Cognito | Use case |
 |------|:---:|:---:|:---:|:---:|:---:|---|
@@ -254,7 +203,7 @@ make reconfigure-shared    # Re-run the interactive config with a diff + APPLY C
 ## Testing
 
 ```bash
-make test-unit         # 415+ unit tests (moto, pytest) — reports, memory, tracing, prompts,
+make test-unit         # 475+ unit tests (moto, pytest) — reports, memory, tracing, prompts,
                        # health-events collector (risk rules + LLM enrichment paths)
 make test-integration  # End-to-end against a deployed stack (requires Cognito creds in scripts/.env)
 ```
@@ -282,7 +231,7 @@ src/
     frontend/ orchestrator/ worker/
     shared/                     # memory, tracing, reports, gateway, registry, cross_account
   lambda/
-    mcp/                        # One folder per AWS API surface (8 tools)
+    mcp/                        # One folder per AWS API surface (9 tools)
     frontend/                   # Browser-facing REST Lambdas (JWT-authorised)
     collectors/                 # Background collectors (EventBridge → SQS → Lambda → DDB)
   frontend/                     # Next.js static export SPA + visualiser / reports / tours
@@ -307,7 +256,7 @@ skills/
     health-events.md            # Health events feature reference
     network-resiliency.md       # Direct Connect topology + resilience rules
     tag-governance.md           # Tag governance feature reference
-    lambda-runtime-upgrade.md   # Lambda runtime upgrade discovery + migration
+    lambda-upgrade.md           # Lambda runtime upgrade discovery + migration
   observability-tuning.md       # X-Ray + Transaction Search knobs
 
 tests/unit/                     # pytest + moto
@@ -388,7 +337,7 @@ See `.env.example` for the canonical identity-only `.env` template and
   - [docs/agents/tag-governance.md](docs/agents/tag-governance.md) —
     tag governance deploy modes, Resource Explorer multi-account
     setup, tag-policy bring-up commands, read-only-by-design rationale.
-  - [docs/agents/lambda-runtime-upgrade.md](docs/agents/lambda-runtime-upgrade.md)
+  - [docs/agents/lambda-upgrade.md](docs/agents/lambda-upgrade.md)
     — Lambda runtime discovery, code analysis, and migration guidance.
 - [docs/observability-tuning.md](docs/observability-tuning.md) —
   X-Ray sampling and Transaction Search indexing knobs.

@@ -4,7 +4,7 @@ This file documents project-specific conventions, architecture, and gotchas for 
 
 ## Project
 
-CloudOps Multi-Agent Platform — a hierarchical multi-agent system for AWS cloud operations built on Amazon Bedrock AgentCore with Strands Agents SDK and an AG-UI streaming Next.js frontend. See `README.md` for architecture diagrams and `skills/developer-guide/SKILL.md` for step-by-step how-tos. `docs/agents/` has one reference file per leaf agent (deploy modes, data model, gotchas) — `health-events.md` and `tag-governance.md` today; add a new file here for any new leaf with non-trivial deploy or operational surface.
+CloudOps Multi-Agent System — a hierarchical multi-agent system for AWS cloud operations built on Amazon Bedrock AgentCore with Strands Agents SDK and an AG-UI streaming Next.js frontend. See `README.md` for architecture diagrams and `skills/developer-guide/SKILL.md` for step-by-step how-tos. `docs/agents/` has one reference file per leaf agent (deploy modes, data model, gotchas) — `health-events.md` and `tag-governance.md` today; add a new file here for any new leaf with non-trivial deploy or operational surface.
 
 The richest source of project-specific conventions and gotchas is this file plus the `docs/` directory — treat them as authoritative. `docs/architecture.md` covers agent topology decisions.
 
@@ -103,7 +103,9 @@ These three rules prevent the most common behavioral regressions:
 
 ## Deploy Modes
 
-`DEPLOY_MODE` in `.env` gates build phases via `DEPLOY_FLAG_*` flags and maps to Terraform `deploy_*` vars. Modes: `full` (default), `agents-only` (skips Next.js/S3/CloudFront), `gateway-only`, `tools-only`. `DEPLOY_TOOLS` filters Lambda tools by `tools.json` keys. `GATEWAY_AUTH` is `iam` (default) or `oauth` (adds Cognito JWT authorizer for external clients).
+`DEPLOY_MODE` gates build phases via `DEPLOY_FLAG_*` flags and maps to Terraform `deploy_*` vars. Modes: `full` (default), `agents-only` (skips Next.js/S3/CloudFront), `gateway-only`, `tools-only`. `DEPLOY_TOOLS` filters Lambda tools by `tools.json` keys. `GATEWAY_AUTH` is `iam` (default) or `oauth` (adds Cognito JWT authorizer for external clients).
+
+**Pass `DEPLOY_MODE` as a command-line override, NOT in `.env`** — e.g. `DEPLOY_MODE=gateway-only make deploy-auto`. `DEPLOY_MODE` (like `DEPLOY_TOOLS`, `GATEWAY_AUTH`, `AWS_REGION`) is a **shared key** (`scripts/shared-keys.txt`): `deploy.sh` captures CLI-set values before sourcing `.env`, then **unsets any shared key that came from `.env`** so stale `.env` values never win for SSM-owned config (see the restore-or-strip loop in `deploy.sh`). A `DEPLOY_MODE=…` line in `.env` is therefore silently ignored and the deploy runs `full`.
 
 ## Observability
 

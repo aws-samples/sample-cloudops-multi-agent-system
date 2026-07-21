@@ -189,7 +189,7 @@ validate_credentials() {
 
 show_help() {
   cat <<'EOF'
-CloudOps Multi-Agent Platform — Deployment Script
+CloudOps Multi-Agent System — Deployment Script
 
 USAGE:
   make deploy-auto     Deploy everything non-interactively

@@ -1,6 +1,6 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: >
-  Bootstrap stack for CloudOps Multi-Agent Platform Terraform state.
+  Bootstrap stack for CloudOps Multi-Agent System Terraform state.
   Creates an S3 bucket and DynamoDB table for remote state locking.
 
 Parameters:

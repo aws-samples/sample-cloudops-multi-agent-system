@@ -1,4 +1,4 @@
-# CloudOps Multi-Agent Platform -- Makefile
+# CloudOps Multi-Agent System -- Makefile
 #
 # Common commands for development, testing, and deployment.
 # Run `make help` to see all available targets.
@@ -22,7 +22,7 @@ HASH_DIR := .lambda-hashes
 
 # Default target
 help: ## Show this help message
-	@echo "CloudOps Multi-Agent Platform"
+	@echo "CloudOps Multi-Agent System"
 	@echo ""
 	@echo "Usage: make <target>"
 	@echo ""
@@ -40,7 +40,7 @@ configure: ## First-run shared project config (writes to SSM via shared-config m
 
 quickstart: ## First-time deploy: setup + configure + deploy in one command
 	@echo "══════════════════════════════════════════════════════════"
-	@echo "  CloudOps Multi-Agent Platform — Quick Start"
+	@echo "  CloudOps Multi-Agent System — Quick Start"
 	@echo "══════════════════════════════════════════════════════════"
 	@echo ""
 	@echo "Step 1/3: Setting up local environment..."
