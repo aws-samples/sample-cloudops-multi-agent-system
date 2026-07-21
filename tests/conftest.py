@@ -1,4 +1,4 @@
-"""Shared test fixtures for CloudOps Multi-Agent Platform."""
+"""Shared test fixtures for CloudOps Multi-Agent System."""
 
 import os
 

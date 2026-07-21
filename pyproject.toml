@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "cloudops-multi-agent-platform"
 version = "0.1.0"
-description = "CloudOps Multi-Agent Platform: Supervisor-SubAgent architecture for AWS cloud operations management"
+description = "CloudOps Multi-Agent System: Supervisor-SubAgent architecture for AWS cloud operations management"
 requires-python = ">=3.10"
 dependencies = [
     "strands-agents[a2a,otel]",

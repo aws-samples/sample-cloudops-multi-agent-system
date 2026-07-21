@@ -1,1 +1,1 @@
-# CloudOps Multi-Agent Platform - Agents
+# CloudOps Multi-Agent System - Agents

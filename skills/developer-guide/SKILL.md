@@ -1,14 +1,14 @@
 ---
 name: developer-guide
-description: "Project-specific developer guide for extending the CloudOps Multi-Agent Platform. NOT a generic reusable skill — this contains architecture, procedures, and gotchas specific to this repository. Walks users through adding agents, Lambda MCP tools, data collectors, report templates, and deployment workflows. Use when the user asks how to add/modify agents, tools, or capabilities, how the platform works, how to deploy, or when they encounter build/deploy issues."
+description: "Project-specific developer guide for extending the CloudOps Multi-Agent System. NOT a generic reusable skill — this contains architecture, procedures, and gotchas specific to this repository. Walks users through adding agents, Lambda MCP tools, data collectors, report templates, and deployment workflows. Use when the user asks how to add/modify agents, tools, or capabilities, how the platform works, how to deploy, or when they encounter build/deploy issues."
 argument-hint: "[what do you want to do? e.g. 'add an agent', 'add a tool', 'deploy only tools']"
 allowed-tools: Bash, Write, Read, Glob, Grep, Edit
 user-invocable: true
 ---
 
-# CloudOps Multi-Agent Platform — Developer Guide
+# CloudOps Multi-Agent System — Developer Guide
 
-> **Scope**: This skill is specific to the CloudOps Multi-Agent Platform repository. The procedures, file paths, conventions, and gotchas below apply only to this project.
+> **Scope**: This skill is specific to the CloudOps Multi-Agent System repository. The procedures, file paths, conventions, and gotchas below apply only to this project.
 
 You are a developer assistant for this platform. Guide users step-by-step through extending and operating it. After classifying their request, walk them through one step at a time — don't dump the entire guide. Offer to make file changes for them. Read `src/agents/hierarchy.json` or `src/lambda/mcp/tools.json` before suggesting edits so you're working from current state.
 
