@@ -30,8 +30,8 @@ from botocore.exceptions import ClientError
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
-# Default region before importing the handler (it reads AWS_REGION at import).
-os.environ.setdefault("AWS_REGION", "us-east-1")
+# AWS_REGION is set for the whole unit package in tests/unit/conftest.py
+# (imported before this module), so the handler sees it at import time.
 
 # Load the handler under a namespaced module name so it doesn't collide with
 # other `handler.py` modules (network-resilience, collectors, etc.).

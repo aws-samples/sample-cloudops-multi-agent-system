@@ -105,6 +105,17 @@ These three rules prevent the most common behavioral regressions:
 
 `DEPLOY_MODE` in `.env` gates build phases via `DEPLOY_FLAG_*` flags and maps to Terraform `deploy_*` vars. Modes: `full` (default), `agents-only` (skips Next.js/S3/CloudFront), `gateway-only`, `tools-only`. `DEPLOY_TOOLS` filters Lambda tools by `tools.json` keys. `GATEWAY_AUTH` is `iam` (default) or `oauth` (adds Cognito JWT authorizer for external clients).
 
+## Testing Conventions
+
+Unit tests live in `tests/unit/` (run by `make test-unit` alongside `tests/topology/`); moto/DynamoDB fixtures are shared via `tests/conftest.py`; package-wide setup is in `tests/unit/conftest.py`. Follow these so new tests don't drift:
+
+- **Loading a Lambda handler**: use `importlib.util.spec_from_file_location(...)` + `exec_module` under a **namespaced** module name (e.g. `lambda_runtime_handler`, not `handler`) so multiple `handler.py` files don't collide. Reference: `tests/unit/test_tag_governance_tool.py`.
+- **NEVER stub `shared.*` (or any real package) via a module-scope `sys.modules[...] = MagicMock()`.** It never gets removed and pollutes every later test file (this once broke all of `test_cross_account.py`). Handlers import `shared.cross_account` **lazily inside functions**, so `exec_module` does not need it stubbed to import. If a test exercises that path, stub it in a **fixture** with `monkeypatch.setitem(sys.modules, ...)` (auto-restored) — see the `cross_account_stub` fixture in `test_lambda_runtime_tool.py`.
+- **AWS env**: don't set `AWS_REGION`/credentials per file. `tests/unit/conftest.py` sets deterministic region + dummy creds for the whole package at import time. Only set genuinely test-specific env (e.g. a tool's own `*_TABLE_NAME`) in the file, and prefer `monkeypatch.setenv` inside a test over module-scope mutation.
+- **Mocking**: DynamoDB-heavy tests use **moto** (`mock_aws` via the shared fixtures); handler-routing/logic tests use **`MagicMock` + `monkeypatch`** on the handler's own seams (e.g. `monkeypatch.setattr(handler, "_get_lambda_client", ...)`). Don't reach into `sys.modules` to patch — patch the handler reference.
+- **Markers**: `tests/unit/conftest.py` auto-applies the `unit` marker to everything under `tests/unit/`, so `pytest -m unit` selects the whole suite. No per-file `pytestmark` needed.
+- **Prove a regression test fails on the bug first** (stash the fix → test fails → restore → passes) — see the report-mode example in `temp/PR-PLAYBOOK.md`.
+
 ## Observability
 
 Runtime → X-Ray trace delivery and runtime → CWL application-log delivery are wired in `terraform/modules/core/observability/main.tf`. Spans land in `aws/spans`; application logs vend to `/aws/vendedlogs/bedrock-agentcore/runtime/{project}`. Runtime execution roles (both `agent-runtime-base` and `agentcore-runtime`) grant four X-Ray actions — `PutTraceSegments`, `PutTelemetryRecords`, `GetSamplingRules`, `GetSamplingTargets`. The two `Get*` are load-bearing: ADOT's sampler calls them every ~10s; without them spans get silently dropped.

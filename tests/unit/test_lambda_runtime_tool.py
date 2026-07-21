@@ -30,26 +30,48 @@ import pytest
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
-# Default region before importing the handler.
-os.environ.setdefault("AWS_REGION", "us-east-1")
+# AWS_REGION is set for the whole unit package in tests/unit/conftest.py
+# (imported before this module), so the handler sees it at import time.
 
 # Load the handler under a namespaced module name so it doesn't collide with
-# other `handler.py` modules.
+# other `handler.py` modules (network-resilience, collectors, etc.).
+#
+# NOTE: the handler imports `shared.cross_account` LAZILY (inside functions,
+# not at module scope), so exec_module succeeds without stubbing `shared`.
+# Tests that exercise those code paths request the `cross_account_stub`
+# fixture below — we must NOT install a global sys.modules["shared.cross_account"]
+# here, because a module-scope stub that is never removed pollutes the whole
+# test session and breaks the real tests/unit/test_cross_account.py.
 _HANDLER_PATH = _REPO_ROOT / "src" / "lambda" / "mcp" / "lambda-runtime" / "handler.py"
 _spec = importlib.util.spec_from_file_location("lambda_runtime_handler", _HANDLER_PATH)
 handler = importlib.util.module_from_spec(_spec)
-
-# Mock the shared.cross_account import that happens at module level
-sys.modules["shared"] = MagicMock()
-sys.modules["shared.cross_account"] = MagicMock()
 _spec.loader.exec_module(handler)
-# Register the module so patch() can resolve it
+# Register the module under its own name so patch("lambda_runtime_handler...")
+# targets resolve. This is namespaced to this handler and does not shadow any
+# real package, so it is safe to leave in sys.modules.
 sys.modules["lambda_runtime_handler"] = handler
 
 
 # ---------------------------------------------------------------------------
 # Test fixtures
 # ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def cross_account_stub(monkeypatch):
+    """Provide a scoped stub for `shared.cross_account` for the tests that
+    exercise the handler's lazy `from shared.cross_account import get_aws_client`.
+
+    monkeypatch.setitem restores the previous sys.modules state (including
+    absence) on teardown, so this never leaks into other test files — unlike
+    a bare module-level `sys.modules["shared.cross_account"] = MagicMock()`.
+    Returns the stub module so the test can set `get_aws_client` on it.
+    """
+    shared_pkg = sys.modules.get("shared") or MagicMock()
+    stub = MagicMock()
+    monkeypatch.setitem(sys.modules, "shared", shared_pkg)
+    monkeypatch.setitem(sys.modules, "shared.cross_account", stub)
+    return stub
 
 
 def _make_context(tool_name: str) -> SimpleNamespace:
@@ -446,7 +468,7 @@ class TestGetDeprecatedFunctionsMultiRegion:
 
 
 class TestDiscoverLambdaRegions:
-    def test_success(self, monkeypatch):
+    def test_success(self, monkeypatch, cross_account_stub):
         """Discovers regions with Lambda functions."""
         mock_ec2 = MagicMock()
         mock_ec2.describe_regions.return_value = {
@@ -474,17 +496,15 @@ class TestDiscoverLambdaRegions:
             client.get_paginator.return_value = paginator
             return client
 
-        # Patch the shared.cross_account.get_aws_client used inside
+        # Stub the shared.cross_account.get_aws_client the handler imports lazily.
+        cross_account_stub.get_aws_client = mock_get_client
         with patch("lambda_runtime_handler.boto3"):
-            monkeypatch.setattr(
-                sys.modules["shared.cross_account"], "get_aws_client", mock_get_client
-            )
             result = handler.handle_discover_lambda_regions({})
 
         assert result["total_functions"] == 2
         assert result["total_regions"] == 1  # only us-east-1 has functions
 
-    def test_region_scan_error_handled(self, monkeypatch):
+    def test_region_scan_error_handled(self, monkeypatch, cross_account_stub):
         """A region that throws during scan doesn't crash discovery."""
         mock_ec2 = MagicMock()
         mock_ec2.describe_regions.return_value = {
@@ -496,10 +516,8 @@ class TestDiscoverLambdaRegions:
                 return mock_ec2
             raise Exception("Connection timeout")
 
+        cross_account_stub.get_aws_client = mock_get_client
         with patch("lambda_runtime_handler.boto3"):
-            monkeypatch.setattr(
-                sys.modules["shared.cross_account"], "get_aws_client", mock_get_client
-            )
             result = handler.handle_discover_lambda_regions({})
 
         # Should return empty results, not crash
