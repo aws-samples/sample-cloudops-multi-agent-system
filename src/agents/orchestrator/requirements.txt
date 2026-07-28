@@ -1,7 +1,7 @@
 # Pinned to specific versions known to work together. See
 # `src/agents/frontend/requirements.txt` for the rationale.
 strands-agents[otel]==1.40.0
-bedrock-agentcore[strands-agents]==1.10.0
+bedrock-agentcore[strands-agents]==1.18.1
 boto3==1.43.12
 httpx==0.28.1
 mcp==1.27.1
