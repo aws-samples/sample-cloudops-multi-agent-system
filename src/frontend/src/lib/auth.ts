@@ -135,7 +135,21 @@ export async function login(): Promise<void> {
     window.location.href = `${config.authorization_endpoint}?${params}`;
 }
 
-export async function handleCallback(code: string): Promise<void> {
+// Deduped by code: React StrictMode (on in `next dev` under Next 16) mounts effects
+// twice, so the callback effect calls this twice with the SAME one-time authorization
+// code. The second exchange hit Cognito after the code was redeemed → 400 → the
+// caller's catch() restarted login() → an infinite "Authenticating..." loop. Reusing
+// the in-flight promise makes the double-invoke harmless. Module-level is safe: both
+// StrictMode invocations share this module instance.
+let callbackInFlight: { code: string; promise: Promise<void> } | null = null;
+
+export function handleCallback(code: string): Promise<void> {
+    if (callbackInFlight?.code === code) return callbackInFlight.promise;
+    callbackInFlight = { code, promise: doHandleCallback(code) };
+    return callbackInFlight.promise;
+}
+
+async function doHandleCallback(code: string): Promise<void> {
     console.log("[auth] handleCallback starting with code:", code.slice(0, 10) + "...");
     const config = await fetchOidcConfig();
     const resp = await fetch(config.token_endpoint, {
