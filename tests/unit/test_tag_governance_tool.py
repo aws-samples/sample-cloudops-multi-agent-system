@@ -538,3 +538,86 @@ class TestGetRemediationGuidance:
         result = handler.handle_get_remediation_guidance({})
         assert result["links"] == []
         assert "compliant" in result["summary"].lower()
+
+
+# ---------------------------------------------------------------------------
+# Snapshot cache (collector fast path)
+# ---------------------------------------------------------------------------
+
+class TestSnapshotLookup:
+    """_snapshot_lookup gates the DDB fast path written by the collector."""
+
+    def _with_table(self, monkeypatch, item=None, raises=None):
+        monkeypatch.setattr(handler, "_SNAPSHOT_TABLE", "snap-table")
+        ddb = MagicMock()
+        if raises:
+            ddb.get_item.side_effect = raises
+        else:
+            ddb.get_item.return_value = {"Item": item} if item else {}
+        monkeypatch.setattr(handler.boto3, "client", MagicMock(return_value=ddb))
+        return ddb
+
+    def _item(self, payload: dict, snapshot_at="2026-08-09T00:00:00+00:00"):
+        import json as _json
+        return {
+            "payload": {"S": _json.dumps(payload)},
+            "snapshot_at": {"S": snapshot_at},
+        }
+
+    def test_disabled_without_table_env(self, monkeypatch):
+        monkeypatch.setattr(handler, "_SNAPSHOT_TABLE", "")
+        assert handler._snapshot_lookup("check_tag_compliance", {}) is None
+
+    def test_canonical_query_served_from_snapshot(self, monkeypatch):
+        self._with_table(monkeypatch, self._item({"total_resources_scanned": 42}))
+        out = handler._snapshot_lookup("check_tag_compliance", {})
+        assert out["total_resources_scanned"] == 42
+        assert out["data_source"] == "scheduled_snapshot"
+        assert out["data_as_of"] == "2026-08-09T00:00:00+00:00"
+
+    def test_force_refresh_goes_live(self, monkeypatch):
+        ddb = self._with_table(monkeypatch, self._item({"x": 1}))
+        assert handler._snapshot_lookup("check_tag_compliance", {"force_refresh": True}) is None
+        ddb.get_item.assert_not_called()
+
+    def test_filtered_query_goes_live(self, monkeypatch):
+        """A snapshot computed for the canonical sweep can't answer a
+        resource_types-filtered question — must fall through to live."""
+        ddb = self._with_table(monkeypatch, self._item({"x": 1}))
+        out = handler._snapshot_lookup(
+            "check_tag_compliance", {"resource_types": ["ec2:instance"]}
+        )
+        assert out is None
+        ddb.get_item.assert_not_called()
+
+    def test_non_eligible_op_goes_live(self, monkeypatch):
+        self._with_table(monkeypatch, self._item({"x": 1}))
+        assert handler._snapshot_lookup("list_cost_allocation_tag_status", {}) is None
+
+    def test_cache_miss_goes_live(self, monkeypatch):
+        self._with_table(monkeypatch, item=None)
+        assert handler._snapshot_lookup("check_tag_compliance", {}) is None
+
+    def test_ddb_failure_falls_back_not_crashes(self, monkeypatch):
+        self._with_table(monkeypatch, raises=RuntimeError("ddb down"))
+        assert handler._snapshot_lookup("check_tag_compliance", {}) is None
+
+    def test_caller_max_resources_truncates_detail(self, monkeypatch):
+        payload = {
+            "non_compliant_count": 100,
+            "non_compliant_resources": [{"arn": f"a{i}"} for i in range(100)],
+        }
+        self._with_table(monkeypatch, self._item(payload))
+        out = handler._snapshot_lookup("check_tag_compliance", {"max_resources": 5})
+        assert len(out["non_compliant_resources"]) == 5
+        assert out["truncated"] is True
+        # counts are untouched — they were computed over the full scan
+        assert out["non_compliant_count"] == 100
+
+    def test_dispatcher_prefers_snapshot(self, monkeypatch):
+        self._with_table(monkeypatch, self._item({"answer": "cached"}))
+        live = MagicMock()
+        monkeypatch.setitem(handler._TOOL_HANDLERS, "check_tag_compliance", live)
+        out = handler.handler({}, _make_context("check_tag_compliance"))
+        assert out["answer"] == "cached"
+        live.assert_not_called()

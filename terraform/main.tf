@@ -183,6 +183,25 @@ module "health_events_collection" {
 }
 
 # -----------------------------------------------------------------------------
+# Tag Governance Collection (scheduled compliance snapshots; opt-out via
+# enable_tag_snapshots=false). Deployed only when the tag-governance tool is.
+# -----------------------------------------------------------------------------
+module "tag_governance_collection" {
+  source             = "./modules/custom/tag-governance-collection"
+  count              = var.enable_tag_snapshots && var.deploy_tools && (contains(var.selected_tools, "tag-governance") || length(var.selected_tools) == 0) ? 1 : 0
+  project_tag        = var.project_tag
+  environment_tag    = var.environment_tag
+  collector_zip_path = "${path.module}/../src/lambda/collectors/tag-governance/tag-governance-collector.zip"
+  # Deterministic names from lambda-tool-base ("<project>-<tool>-tool") rather
+  # than module outputs — the tool module reads THIS module's table_name, so
+  # output references both ways would cycle.
+  tool_function_name = "${var.project_tag}-tag-governance-tool"
+  tool_role_name     = "${var.project_tag}-tag-governance-tool-role"
+  snapshot_schedule  = var.tag_snapshot_schedule
+  log_retention_days = var.log_retention_days
+}
+
+# -----------------------------------------------------------------------------
 # Frontend API (only when agents + frontend are deployed)
 # -----------------------------------------------------------------------------
 module "frontend_api" {
@@ -302,6 +321,15 @@ module "lambda_tools" {
     # Infra-derived env vars (override user-provided if both set)
     lookup(each.value, "needs_health_events", false) && length(module.health_events_collection) > 0 ? {
       HEALTH_EVENTS_TABLE_NAME = module.health_events_collection[0].table_name
+    } : {},
+    # Snapshot cache for tag-governance: when the collection module is
+    # deployed, the tool serves canonical (unfiltered) queries from the
+    # snapshot table and falls back to live scans otherwise. The read IAM
+    # grant is attached by the collection module (see tool_role_name there)
+    # because this module's single iam_actions/iam_resources statement
+    # can't scope DDB to one table while the scan APIs need "*".
+    lookup(each.value, "needs_tag_snapshots", false) && length(module.tag_governance_collection) > 0 ? {
+      TAG_SNAPSHOT_TABLE_NAME = module.tag_governance_collection[0].table_name
     } : {},
   )
 

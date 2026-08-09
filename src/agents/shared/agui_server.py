@@ -28,6 +28,7 @@ Usage::
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import os
@@ -71,6 +72,49 @@ logger = logging.getLogger(__name__)
 AGENTCORE_MEMORY_ID = os.environ.get("AGENTCORE_MEMORY_ID", "")
 AWS_REGION = os.environ.get("AWS_REGION", "us-east-1")
 REPORT_TABLE_NAME = os.environ.get("REPORT_TABLE_NAME", "")
+
+
+def _sanitize_actor_id(email: str) -> str:
+    """Sanitize an email into the actor_id form used as a partition-key component.
+
+    MUST stay in lockstep with the frontend's ``sanitizeActorId`` (auth.ts) and
+    core-api's ``_get_actor_id`` (handler.py) — all three produce the key the
+    browser later reads reports/sessions back under.
+    """
+    return email.replace("@", "_at_").replace(".", "_")
+
+
+def _actor_id_from_jwt(request: "Request") -> str:
+    """Derive actor_id from the request's already-validated JWT, if present.
+
+    The runtime's custom_jwt_authorizer verified this token's signature at the
+    platform edge before the request reached the container, so decoding the
+    payload here (WITHOUT re-verifying) is safe — an unverified token never
+    gets this far. Returns "" when there is no bearer token or no email claim
+    (e.g. SigV4 / legacy callers), letting the caller fall back.
+
+    Why this exists: actor_id used to be read only from forwardedProps — a
+    client-controlled field. When the browser sent it empty (getActorId()
+    returns "anonymous"/"" if userEmail hasn't hydrated yet — a real race) or
+    sent a value that diverged from core-api's JWT-derived key, the report row
+    was written under one partition key while the frontend polled another. The
+    report completed in DynamoDB but the UI spun on "Generating…" forever.
+    Deriving from the JWT makes the write key and the poll key come from the
+    same claim, and stops any authenticated user from reading/writing another
+    actor's reports by editing forwardedProps.
+    """
+    auth = request.headers.get("authorization", "")
+    if not auth.lower().startswith("bearer "):
+        return ""
+    token = auth[7:].strip()
+    try:
+        payload_b64 = token.split(".")[1]
+        payload_b64 += "=" * (-len(payload_b64) % 4)
+        claims = json.loads(base64.urlsafe_b64decode(payload_b64))
+        email = claims.get("email", "")
+        return _sanitize_actor_id(email) if email else ""
+    except Exception:
+        return ""
 
 # Type alias for the agent builder callable.
 # Signature: (payload: dict) -> (Agent, system_prompt: str, cleanup_fn: Optional[Callable])
@@ -132,7 +176,10 @@ def create_agui_app(
         # AG-UI chat
         forwarded = payload.get("forwardedProps", {})
         session_id = forwarded.get("session_id", payload.get("threadId", ""))
-        actor_id = forwarded.get("actor_id", "")
+        # JWT-derived actor wins; forwardedProps is only a fallback for callers
+        # without a bearer token (SigV4 smoke tests, legacy clients). See
+        # _actor_id_from_jwt for the report-orphaning bug this closes.
+        actor_id = _actor_id_from_jwt(request) or forwarded.get("actor_id", "")
 
         # Extract user prompt from AG-UI messages
         user_prompt = _extract_user_prompt(payload)

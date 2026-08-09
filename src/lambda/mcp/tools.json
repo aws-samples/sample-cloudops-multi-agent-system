@@ -890,6 +890,7 @@
         "runtime": "python3.12",
         "timeout": 60,
         "memory": 512,
+        "needs_tag_snapshots": true,
         "env_vars": {
             "CROSS_ACCOUNT_ROLE_ARN_TAG_GOVERNANCE": "$CROSS_ACCOUNT_ROLE_ARN_TAG_GOVERNANCE"
         },

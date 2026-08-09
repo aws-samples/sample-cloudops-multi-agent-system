@@ -420,6 +420,20 @@ Each question that lands in `health-events-agent`: ~$0.034 leaf Bedrock. No per-
 - **Tier 2 response-size scaling is the only thing that moves this number.** A tag drill-down against a 500-account org returns ~15 KB of JSON; the next turn's Bedrock input cost picks that up (~$0.01 extra per drill-down). Immaterial.
 - Like `pricing-agent`, this is one of the cheapest modules to enable — zero paid AWS APIs, pure Bedrock leaf cost per turn.
 
+**Snapshot collector (`enable_tag_snapshots`, default ON when this tool is deployed)**
+
+A scheduled Lambda (default `rate(6 hours)`) re-runs the expensive sweeps — Resource Explorer inventory + classification — through the tool Lambda and stores the responses in a snapshot table, so canonical tag queries answer from DynamoDB in milliseconds instead of a 3–60s live scan. Filtered queries and `force_refresh=true` still go live.
+
+| Item | Cost | Notes |
+|---|---|---|
+| Collector Lambda (schedule) | $0 | 4 runs/day × ~60s × 256 MB ≈ 1 800 GB-s/mo — inside the 400 000 GB-s free tier. |
+| Tool Lambda re-invocations | $0 | ~5 invocations per sweep (600/mo) — free tier. |
+| EventBridge schedule rule | $0 | Scheduler rules are free. |
+| DynamoDB `tag-compliance-snapshots` | ~$0.01–$0.05 | ~5 items rewritten 4×/day (≤400 KB each): ~120 write-units/day. 48h TTL caps storage under 2 MB. |
+| All AWS scan APIs (Resource Explorer, Tagging, Organizations) | Free | Same free APIs the live path uses — the schedule just moves them off the user's turn. |
+
+**Module cost delta: effectively $0** (worst case ~$0.05/mo DDB). What it buys: tag-governance turns skip the 3–60s scan, so the leaf's Bedrock turn also gets slightly *cheaper* (no retry/continuation prompts on slow tool calls), and report sections stop triple-running the same sweep. At `rate(1 hour)` the numbers stay in free tier; the knob that would eventually cost money is snapshotting a very large estate (approaching the 400 KB item cap) every few minutes — don't do that.
+
 ### 6.7 Side-by-side module summary
 
 Comparing typical module usage at **small-team scale** (5 users, ~1 500 total turns/mo spread across the modules each user actually uses):
@@ -431,7 +445,7 @@ Comparing typical module usage at **small-team scale** (5 users, ~1 500 total tu
 | `pricing-agent` | 100 | — | ~$3.40 | $0 | **~$3** |
 | `health-events-agent` (100-acct org) | 60 | ~$0.55 | ~$2 | $0 | **~$3** |
 | `network-resiliency-agent` | 40 | — | ~$1.40 | $0 | **~$1** |
-| `tag-governance-agent` | 100 | — | ~$3.40 | $0 | **~$3** |
+| `tag-governance-agent` (+ snapshot collector) | 100 | ~$0.05 | ~$3.40 | $0 | **~$3** |
 | **Small-team total (all modules enabled)** | | | | | **~$75–$80** |
 
 (Note this is lower than the §5 "Small team" $208 because §5 uses a heavier 2 250 turns/mo assumption and counts reports. Both are valid framings — §5 is "full platform, typical chatty team"; this table is "what does each feature contribute".)

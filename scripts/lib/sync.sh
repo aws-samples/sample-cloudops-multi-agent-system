@@ -186,6 +186,10 @@ if rt.get('authorizerConfiguration'):
 # others) — update_agent_runtime is not partial, so omitting it resets it.
 if rt.get('protocolConfiguration'):
     kwargs['protocolConfiguration'] = rt['protocolConfiguration']
+# Preserve the request-header allowlist Terraform set (Authorization forwarding
+# on the supervisor) — same non-partial-update reason as protocol above.
+if rt.get('requestHeaderConfiguration'):
+    kwargs['requestHeaderConfiguration'] = rt['requestHeaderConfiguration']
 resp = client.update_agent_runtime(**kwargs)
 print(f'${agent_name} updated — version: {resp.get(\"agentRuntimeVersion\", \"unknown\")}')
 " 2>&1 || warn "${agent_name} force update failed (non-fatal)"
@@ -260,6 +264,10 @@ else:
     # others) — update_agent_runtime is not partial, so omitting it resets it.
     if rt.get('protocolConfiguration'):
         kwargs['protocolConfiguration'] = rt['protocolConfiguration']
+    # Preserve the request-header allowlist Terraform set (Authorization
+    # forwarding on the supervisor) — same non-partial-update reason.
+    if rt.get('requestHeaderConfiguration'):
+        kwargs['requestHeaderConfiguration'] = rt['requestHeaderConfiguration']
     client.update_agent_runtime(**kwargs)
     print('${agent_name} env vars updated')
 " 2>&1 || warn "${agent_name} env var sync failed (non-fatal)"
