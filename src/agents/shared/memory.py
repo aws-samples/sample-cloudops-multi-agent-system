@@ -144,6 +144,40 @@ def save_user_message(
         logger.warning("Failed to save user message: %s", exc)
 
 
+# Pattern that catches a complete `<cfn-artifact …>…</cfn-artifact>` block
+# regardless of where it sits in the enriched text. Using `[\s\S]` (instead
+# of `.` with DOTALL) so the regex compiles fast and the match is greedy
+# only within a single artifact (`*?` non-greedy on the body).
+_CFN_ARTIFACT_BLOCK = re.compile(
+    r"<cfn-artifact\b[^>]*>[\s\S]*?</cfn-artifact>"
+)
+_CFN_ARTIFACT_REPLACEMENT = (
+    "[cfn-artifact body omitted from chat memory — see ReportPanel]"
+)
+
+
+def _scrub_cfn_artifacts(text: str) -> str:
+    """Replace every `<cfn-artifact …>…</cfn-artifact>` block with a short
+    placeholder.
+
+    Applied as a final safety net inside `save_assistant_message` so that
+    no matter where a YAML body slipped into the enriched text — top-level
+    sub-agent response, nested `tool_trace` entry inside a `<tool>` segment,
+    suggestions tag, future code path — it gets stripped before we hit
+    AgentCore Memory's 100k char per-event limit.
+
+    The artifact body is already persisted to the reports DynamoDB table
+    by the chat-mode interceptor and rendered via ReportPanel. Keeping a
+    second copy in Memory is pure bloat and was the live root cause of
+    the assistant turn silently vanishing on reload after a many-alarm
+    CFN generation (ValidationException on CreateEvent, swallowed in a
+    try/except).
+    """
+    if not text or "<cfn-artifact" not in text:
+        return text
+    return _CFN_ARTIFACT_BLOCK.sub(_CFN_ARTIFACT_REPLACEMENT, text)
+
+
 def save_assistant_message(
     memory_id: str,
     session_id: str,
@@ -151,9 +185,17 @@ def save_assistant_message(
     enriched_text: str,
     region: str = "us-east-1",
 ) -> None:
-    """Save enriched assistant response to Memory (after streaming completes)."""
+    """Save enriched assistant response to Memory (after streaming completes).
+
+    Applies `_scrub_cfn_artifacts` to strip any `<cfn-artifact>`-wrapped YAML
+    that leaked into the enriched TEXT. The bulky tool-trace copy of a CFN
+    template is removed separately at the supervisor save path
+    (`agui_server._abbreviate_bulky_tool_traces`, keyed by tool name). No blunt
+    size truncation is applied — matching upstream behaviour.
+    """
     if not memory_id or not session_id or not actor_id or not enriched_text.strip():
         return
+    safe_text = _scrub_cfn_artifacts(enriched_text)
     try:
         client = _get_client(region)
         client.create_event(
@@ -164,13 +206,18 @@ def save_assistant_message(
             payload=[
                 {
                     "conversational": {
-                        "content": {"text": enriched_text},
+                        "content": {"text": safe_text},
                         "role": "ASSISTANT",
                     }
                 }
             ],
         )
-        logger.info("Saved conversation to Memory for session %s", session_id[:20])
+        logger.info(
+            "Saved conversation to Memory for session %s (saved %d chars, original %d)",
+            session_id[:20],
+            len(safe_text),
+            len(enriched_text),
+        )
     except Exception as exc:
         logger.warning("Failed to save assistant message: %s", exc)
 

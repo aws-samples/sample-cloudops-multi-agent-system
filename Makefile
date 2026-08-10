@@ -160,7 +160,10 @@ package: $(HASH_DIR) ## Package Lambda tools (only changed ones, parallel)
 				rm -rf "$$dir/package"; \
 				mkdir -p "$$dir/package/"; \
 				if grep -qvE '^[[:space:]]*(#|$$)' "$$dir/requirements.txt" 2>/dev/null; then \
-					pip install -r "$$dir/requirements.txt" -t "$$dir/package/" --quiet 2>/dev/null; \
+					pip install -r "$$dir/requirements.txt" -t "$$dir/package/" \
+						--platform manylinux_2_28_x86_64 --platform manylinux2014_x86_64 \
+						--python-version 3.12 --implementation cp \
+						--only-binary=:all: --upgrade --quiet || exit 1; \
 				fi; \
 				cp $$dir/*.py "$$dir/package/" 2>/dev/null; \
 				for sub in "$$dir"*/; do \

@@ -46,6 +46,7 @@ from strands.models import BedrockModel
 from agents.shared.prompt import build_dynamic_prompt
 from agents.shared.registry import (
     build_agent_tools,
+    drain_outbound_cfn_artifacts,
     load_agent_registry,
     set_current_handler,
 )
@@ -63,6 +64,43 @@ DEFAULT_MODEL_ID = os.environ.get(
 )
 AGENTCORE_MEMORY_ID = os.environ.get("AGENTCORE_MEMORY_ID", "")
 AWS_REGION = os.environ.get("AWS_REGION", "us-east-1")
+
+# Tools whose raw output must NOT be persisted into the tool trace. They return
+# very large payloads (a many-alarm CFN template runs 100k+ chars) AND have no
+# functional consumer on reload — the saved trace is a display-only collapsed
+# view, and the actual artifact is persisted separately to the reports DynamoDB
+# table (rendered via the <report-pending> marker). We drop the output at the
+# SOURCE (the leaf agent that calls the tool), so it never gets serialized into
+# this agent's trace and therefore never appears in any enclosing agent's trace
+# or the AgentCore Memory event. Matching is by bare tool name (the gateway
+# "<target>___" prefix is stripped before comparison).
+#
+# The CloudWatch alarm-recommendation read tools belong here too: a single
+# many-resource run fans out get_recommended_metric_alarms ~26× (one per
+# metric), and each result is a full AWS recommendation-catalogue JSON. That
+# nested trace bubbles worker -> orchestrator -> supervisor and, even after the
+# CFN YAML itself is dropped, was the dominant term that pushed the saved
+# assistant turn past AgentCore Memory's 100k-char per-event limit (observed
+# live: a 26-alarm run produced a ~155 KB <tool> blob and a CreateEvent
+# ValidationException, silently dropping the turn on reload). Their output has
+# NO reload consumer — the recommendations are reflected in the generated CFN
+# template, which is persisted separately to the reports table and rendered via
+# ReportPanel. analyse_metric / get_metric_metadata are included for the same
+# reason (verbose 14-day stats / metadata with no reload-time render path).
+#
+# Contrast: the DX-topology tools (discover_dx_topology / assess_dx_resiliency)
+# are deliberately NOT here — the frontend rebuilds the diagram from their saved
+# trace output on reload, so they must keep full fidelity.
+_NO_RELOAD_TRACE_TOOLS = frozenset(
+    {
+        "assemble_cfn_template",
+        "build_cfn_alarm",
+        "get_recommended_metric_alarms",
+        "get_metric_metadata",
+        "analyse_metric",
+    }
+)
+_ABBREVIATED_TOOL_OUTPUT = "[tool output omitted from chat memory — see ReportPanel]"
 
 
 def _build_model(model_id: str) -> "BedrockModel":
@@ -136,6 +174,13 @@ _NO_FABRICATION_PREAMBLE = """\
    If the user references a report and your history contains NO
    `<report-pending>` markers, do NOT guess a `report_id`. Tell the
    user the report isn't in this conversation.
+   NEVER write a `<report-pending>` marker yourself. These markers are
+   injected by the platform when it persists a report; they are records
+   you READ, never output you produce. To hand back a CloudFormation
+   template, emit a single `<cfn-artifact title="…">…</cfn-artifact>`
+   block (the platform turns that into the report + marker). Typing your
+   own `<report-pending report_id="…"/>` invents an id that resolves to
+   nothing and renders a broken card.
 
 Breaking any of these rules constitutes a serious operational failure.
 These rules override every other instruction in this prompt.
@@ -340,7 +385,20 @@ def create_mid_level_agent(
 
             agent = Agent(**kwargs)
             response = agent(prompt)
-            return build_traced_response(response, handler)
+            traced = build_traced_response(response, handler)
+
+            # Forward any CFN artifacts extracted during this run up to the
+            # parent (ultimately the supervisor). Orchestrators have no event
+            # loop draining the queue, so we attach them to the response dict;
+            # the parent's _delegate re-queues them one hop up. Promote a
+            # plain-string response to a dict when needed so the field
+            # survives the hop.
+            outbound = drain_outbound_cfn_artifacts()
+            if outbound:
+                if isinstance(traced, str):
+                    traced = {"response": traced}
+                traced["cfn_artifacts"] = outbound
+            return traced
         except Exception as exc:
             logger.error("%s failed: %s", agent_name, exc, exc_info=True)
             return json.dumps({"error": str(exc)})
@@ -421,6 +479,17 @@ def create_leaf_agent(
             )
             response = agent(prompt)
 
+            # Map toolUseId -> tool name from the assistant's toolUse blocks so
+            # we can identify each result by tool name (the toolResult block
+            # itself carries no name). Names are gateway-prefixed here, e.g.
+            # "cloudwatch___assemble_cfn_template".
+            tool_names_by_id: dict[str, str] = {}
+            for msg in getattr(agent, "messages", []):
+                for block in msg.get("content", []):
+                    if isinstance(block, dict) and "toolUse" in block:
+                        tu = block["toolUse"]
+                        tool_names_by_id[tu.get("toolUseId", "")] = tu.get("name", "")
+
             # Extract MCP tool results from agent's message history
             # (callback_handler can't capture them — ToolResultEvent.is_callback_event=False)
             for msg in getattr(agent, "messages", []):
@@ -432,6 +501,25 @@ def create_leaf_agent(
                     tr = block["toolResult"]
                     tid = tr.get("toolUseId", "")
                     status = tr.get("status", "success")
+                    # Drop the output of no-reload-consumer tools (e.g.
+                    # assemble_cfn_template) AT THE SOURCE — before it is ever
+                    # serialized into this leaf's trace. The CFN body is already
+                    # persisted to the reports table and rendered via the
+                    # ReportPanel; keeping it in the trace only bloats every
+                    # enclosing agent's trace (worker -> orchestrator ->
+                    # supervisor) and the AgentCore Memory event past its 100k
+                    # char limit, which silently drops the whole turn on reload.
+                    # Killing it here means no enclosing level ever has to find
+                    # it inside a deeply string-encoded nested trace.
+                    raw_name = tool_names_by_id.get(tid, "")
+                    bare_name = (
+                        raw_name.split("___")[-1] if "___" in raw_name else raw_name
+                    )
+                    if bare_name in _NO_RELOAD_TRACE_TOOLS:
+                        handler.complete_tool_by_id(
+                            tid, output=_ABBREVIATED_TOOL_OUTPUT, status=status
+                        )
+                        continue
                     content = tr.get("content", "")
                     if isinstance(content, list):
                         content = " ".join(

@@ -1,7 +1,7 @@
 """
 Tag Governance MCP Tool — Lambda Implementation for AgentCore Gateway
 
-Seven tools:
+Eight tools:
 - get_required_tags                 Resolve required-tag policy from caller
                                     input or AWS Organizations Tag Policy.
 - list_tag_keys_in_use              Enumerate tag keys actually applied to
@@ -23,6 +23,11 @@ Seven tools:
 - get_remediation_guidance          Resource Explorer deep-links pre-filtered
                                     to each violation bucket for bulk-fix
                                     via Actions > Manage tags.
+- find_resources_by_tag             Resolve a tag selector to a list of
+                                    resource ARNs via tag:GetResources.
+                                    Used by the cloudwatch-agent to fan out
+                                    alarm recommendations across resources
+                                    matching a tag.
 
 Design notes:
 - Single-account scope. No cross-account role assumption.
@@ -53,6 +58,12 @@ from typing import Any, Callable
 
 import boto3
 from botocore.exceptions import ClientError
+
+# Cross-account support — shared module is packaged alongside handler.py by
+# the build (Makefile copies src/lambda/mcp/shared/ into every tool's zip).
+# When CROSS_ACCOUNT_ROLE_ARN_TAG_GOVERNANCE is set, get_aws_client returns
+# an assumed-role client; otherwise it falls back to the execution role.
+from shared.cross_account import get_aws_client
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -1270,6 +1281,162 @@ def _build_re_remediation_link(
 
 
 # ---------------------------------------------------------------------------
+# Tool 8: find_resources_by_tag
+# ---------------------------------------------------------------------------
+
+# 1000-resource cap matches the cloudwatch-agent's contract — beyond that the
+# agent's per-resource alarm-recommendation fan-out becomes unwieldy. The cap
+# is enforced in Python (we stop paginating once we hit it) rather than via
+# the boto3 ResourcesPerPage knob, which only controls page size.
+_FIND_RESOURCES_HARD_CAP = 1000
+
+_FIND_RESOURCES_TRUNCATION_NOTE = (
+    f"Results capped at {_FIND_RESOURCES_HARD_CAP}. Provide more specific "
+    f"tag_filters or a resource_types filter to narrow results."
+)
+
+
+def _build_tag_filters(raw: dict[str, Any]) -> list[dict[str, Any]]:
+    """Convert a {key: value} or {key: [values]} dict into the boto3 shape.
+
+    boto3 ``tag:GetResources`` expects ``TagFilters=[{"Key": ..., "Values":
+    [...]}]``. The user's input may be either ``{"App": "test"}`` (single
+    value) or ``{"App": ["test", "prod"]}`` (multi-value, valid AWS query
+    semantics — OR within a key). Both are passed through here.
+
+    Skips entries whose key is empty/falsy. Coerces non-list values into a
+    one-element list of the stringified value.
+    """
+    filters: list[dict[str, Any]] = []
+    for key, value in raw.items():
+        if not key:
+            continue
+        if isinstance(value, list):
+            values = [str(v) for v in value]
+        elif value is None:
+            values = []
+        else:
+            values = [str(value)]
+        filters.append({"Key": str(key), "Values": values})
+    return filters
+
+
+def _resource_from_arn(
+    raw_resource: dict[str, Any], fallback_region: str
+) -> dict[str, Any]:
+    """Map one ``ResourceTagMappingList`` entry to our return shape.
+
+    ``tag:GetResources`` returns ``ResourceARN`` and ``Tags`` (list of
+    ``{"Key", "Value"}``) — nothing else. We extract ``account_id`` and
+    ``region`` by parsing the ARN, falling back to ``fallback_region``
+    (the Lambda's query region) for global-service ARNs whose ARN has an
+    empty region segment.
+
+    ARN format: ``arn:aws:<service>:<region>:<account>:<rest>``.
+    """
+    arn = raw_resource.get("ResourceARN", "") or ""
+    parts = arn.split(":")
+    region = parts[3] if len(parts) > 3 and parts[3] else fallback_region
+    account_id = parts[4] if len(parts) > 4 else ""
+    tags = {
+        t.get("Key", ""): t.get("Value", "")
+        for t in raw_resource.get("Tags") or []
+        if t.get("Key")
+    }
+    return {
+        "arn": arn,
+        "tags": tags,
+        "region": region,
+        "account_id": account_id,
+    }
+
+
+def handle_find_resources_by_tag(event: dict[str, Any]) -> dict[str, Any]:
+    """Resolve a tag selector to a list of resource ARNs via tag:GetResources.
+
+    Designed for the cloudwatch-agent's "alarms for tag App=test" flow: the
+    agent calls this tool first to get ARNs, then fans out to
+    ``cloudwatch.get_recommended_metric_alarms`` per resource.
+
+    Inputs:
+      * ``tag_filters`` (required, dict): ``{"App": "test"}`` or
+        ``{"App": ["test", "prod"]}``. Empty/missing returns the canonical
+        ``selector_required`` error so the agent can prompt the user.
+      * ``resource_types`` (optional, list[str]): ``["ec2:instance",
+        "lambda:function"]`` — passed through to ``ResourceTypeFilters``.
+      * ``region`` (optional, str): defaults to the Lambda's ``AWS_REGION``.
+
+    Pagination caps results at 1000 (per Requirement 3.3). When the cap is
+    hit, ``truncated`` flips to True and a ``note`` field carries a hint to
+    narrow filters. When not hit, ``note`` is None.
+
+    Cross-account: routed through ``shared.cross_account.get_aws_client``
+    with ``role_alias="TAG_GOVERNANCE"``, so it inherits whatever
+    ``CROSS_ACCOUNT_ROLE_ARN_TAG_GOVERNANCE`` is configured for the rest of
+    this Lambda. Unset = falls back to the execution role.
+    """
+    raw_filters = event.get("tag_filters")
+    if not isinstance(raw_filters, dict) or not raw_filters:
+        return {
+            "error": "selector_required",
+            "message": "Provide at least one tag_filters entry.",
+        }
+
+    tag_filters = _build_tag_filters(raw_filters)
+    if not tag_filters:
+        # The dict was non-empty but every entry had a falsy key.
+        return {
+            "error": "selector_required",
+            "message": "Provide at least one tag_filters entry.",
+        }
+
+    resource_types = event.get("resource_types") or []
+    if isinstance(resource_types, str):
+        resource_types = [resource_types]
+
+    region = event.get("region") or _default_region()
+
+    client = get_aws_client(
+        service_name="resourcegroupstaggingapi",
+        region_name=region,
+        role_alias="TAG_GOVERNANCE",
+    )
+
+    params: dict[str, Any] = {
+        "TagFilters": tag_filters,
+        "ResourcesPerPage": 100,
+    }
+    if resource_types:
+        params["ResourceTypeFilters"] = list(resource_types)
+
+    resources: list[dict[str, Any]] = []
+    truncated = False
+    try:
+        while True:
+            resp = client.get_resources(**params)
+            for raw in resp.get("ResourceTagMappingList", []):
+                if len(resources) >= _FIND_RESOURCES_HARD_CAP:
+                    truncated = True
+                    break
+                resources.append(_resource_from_arn(raw, region))
+            if truncated:
+                break
+            token = resp.get("PaginationToken") or ""
+            if not token:
+                break
+            params["PaginationToken"] = token
+    except ClientError as exc:
+        logger.error("tag:GetResources failed: %s", exc)
+        return {"error": str(exc)}
+
+    return {
+        "resources": resources,
+        "truncated": truncated,
+        "note": _FIND_RESOURCES_TRUNCATION_NOTE if truncated else None,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Tool registry — declared at module scope so the dispatcher can find handlers.
 # ---------------------------------------------------------------------------
 
@@ -1281,4 +1448,5 @@ _TOOL_HANDLERS: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
     "find_untagged_resources": handle_find_untagged_resources,
     "list_cost_allocation_tag_status": handle_list_cost_allocation_tag_status,
     "get_remediation_guidance": handle_get_remediation_guidance,
+    "find_resources_by_tag": handle_find_resources_by_tag,
 }

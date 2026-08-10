@@ -606,7 +606,7 @@ _configure_prompts() {
   # -------------------------------------------------------------------------
   # TOOL-SPECIFIC CONFIG — conditional on selections above.
   # -------------------------------------------------------------------------
-  local need_ce_xacct need_coh_xacct need_cur need_health_xacct need_netres_xacct
+  local need_ce_xacct need_coh_xacct need_cur need_health_xacct need_netres_xacct need_cw_xacct
   case ",$active_tools," in
     *,cost-explorer,*)          need_ce_xacct=1 ;;
     *)                          need_ce_xacct=0 ;;
@@ -627,9 +627,14 @@ _configure_prompts() {
     *,network-resilience,*)     need_netres_xacct=1 ;;
     *)                          need_netres_xacct=0 ;;
   esac
+  case ",$active_tools," in
+    *,cloudwatch,*)             need_cw_xacct=1 ;;
+    *)                          need_cw_xacct=0 ;;
+  esac
 
   if [ "$need_ce_xacct" = 1 ] || [ "$need_coh_xacct" = 1 ] || [ "$need_cur" = 1 ] \
-     || [ "$need_health_xacct" = 1 ] || [ "$need_netres_xacct" = 1 ]; then
+     || [ "$need_health_xacct" = 1 ] || [ "$need_netres_xacct" = 1 ] \
+     || [ "$need_cw_xacct" = 1 ]; then
     echo
     echo "=== Tool-specific config ==="
     echo
@@ -697,6 +702,19 @@ _configure_prompts() {
       _answers_set CROSS_ACCOUNT_NETWORK_RESILIENCE_ROLE_ARNS "$netres_arns"
     else
       _answers_set CROSS_ACCOUNT_NETWORK_RESILIENCE_ROLE_ARNS ""
+    fi
+  fi
+
+  if [ "$need_cw_xacct" = 1 ]; then
+    local cw_yn cw_arn
+    local current_cw; current_cw="$(shared_config_get CROSS_ACCOUNT_CLOUDWATCH_ROLE_ARN "")"
+    local default_yn; [ -n "$current_cw" ] && default_yn="Y" || default_yn="N"
+    shared_config_prompt_yn cw_yn "cloudwatch: read metrics/alarms from a different account (e.g. spoke)?" "$default_yn"
+    if [ "$cw_yn" = "true" ]; then
+      shared_config_prompt cw_arn "  Cross-account role ARN for cloudwatch" "$current_cw"
+      _answers_set CROSS_ACCOUNT_ROLE_ARN_CLOUDWATCH "$cw_arn"
+    else
+      _answers_set CROSS_ACCOUNT_ROLE_ARN_CLOUDWATCH ""
     fi
   fi
 }

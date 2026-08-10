@@ -30,12 +30,22 @@ from botocore.exceptions import ClientError
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
-# AWS_REGION is set for the whole unit package in tests/unit/conftest.py
-# (imported before this module), so the handler sees it at import time.
+# The handler imports `from shared.cross_account import get_aws_client` —
+# that module lives at src/lambda/mcp/shared/, which is copied alongside
+# handler.py into every Lambda zip at build time. At test time we need to
+# add src/lambda/mcp/ to sys.path so the import resolves.
+_LAMBDA_MCP = _REPO_ROOT / "src" / "lambda" / "mcp"
+if str(_LAMBDA_MCP) not in sys.path:
+    sys.path.insert(0, str(_LAMBDA_MCP))
+
+# AWS_REGION is also set for the whole unit package in tests/unit/conftest.py
+# (imported before this module); this setdefault keeps the handler import
+# working even when the module is loaded outside that package context.
+os.environ.setdefault("AWS_REGION", "us-east-1")
 
 # Load the handler under a namespaced module name so it doesn't collide with
 # other `handler.py` modules (network-resilience, collectors, etc.).
-_HANDLER_PATH = _REPO_ROOT / "src" / "lambda" / "mcp" / "tag-governance" / "handler.py"
+_HANDLER_PATH = _LAMBDA_MCP / "tag-governance" / "handler.py"
 _spec = importlib.util.spec_from_file_location("tag_governance_handler", _HANDLER_PATH)
 handler = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(handler)
@@ -84,7 +94,7 @@ class TestDispatcher:
         result = handler.handler({}, ctx)
         assert result["error"].startswith("Unknown tool: nonexistent_tool")
         assert "get_required_tags" in result["available_tools"]
-        assert len(result["available_tools"]) == 7
+        assert len(result["available_tools"]) == 8
 
     def test_exception_in_handler_surfaces_as_error(self, monkeypatch):
         def boom(_event):

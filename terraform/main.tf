@@ -75,6 +75,7 @@ module "shared_config" {
   cross_account_role_arn                = try(var.tool_env_vars["cost-explorer"]["CROSS_ACCOUNT_ROLE_ARN"], "")
   cross_account_role_arn_coh            = try(var.tool_env_vars["cost-optimization-hub"]["CROSS_ACCOUNT_ROLE_ARN_COH"], "")
   cross_account_role_arn_tag_governance = try(var.tool_env_vars["tag-governance"]["CROSS_ACCOUNT_ROLE_ARN_TAG_GOVERNANCE"], "")
+  cross_account_role_arn_cloudwatch     = try(var.tool_env_vars["cloudwatch"]["CROSS_ACCOUNT_ROLE_ARN_CLOUDWATCH"], "")
   cur_database_name                     = try(var.tool_env_vars["cur-athena"]["CUR_DATABASE_NAME"], "")
   cur_table_name                        = try(var.tool_env_vars["cur-athena"]["CUR_TABLE_NAME"], "")
   athena_workgroup                      = try(var.tool_env_vars["cur-athena"]["ATHENA_WORKGROUP"], "")

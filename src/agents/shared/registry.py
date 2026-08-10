@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 from typing import Any
 from urllib.parse import unquote
 
@@ -208,6 +209,106 @@ def get_current_handler() -> Any:
     return _current_handler
 
 
+# ---------------------------------------------------------------------------
+# <cfn-artifact> extraction — runs inside _delegate (thread-pool) before the
+# result reaches the supervisor model. Strips the YAML body so the model
+# never sees it (can't abbreviate what it doesn't receive), and stores the
+# extracted artifacts in a module-level queue for the event-loop to
+# persist and emit <report-pending> markers.
+#
+# Module-level state is safe because AgentCore Runtime processes one request
+# at a time per container (same rationale as _current_handler).
+# ---------------------------------------------------------------------------
+
+_CFN_ARTIFACT_RE = re.compile(
+    r"<cfn-artifact\b(?P<attrs>[^>]*)>(?P<body>[\s\S]*?)</cfn-artifact>"
+)
+_CFN_TITLE_RE = re.compile(r'title\s*=\s*"([^"]*)"')
+
+# Artifacts extracted by _delegate. Two queues with different destinations:
+#
+#   _pending_cfn_artifacts  — supervisor/frontend container ONLY. Drained by
+#       the agui_server event loop on TOOL_CALL_RESULT, which persists each
+#       to DynamoDB and emits a <report-pending> SSE marker.
+#   _outbound_cfn_artifacts — intermediate (orchestrator) containers. These
+#       have no event loop draining the queue, so instead the orchestrator's
+#       entrypoint drains this list AFTER the agent run and attaches the
+#       artifacts to its response dict under "cfn_artifacts". The parent's
+#       _delegate reads that field and re-queues it one hop up. This carries
+#       the YAML supervisor-ward OUT OF BAND — no intermediate LLM ever has
+#       to echo the (large, easily-mangled) template verbatim.
+#
+# `_is_frontend_container` is flipped to True only in the supervisor, because
+# agui_server (imported only by create_frontend_agent) calls
+# mark_frontend_container() at import. Orchestrator/worker containers never
+# import agui_server, so the flag stays False and their artifacts route to
+# the outbound list.
+_pending_cfn_artifacts: list[dict] = []
+_outbound_cfn_artifacts: list[dict] = []
+_is_frontend_container = False
+
+
+def mark_frontend_container() -> None:
+    """Flag this process as the supervisor/frontend container.
+
+    Called once by ``agui_server`` at import. Determines whether extracted
+    CFN artifacts are queued for the local event loop (supervisor) or
+    forwarded up via the response dict (orchestrator).
+    """
+    global _is_frontend_container
+    _is_frontend_container = True
+
+
+def get_pending_cfn_artifacts() -> list[dict]:
+    """Pop all pending CFN artifacts (called by the agui_server event loop)."""
+    global _pending_cfn_artifacts
+    items = list(_pending_cfn_artifacts)
+    _pending_cfn_artifacts = []
+    return items
+
+
+def drain_outbound_cfn_artifacts() -> list[dict]:
+    """Pop all artifacts an orchestrator must forward up (called by entrypoint)."""
+    global _outbound_cfn_artifacts
+    items = list(_outbound_cfn_artifacts)
+    _outbound_cfn_artifacts = []
+    return items
+
+
+def _queue_cfn_artifacts(artifacts: list[dict]) -> None:
+    """Route extracted artifacts to the right queue for this container role."""
+    if not artifacts:
+        return
+    if _is_frontend_container:
+        _pending_cfn_artifacts.extend(artifacts)
+    else:
+        _outbound_cfn_artifacts.extend(artifacts)
+
+
+def _extract_cfn_artifacts(data: str) -> tuple[str, list[dict]]:
+    """Extract <cfn-artifact> blocks from a delegate response.
+
+    Returns (sanitized_data, artifacts) where:
+      - sanitized_data has each block replaced with a short placeholder
+      - artifacts is a list of {"title": str, "yaml": str} dicts
+    """
+    if "<cfn-artifact" not in data:
+        return data, []
+
+    artifacts: list[dict] = []
+
+    def _replace(m: re.Match) -> str:
+        attrs = m.group("attrs") or ""
+        title_m = _CFN_TITLE_RE.search(attrs)
+        title = title_m.group(1) if title_m else "CloudFormation alarm template"
+        yaml_body = m.group("body")
+        artifacts.append({"title": title, "yaml": yaml_body})
+        return f"[CloudFormation template generated: {title}]"
+
+    sanitized = _CFN_ARTIFACT_RE.sub(_replace, data)
+    return sanitized, artifacts
+
+
 def _make_agent_tool(
     agent_name: str,
     endpoint: str,
@@ -308,6 +409,20 @@ def _make_agent_tool(
                 if isinstance(parsed, dict):
                     if "tool_trace" in parsed:
                         result["tool_trace"] = parsed["tool_trace"]
+                    # An intermediate (orchestrator) child forwards already
+                    # extracted artifacts out of band under "cfn_artifacts".
+                    # Re-queue them here so they continue travelling up to
+                    # the supervisor (where they finally get persisted +
+                    # emitted). The child already stripped the YAML from its
+                    # text, so the model never sees it at this hop either.
+                    forwarded_artifacts = parsed.get("cfn_artifacts")
+                    if isinstance(forwarded_artifacts, list) and forwarded_artifacts:
+                        _queue_cfn_artifacts(forwarded_artifacts)
+                        logger.info(
+                            "Delegate %s: forwarded %d cfn-artifact(s) from child",
+                            agent_name,
+                            len(forwarded_artifacts),
+                        )
                     result["data"] = parsed.get(
                         "response", parsed.get("data", result_text)
                     )
@@ -321,22 +436,29 @@ def _make_agent_tool(
                 len(str(result.get("data", ""))),
             )
 
+            # Extract <cfn-artifact> blocks BEFORE the model sees the
+            # result. The sanitized data has short placeholders; the
+            # extracted YAML bodies go into the module-level queue for
+            # the event-loop to persist and emit <report-pending>.
+            data_str = str(result.get("data", ""))
+            sanitized, cfn_artifacts = _extract_cfn_artifacts(data_str)
+            if cfn_artifacts:
+                result["data"] = sanitized
+                _queue_cfn_artifacts(cfn_artifacts)
+                logger.info(
+                    "Delegate %s: extracted %d cfn-artifact(s), "
+                    "sanitized data_len=%d",
+                    agent_name,
+                    len(cfn_artifacts),
+                    len(sanitized),
+                )
+
             # Register completion on the current handler so the trace
             # gets input, output, duration, and nested sub-agent traces.
             handler = get_current_handler()
             if handler:
                 output_val = str(result.get("data", ""))
                 nested_val = result.get("tool_trace")
-                # Debug: print to stdout so it appears in runtime logs
-                import sys
-
-                print(
-                    f"[TRACE_DEBUG] {agent_name}: output_len={len(output_val)}, "
-                    f"nested={len(nested_val) if nested_val else 'None'}, "
-                    f"result_keys={list(result.keys())}",
-                    file=sys.stderr,
-                    flush=True,
-                )
                 handler.complete_tool(
                     tool_name=agent_name,
                     output=output_val,

@@ -1,6 +1,5 @@
 """Unit tests for agents.shared.memory — manual memory management."""
 
-import re
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -238,3 +237,86 @@ class TestSaveAssistantMessage:
     def test_skips_empty_text(self):
         # Should not raise
         save_assistant_message("mem", "sess", "actor", "   ")
+
+
+class TestMemoryEventSizeGuard:
+    """Regression coverage for AgentCore Memory's 100,000-char per-event
+    payload limit. A many-alarm CFN template inside `<cfn-artifact>` plus
+    the surrounding `<tool>`/`<think>`/text segments routinely pushed the
+    enriched text past the limit, the CreateEvent call failed with
+    ValidationException, and the entire assistant turn was lost from
+    history on reload — leaving the user prompt visible but no response.
+    """
+
+    @patch("agents.shared.memory._get_client")
+    def test_strips_cfn_artifact_block_before_save(self, mock_get):
+        client = MagicMock()
+        mock_get.return_value = client
+        big_yaml = "x" * 60_000
+        text = (
+            "Summary text.\n"
+            f"<cfn-artifact title=\"big\">{big_yaml}</cfn-artifact>\n"
+            "Trailing summary."
+        )
+        save_assistant_message("mem", "sess", "actor", text)
+        saved = client.create_event.call_args[1]["payload"][0][
+            "conversational"
+        ]["content"]["text"]
+        assert big_yaml not in saved
+        assert "<cfn-artifact" not in saved
+        assert "</cfn-artifact>" not in saved
+        assert "Summary text." in saved
+        assert "Trailing summary." in saved
+        assert "ReportPanel" in saved
+
+    @patch("agents.shared.memory._get_client")
+    def test_strips_cfn_artifact_inside_tool_segment(self, mock_get):
+        # The <cfn-artifact> can land anywhere in the enriched text —
+        # including nested inside a sub-agent's saved <tool> output JSON.
+        # The strip must catch every embedding layer.
+        client = MagicMock()
+        mock_get.return_value = client
+        big_yaml = "y" * 70_000
+        tool_payload = (
+            '{"name":"cloudwatch-agent","input":{},"output":'
+            f'"<cfn-artifact title=\\"x\\">{big_yaml}</cfn-artifact>"' "}"
+        )
+        text = f"Header\n<tool>{tool_payload}</tool>\nFooter"
+        save_assistant_message("mem", "sess", "actor", text)
+        saved = client.create_event.call_args[1]["payload"][0][
+            "conversational"
+        ]["content"]["text"]
+        # The artifact body inside the tool's `output` field must be gone.
+        assert big_yaml not in saved
+        # The surrounding chat text and tool wrapper survive — only the
+        # artifact body is replaced with the placeholder.
+        assert "Header" in saved
+        assert "Footer" in saved
+        assert "<tool>" in saved
+        assert len(saved) < 10_000
+
+    @patch("agents.shared.memory._get_client")
+    def test_preserves_short_text_unchanged(self, mock_get):
+        client = MagicMock()
+        mock_get.return_value = client
+        text = (
+            "Short answer with a <tool>{\"name\":\"x\"}</tool> trace and "
+            "<suggestions>[\"q\"]</suggestions>."
+        )
+        save_assistant_message("mem", "sess", "actor", text)
+        saved = client.create_event.call_args[1]["payload"][0][
+            "conversational"
+        ]["content"]["text"]
+        # No `<cfn-artifact>` and well under the limit — must save verbatim.
+        assert saved == text
+
+    @patch("agents.shared.memory._get_client")
+    def test_no_op_when_no_cfn_artifact_present(self, mock_get):
+        client = MagicMock()
+        mock_get.return_value = client
+        text = "Just a regular response with <tool>{\"a\":1}</tool>."
+        save_assistant_message("mem", "sess", "actor", text)
+        saved = client.create_event.call_args[1]["payload"][0][
+            "conversational"
+        ]["content"]["text"]
+        assert saved == text
