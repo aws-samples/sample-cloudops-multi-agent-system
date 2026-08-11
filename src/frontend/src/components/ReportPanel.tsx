@@ -292,9 +292,16 @@ export function ReportPanel({ messageId, reportId, onClose, fullBleed = false, o
     document.body.style.cursor = "col-resize";
     document.body.style.userSelect = "none";
 
+    // Resize via DIRECT DOM writes during the drag; commit React state ONCE on
+    // mouseup. Setting state per mousemove re-rendered the whole panel — and
+    // through it ReactMarkdown + every SmartTable chart (each a Recharts
+    // ResponsiveContainer with a ResizeObserver) — ~60x/second. Oscillating
+    // the handle stacked those observer/setState cascades until React threw
+    // "Maximum update depth exceeded" and the app was dead until refresh.
+    let liveWidth = 0;
     const onMouseMove = (ev: MouseEvent) => {
-      const newWidth = Math.max(MIN_WIDTH, Math.min(window.innerWidth - ev.clientX, window.innerWidth * MAX_WIDTH_RATIO));
-      setPanelWidth(newWidth);
+      liveWidth = Math.max(MIN_WIDTH, Math.min(window.innerWidth - ev.clientX, window.innerWidth * MAX_WIDTH_RATIO));
+      if (panelRef.current) panelRef.current.style.width = `${liveWidth}px`;
     };
     const onMouseUp = () => {
       document.removeEventListener("mousemove", onMouseMove);
@@ -302,11 +309,14 @@ export function ReportPanel({ messageId, reportId, onClose, fullBleed = false, o
       document.body.style.cursor = "";
       document.body.style.userSelect = "";
       setIsDragging(false);
-      setPanelWidth((w) => { localStorage.setItem("artifact-panel-width", String(w)); return w; });
+      if (liveWidth) {
+        localStorage.setItem("artifact-panel-width", String(liveWidth));
+        setPanelWidth(liveWidth);
+      }
     };
     document.addEventListener("mousemove", onMouseMove);
     document.addEventListener("mouseup", onMouseUp);
-  }, []);
+  }, [panelRef]);
 
   // When the panel was opened from an async-report ReportCard, the message
   // content only has a <report-pending> marker until the background worker

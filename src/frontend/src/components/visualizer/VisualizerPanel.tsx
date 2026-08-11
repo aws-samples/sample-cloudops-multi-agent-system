@@ -103,12 +103,23 @@ export function VisualizerPanel({
     document.body.style.cursor = "col-resize";
     document.body.style.userSelect = "none";
 
+    // Direct DOM writes during the drag; React state committed once on mouseup.
+    // Per-mousemove setState re-rendered the panel's heavy children (ReactFlow
+    // canvas here; Recharts in ReportPanel) ~60x/s — oscillating the handle
+    // stacked their ResizeObserver/setState cascades until React threw
+    // "Maximum update depth exceeded". See ReportPanel.handleMouseDown.
+    let liveWidth = 0;
     const onMouseMove = (ev: MouseEvent) => {
-      const next = Math.max(
+      liveWidth = Math.max(
         MIN_WIDTH,
         Math.min(window.innerWidth - ev.clientX, window.innerWidth * MAX_WIDTH_RATIO),
       );
-      setPanelWidth(next);
+      if (panelRef.current) {
+        panelRef.current.style.width = `${liveWidth}px`;
+        // Keep the chat-collapse button anchored during the drag (it reads
+        // this var); the panelWidth effect re-publishes it after commit.
+        document.documentElement.style.setProperty("--visualizer-panel-width", `${liveWidth}px`);
+      }
     };
     const onMouseUp = () => {
       document.removeEventListener("mousemove", onMouseMove);
@@ -116,14 +127,14 @@ export function VisualizerPanel({
       document.body.style.cursor = "";
       document.body.style.userSelect = "";
       setIsDragging(false);
-      setPanelWidth((w) => {
-        localStorage.setItem(STORAGE_KEY, String(w));
-        return w;
-      });
+      if (liveWidth) {
+        localStorage.setItem(STORAGE_KEY, String(liveWidth));
+        setPanelWidth(liveWidth);
+      }
     };
     document.addEventListener("mousemove", onMouseMove);
     document.addEventListener("mouseup", onMouseUp);
-  }, []);
+  }, [panelRef]);
 
   // Escape-to-close is now handled by `useFocusTrap` above — no separate
   // window-level listener needed. Keeping the comment so a future reader

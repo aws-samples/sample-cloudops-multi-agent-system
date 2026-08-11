@@ -61,7 +61,21 @@ export function ReportCard({ markerText }: { markerText: string }) {
             try {
                 const resp = await getReportStatus(reportId, "", getToken);
                 if (cancelled) return;
-                setStatus(resp as ReportStatus);
+                // Only re-set state when something actually CHANGED. This poll
+                // ran every 3s and always set a fresh object, so a completed
+                // report re-rendered this card indefinitely — and because the
+                // card sits above later messages in the thread, that reflow
+                // reset the scroll position while a follow-up answer was
+                // streaming in.
+                setStatus((prev) =>
+                    prev.status === (resp as ReportStatus).status &&
+                    prev.title === (resp as ReportStatus).title &&
+                    prev.current_section === (resp as ReportStatus).current_section &&
+                    prev.total_sections === (resp as ReportStatus).total_sections &&
+                    prev.error === (resp as ReportStatus).error
+                        ? prev
+                        : (resp as ReportStatus),
+                );
                 if (!TERMINAL.has((resp as ReportStatus).status || "")) {
                     timer = setTimeout(tick, POLL_INTERVAL_MS);
                 }

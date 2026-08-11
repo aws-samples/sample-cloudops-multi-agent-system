@@ -27,6 +27,56 @@ logger = logging.getLogger(__name__)
 
 _memory_client = None
 
+# AgentCore Memory rejects any single conversational event whose text exceeds
+# 100,000 chars (CreateEvent ValidationException). A large report follow-up —
+# which quotes the report's tables plus full <tool> outputs — can blow past
+# this; the event was then dropped entirely and the turn vanished on reload.
+# Keep a margin under the hard cap for the role/JSON envelope overhead.
+_MAX_EVENT_TEXT = 96_000
+
+# Structured UI the frontend rehydrates on reload is persisted in its OWN
+# compact tags (<visualizer-state>, <report-body>, <artifact>, <report-pending>,
+# <suggestions>), which the trimmer must NEVER touch — the card/report is
+# reconstructed from them regardless of how the bulky raw <tool> trace is
+# trimmed. <tool> blocks are pure trace verbosity for reload purposes (the
+# frontend re-abbreviates them), so they are the only thing sacrificed here.
+def _fit_event_text(text: str) -> str:
+    """Shrink *text* to fit the Memory per-event limit without losing UI state.
+
+    The compact <visualizer-state>/<report-body>/<artifact>/<suggestions> tags
+    carry everything the UI needs on reload, so they are protected. Only whole
+    <tool>…</tool> trace blocks are trimmed (biggest first, so tag structure is
+    never left half-open), then a hard tail-cut as an absolute last resort.
+    """
+    if len(text) <= _MAX_EVENT_TEXT:
+        return text
+
+    tool_re = re.compile(r"<tool>[\s\S]*?</tool>", re.DOTALL)
+    placeholder = '<tool>{"truncated":true}</tool>'
+
+    blocks = sorted(tool_re.finditer(text), key=lambda m: m.end() - m.start(), reverse=True)
+    for m in blocks:
+        if len(text) <= _MAX_EVENT_TEXT:
+            break
+        if m.group(0) == placeholder:
+            continue
+        text = text[: m.start()] + placeholder + text[m.end():]
+
+    # Absolute last resort — no <tool> blocks left and still over (e.g. a giant
+    # report body). Hard-cut the head, but ALWAYS keep a trailing
+    # <visualizer-state> tag (wherever it sits) so the card still rehydrates —
+    # it's small and load-bearing; the report body is what's oversized.
+    if len(text) > _MAX_EVENT_TEXT:
+        viz_m = re.search(r"<visualizer-state>[\s\S]*</visualizer-state>\s*$", text)
+        marker = "\n[…truncated for storage…]\n"
+        if viz_m and len(viz_m.group(0)) + len(marker) < _MAX_EVENT_TEXT:
+            viz = viz_m.group(0)
+            head_budget = _MAX_EVENT_TEXT - len(viz) - len(marker)
+            text = text[:head_budget] + marker + viz
+        else:
+            text = text[: _MAX_EVENT_TEXT - 40] + "\n[…truncated for storage…]"
+    return text
+
 
 def _get_client(region: str = "us-east-1"):
     global _memory_client
@@ -92,6 +142,14 @@ def load_history(
                 text = re.sub(
                     r"\n?<session-title>.*?</session-title>", "", text, flags=re.DOTALL
                 )
+                # Frontend-only VisualizerCard payload — the compact topology
+                # JSON is for the browser to rehydrate the card, NOT for the
+                # model. Stripping it keeps 30-80KB of topology out of every
+                # follow-up turn's context (the <tool> trace above already
+                # gives the model what it needs to reference "the diagram").
+                text = re.sub(
+                    r"\n?<visualizer-state>.*?</visualizer-state>", "", text, flags=re.DOTALL
+                )
                 # Frontend-only report-mode marker on user turns — the model
                 # must never see it (it's not content, just a UI badge signal).
                 text = re.sub(r"\n?<report-request/>", "", text)
@@ -132,6 +190,7 @@ def save_user_message(
         return
     try:
         text = prompt + "\n<report-request/>" if is_report else prompt
+        text = _fit_event_text(text)
         client = _get_client(region)
         client.create_event(
             memoryId=memory_id,
@@ -154,6 +213,12 @@ def save_assistant_message(
     """Save enriched assistant response to Memory (after streaming completes)."""
     if not memory_id or not session_id or not actor_id or not enriched_text.strip():
         return
+    text = _fit_event_text(enriched_text)
+    if len(text) < len(enriched_text):
+        logger.info(
+            "Trimmed assistant message %d -> %d chars to fit Memory event limit",
+            len(enriched_text), len(text),
+        )
     try:
         client = _get_client(region)
         client.create_event(
@@ -164,7 +229,7 @@ def save_assistant_message(
             payload=[
                 {
                     "conversational": {
-                        "content": {"text": enriched_text},
+                        "content": {"text": text},
                         "role": "ASSISTANT",
                     }
                 }
@@ -211,6 +276,13 @@ def build_enriched_text(ordered_segments: list[dict]) -> str:
             flush_text()
             flush_thinking()
             enriched_parts.append(f'<suggestions>{seg["value"]}</suggestions>')
+        elif seg_type == "visualizer_state":
+            # Compact DX topology for reload-time VisualizerCard rehydration.
+            # page.tsx reads this <visualizer-state> tag directly, so the card
+            # survives even if the bulky raw <tool> topology gets trimmed.
+            flush_text()
+            flush_thinking()
+            enriched_parts.append(f'<visualizer-state>{seg["value"]}</visualizer-state>')
 
     flush_text()
     flush_thinking()

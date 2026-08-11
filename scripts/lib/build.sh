@@ -161,10 +161,15 @@ _build_single_agent() {
   local ecr_registry="${account_id}.dkr.ecr.${AWS_REGION}.amazonaws.com"
   local image_uri="${ecr_registry}/${repo_name}:${tag}"
 
-  # Ensure ECR repo exists
+  # Ensure ECR repo exists. ECR repos are created here via the CLI, NOT by
+  # Terraform, so the provider's default_tags don't apply to them — tag them
+  # explicitly so they carry the same project/environment/retention metadata
+  # as every other resource in the stack.
   if ! aws ecr describe-repositories --repository-names "$repo_name" --region "$AWS_REGION" > /dev/null 2>&1; then
     info "Creating ECR repo: $repo_name"
-    aws ecr create-repository --repository-name "$repo_name" --region "$AWS_REGION" --image-scanning-configuration scanOnPush=true > /dev/null
+    aws ecr create-repository --repository-name "$repo_name" --region "$AWS_REGION" \
+      --image-scanning-configuration scanOnPush=true \
+      --tags "Key=auto-delete,Value=no" "Key=project,Value=${PROJECT_PREFIX}" "Key=environment,Value=${ENVIRONMENT}" "Key=managed_by,Value=deploy-script" > /dev/null
   fi
 
   # Ensure the per-agent hierarchy slice exists (build_all_agent_images writes

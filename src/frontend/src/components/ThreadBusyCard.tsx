@@ -34,7 +34,10 @@ export function ThreadBusyCard({ activity }: ThreadBusyCardProps) {
 
     return (
         <div
-            className="max-w-2xl mx-auto w-full px-4 pt-8"
+            // shrink-0: as a flex child of <main> (now min-h-0/overflow-hidden)
+            // the card must keep its natural height instead of being squeezed,
+            // while the Thread below flexes into whatever remains.
+            className="max-w-2xl mx-auto w-full px-4 pt-8 shrink-0"
             role="status"
             aria-live="polite"
         >
