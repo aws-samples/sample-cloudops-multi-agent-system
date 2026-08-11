@@ -13,9 +13,23 @@ reference material.
 
 ## 1. What the feature does
 
-Answers tag-compliance questions on-demand — no collector, no cached
-state. Every query hits the live AWS APIs from the Lambda's account
-and returns a fresh classification.
+Answers tag-compliance questions from a **scheduled snapshot** when one is
+available, falling back to live AWS API queries otherwise.
+
+By default (`enable_tag_snapshots = true`), a collector Lambda sweeps the
+expensive scans on a schedule (`rate(6 hours)`) and stores the responses in
+DynamoDB. Canonical (unfiltered) queries then answer in milliseconds and carry
+`data_as_of` + `data_source: "scheduled_snapshot"`. Three things always go
+live: queries with caller filters (`resource_types`, `regions`,
+`required_tags` override, `use_aws_evaluation`…), `force_refresh=true`, and
+any cache miss (collector disabled, snapshot expired, table unreachable —
+the fallback is silent and the tool behaves exactly as it did pre-collector).
+
+The collector does not reimplement scan logic: it invokes the SAME tool
+Lambda with gateway-shaped requests and stores what comes back, so the live
+and snapshot paths cannot drift. Snapshot staleness is bounded by the item
+TTL (default 48h): if the collector stops running, snapshots expire and the
+tool reverts to live queries rather than serving stale data forever.
 
 Representative prompts:
 
@@ -337,3 +351,6 @@ delete the row to fall back to the JSON.
 | Tag is compliant per policy but doesn't show on the bill | Cost-allocation activation is a separate payer action | Use `list_cost_allocation_tag_status`; activate in Billing → Cost allocation tags |
 | `api_limit_reached: true` in `find_untagged_resources` or `check_tag_compliance` | Resource Explorer Search capped at 1000 results | Pass single `resource_type` or `region` to filter server-side |
 | Report still shows old section count after editing the JSON | DynamoDB shadow row under your actor_id (created by UI save) | Delete the row from `<prefix>-<env>-report-templates` and redeploy |
+| Answers carry `data_source: "scheduled_snapshot"` but numbers look stale | Snapshot age within the schedule window (default 6h) | Ask again with `force_refresh=true`, or check the collector's `LAST_RUN` meta row / CloudWatch logs |
+| Snapshot never serves (every call is slow/live) despite `enable_tag_snapshots = true` | Collector failing (see its log group) or snapshot TTL expired; also every filtered query is live BY DESIGN | `aws logs tail /aws/lambda/<prefix>-tag-governance-collector`; confirm the CACHE rows exist in `<prefix>-tag-compliance-snapshots` |
+| Snapshot responses carry `snapshot_note` about trimmed detail lists | Full detail list exceeded the DynamoDB 400 KB item cap | Counts/breakdowns are still complete; use `force_refresh=true` when the full detail list matters |

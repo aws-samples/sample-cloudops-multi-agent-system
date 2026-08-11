@@ -633,6 +633,79 @@ def _assemble_compliance_response(
 
 
 # ---------------------------------------------------------------------------
+# Snapshot cache (optional, written by the tag-governance collector)
+# ---------------------------------------------------------------------------
+#
+# When TAG_SNAPSHOT_TABLE_NAME is set, a scheduled collector periodically runs
+# the expensive sweeps (Resource Explorer inventory + classification, 3–60s on
+# real estates) and stores the responses. Reads here become millisecond DDB
+# GetItems. Live querying remains for:
+#   * requests with caller filters (resource_types, regions, required_tags
+#     override, non-default max_resources…) — a canonical snapshot cannot
+#     honestly answer a filtered question;
+#   * force_refresh=true (explicit freshness escape hatch);
+#   * cache miss / collector not deployed / table unset — silent fallthrough.
+#
+# Only these ops are snapshot-eligible; the rest are cheap single API calls
+# (list_cost_allocation_tag_status) or static (get_remediation_guidance).
+
+_SNAPSHOT_TABLE = os.environ.get("TAG_SNAPSHOT_TABLE_NAME", "")
+
+# op → the exact caller keys that force a LIVE query when present. Keys the
+# canonical sweep already used (max_resources — details are stored beyond any
+# caller's cap and re-truncated below) do not force liveness.
+_SNAPSHOT_ELIGIBLE: dict[str, tuple[str, ...]] = {
+    "get_required_tags": ("required_tags",),
+    "check_tag_compliance": (
+        "required_tags", "resource_types", "regions",
+        "use_aws_evaluation", "include_system_managed",
+    ),
+    "find_untagged_resources": ("resource_types", "regions"),
+    "list_tag_keys_in_use": ("regions",),
+    "get_org_tag_compliance_summary": ("group_by", "target_ids", "regions"),
+}
+
+
+def _snapshot_lookup(tool_name: str, event: dict[str, Any]) -> dict[str, Any] | None:
+    """Return the cached snapshot for *tool_name*, or None to go live."""
+    if not _SNAPSHOT_TABLE or tool_name not in _SNAPSHOT_ELIGIBLE:
+        return None
+    if event.get("force_refresh"):
+        return None
+    # Any live-forcing filter present (and truthy) → live path.
+    if any(event.get(k) for k in _SNAPSHOT_ELIGIBLE[tool_name]):
+        return None
+    try:
+        resp = boto3.client("dynamodb").get_item(
+            TableName=_SNAPSHOT_TABLE,
+            Key={"pk": {"S": "CACHE"}, "sk": {"S": tool_name}},
+        )
+        item = resp.get("Item")
+        if not item:
+            return None
+        payload = json.loads(item["payload"]["S"])
+        payload["data_as_of"] = item.get("snapshot_at", {}).get("S", "")
+        payload["data_source"] = "scheduled_snapshot"
+        payload["freshness_note"] = (
+            "Served from the scheduled compliance snapshot (fast path). "
+            "Pass force_refresh=true for a live scan."
+        )
+        # Honor the caller's max_resources against the stored detail list —
+        # the snapshot stores up to the sweep cap, callers usually want less.
+        if tool_name in ("check_tag_compliance", "find_untagged_resources"):
+            cap = int(event.get("max_resources", 25))
+            for key in ("non_compliant_resources", "untagged_resources", "resources"):
+                lst = payload.get(key)
+                if isinstance(lst, list) and len(lst) > cap:
+                    payload[key] = lst[:cap]
+                    payload["truncated"] = True
+        return payload
+    except Exception as exc:  # noqa: BLE001 — cache failure must never break the tool
+        logger.warning("snapshot lookup failed (%s); falling back to live", exc)
+        return None
+
+
+# ---------------------------------------------------------------------------
 # Tool dispatch
 # ---------------------------------------------------------------------------
 
@@ -648,6 +721,10 @@ def handler(event, context):
             "error": f"Unknown tool: {tool_name}",
             "available_tools": list(_TOOL_HANDLERS.keys()),
         }
+    cached = _snapshot_lookup(tool_name, event or {})
+    if cached is not None:
+        logger.info("Serving %s from snapshot (%s)", tool_name, cached.get("data_as_of"))
+        return cached
     try:
         response = fn(event or {})
         logger.info("Response: %s", json.dumps(response, default=str))

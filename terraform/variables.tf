@@ -283,3 +283,22 @@ variable "memory_id" {
   type        = string
   default     = ""
 }
+
+variable "enable_tag_snapshots" {
+  description = <<-EOT
+    Deploy the tag-governance collection module: a scheduled Lambda that
+    snapshots org tag-compliance posture into DynamoDB so canonical
+    (unfiltered) tag-governance queries answer in milliseconds instead of a
+    3-60s live Resource Explorer sweep. Filtered queries and
+    force_refresh=true still go live. Only takes effect when the
+    tag-governance tool is deployed.
+  EOT
+  type        = bool
+  default     = true
+}
+
+variable "tag_snapshot_schedule" {
+  description = "EventBridge schedule expression for the tag-compliance snapshot sweep."
+  type        = string
+  default     = "rate(6 hours)"
+}

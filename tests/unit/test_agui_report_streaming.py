@@ -582,3 +582,61 @@ class TestBuildFreeformTemplate:
         tpl = _build_freeform_template("Show me April spend!")
         # Cleaner sidebar rendering when the prompt ends in a sentence stop.
         assert tpl["name"] == "Show me April spend"
+
+
+# ---------------------------------------------------------------------------
+# actor_id derivation tests — the report-orphaning bug
+# ---------------------------------------------------------------------------
+
+
+def _jwt_with(claims: dict) -> str:
+    """Build an unsigned JWT-shaped token (header.payload.sig) for header tests.
+
+    The runtime's platform authorizer verifies signatures before requests reach
+    the container, so the container-side parser deliberately does not verify —
+    a structurally-valid token is all these tests need.
+    """
+    import base64 as b64
+
+    enc = lambda d: b64.urlsafe_b64encode(json.dumps(d).encode()).decode().rstrip("=")
+    return f"{enc({'alg': 'RS256'})}.{enc(claims)}.sig"
+
+
+class TestActorIdFromJwt:
+    def test_email_claim_wins_over_forwarded_props(self):
+        """The bug: a client-sent actor_id diverging from the JWT identity made
+        the report save under one partition key while core-api's poll (JWT-
+        derived) read another — the UI spun on 'Generating…' forever."""
+        from agents.shared.agui_server import _actor_id_from_jwt
+
+        req = MagicMock()
+        req.headers = {"authorization": f"Bearer {_jwt_with({'email': 'alice@example.com'})}"}
+        assert _actor_id_from_jwt(req) == "alice_at_example_com"
+
+    def test_sanitization_matches_core_api(self):
+        """Same input must produce core-api handler.py::_get_actor_id's output."""
+        from agents.shared.agui_server import _sanitize_actor_id
+
+        email = "first.last@sub.example.co.uk"
+        assert _sanitize_actor_id(email) == email.replace("@", "_at_").replace(".", "_")
+
+    def test_no_bearer_token_falls_back(self):
+        from agents.shared.agui_server import _actor_id_from_jwt
+
+        req = MagicMock()
+        req.headers = {}
+        assert _actor_id_from_jwt(req) == ""
+
+    def test_token_without_email_falls_back(self):
+        from agents.shared.agui_server import _actor_id_from_jwt
+
+        req = MagicMock()
+        req.headers = {"authorization": f"Bearer {_jwt_with({'sub': 'abc-123'})}"}
+        assert _actor_id_from_jwt(req) == ""
+
+    def test_malformed_token_falls_back_not_crashes(self):
+        from agents.shared.agui_server import _actor_id_from_jwt
+
+        req = MagicMock()
+        req.headers = {"authorization": "Bearer not.a.jwt"}
+        assert _actor_id_from_jwt(req) == ""

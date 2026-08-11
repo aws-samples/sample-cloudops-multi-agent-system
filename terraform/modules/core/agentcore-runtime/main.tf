@@ -214,6 +214,17 @@ resource "aws_bedrockagentcore_agent_runtime" "this" {
     server_protocol = "AGUI"
   }
 
+  # Forward the caller's Authorization header into the container. The runtime
+  # strips all client headers unless allowlisted; the AG-UI server derives
+  # actor_id from the platform-validated JWT in this header (agui_server.py::
+  # _actor_id_from_jwt) so report/session partition keys come from the same
+  # claim core-api uses — without this, actor_id silently falls back to the
+  # client-controlled forwardedProps and reports can be written under a key
+  # the frontend never polls ("Generating…" forever) or spoofed cross-actor.
+  request_header_configuration {
+    request_header_allowlist = ["Authorization"]
+  }
+
   environment_variables = merge(
     {
       AGENT_NAME                 = var.agent_name
