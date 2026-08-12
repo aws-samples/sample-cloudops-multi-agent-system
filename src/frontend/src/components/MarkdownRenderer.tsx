@@ -183,7 +183,7 @@ export function SmartTable({ children }: { children: React.ReactNode }) {
         <div data-view="chart" className="rounded-lg p-3" style={showChart ? { background: "var(--bg-surface)", border: "1px solid var(--border-default)" } : { position: "absolute", opacity: 0, pointerEvents: "none", zIndex: -1, width: "100%", background: "var(--bg-surface)", border: "1px solid var(--border-default)" }}>
           {chartInfo.chartType === "area" ? (
             /* Area chart for time series — shows magnitude + trend */
-            <ResponsiveContainer width="100%" height={300}>
+            <ResponsiveContainer width="100%" height={300} debounce={150}>
               <AreaChart data={chartInfo.data} margin={{ left: 10, right: 20, top: 5, bottom: chartInfo.data.length > 6 ? 40 : 5 }}>
                 <defs>
                   {chartInfo.keys.map((key, i) => (
@@ -219,7 +219,7 @@ export function SmartTable({ children }: { children: React.ReactNode }) {
               </AreaChart>
             </ResponsiveContainer>
           ) : chartInfo.chartType === "pie" ? (
-            <ResponsiveContainer width="100%" height={300}>
+            <ResponsiveContainer width="100%" height={300} debounce={150}>
               <PieChart>
                 <Pie
                   data={chartInfo.data}
@@ -243,7 +243,7 @@ export function SmartTable({ children }: { children: React.ReactNode }) {
             </ResponsiveContainer>
           ) : (
             /* Default: horizontal bar chart, sorted descending */
-            <ResponsiveContainer width="100%" height={Math.min(chartInfo.data.length * (chartInfo.keys.length > 1 ? 48 : 36) + 60, 500)}>
+            <ResponsiveContainer width="100%" height={Math.min(chartInfo.data.length * (chartInfo.keys.length > 1 ? 48 : 36) + 60, 500)} debounce={150}>
               <BarChart data={chartInfo.data} layout="vertical" margin={{ left: 10, right: 20, top: 5, bottom: 5 }}>
                 <XAxis type="number" tick={{ fill: "var(--text-muted)", fontSize: 10 }} tickFormatter={(v) => formatValue(v)} />
                 <YAxis type="category" dataKey="name" width={120} tick={{ fill: "var(--text-muted)", fontSize: 10 }} tickFormatter={(v) => truncateLabel(v)} />

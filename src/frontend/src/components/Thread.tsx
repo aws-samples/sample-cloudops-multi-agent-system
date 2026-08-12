@@ -16,8 +16,6 @@ import {
   Wrench,
   Loader2,
   Copy,
-  ThumbsUp,
-  ThumbsDown,
   CornerDownRight,
   Check,
   NotebookText,
@@ -79,7 +77,12 @@ const SUGGESTIONS = [
 
 export function Thread() {
   return (
-    <ThreadPrimitive.Root className="flex flex-col h-full" style={{ background: "var(--bg-primary)" }}>
+    // min-h-0 + flex-1 (not h-full): this Root is a flex child of <main>, which
+    // may also render the ThreadBusyCard above it. With h-full the Root claimed
+    // 100% of main's height ON TOP of the card's height, so main overflowed its
+    // h-dvh parent and the DOCUMENT scrolled — which dragged the sidebar header
+    // off-screen and threw the view to the top as content streamed in.
+    <ThreadPrimitive.Root className="flex flex-col flex-1 min-h-0" style={{ background: "var(--bg-primary)" }}>
       <ThreadPrimitive.Viewport className="flex-1 overflow-y-auto px-4 pt-8 pb-4">
         <ThreadPrimitive.Empty>
           <EmptyState />
@@ -162,7 +165,18 @@ function Composer() {
   // tab isn't the one streaming it (e.g. user switched threads, came back),
   // the composer has to be disabled so a new message doesn't corrupt the
   // in-flight run. Local streaming is handled by the existing stop/send split.
-  const onlyRemoteBusy = !isStreamingLocally && isThreadBusyRemotely;
+  //
+  // Sticky within a turn: the remote activity row lags the local streaming
+  // flag by up to one poll interval (2s), so a naive
+  // `!isStreamingLocally && isThreadBusyRemotely` flickers true for a beat at
+  // the start/end of YOUR OWN turn — disabling the composer mid-stream. Once
+  // we've seen local streaming for this run, treat the thread as locally-owned
+  // until the remote flag clears too.
+  const streamedLocallyRef = useRef(false);
+  if (isStreamingLocally) streamedLocallyRef.current = true;
+  if (!isThreadBusyRemotely) streamedLocallyRef.current = false;
+  const onlyRemoteBusy =
+    !isStreamingLocally && isThreadBusyRemotely && !streamedLocallyRef.current;
 
   useEffect(() => {
     window.__chatMode = reportMode ? "report" : null;
@@ -412,7 +426,13 @@ function Composer() {
               : "Ask about your AWS cloud operations..."}
             className="flex-1 resize-none border-0 bg-transparent text-sm outline-none min-h-[20px] max-h-[120px] disabled:opacity-60"
             style={{ color: "var(--text-primary)" }}
-            autoFocus={!onlyRemoteBusy}
+            // autoFocus must be a CONSTANT. Deriving it from `onlyRemoteBusy`
+            // made it re-fire mid-stream: during your own turn the remote
+            // activity row lags the local streaming flag by up to one poll
+            // (2s), so onlyRemoteBusy briefly flips true→false, the input
+            // disables/re-enables, and the refocus yanked the viewport back to
+            // the composer while the answer was still streaming.
+            autoFocus
             disabled={onlyRemoteBusy}
           />
           {isStreamingLocally ? (
@@ -529,7 +549,6 @@ function AssistantMessage() {
 
 function ActionBar() {
   const [copied, setCopied] = useState(false);
-  const [vote, setVote] = useState<"up" | "down" | null>(null);
   const message = useMessage();
 
   const handleCopy = useCallback(() => {
@@ -562,21 +581,6 @@ function ActionBar() {
         label={copied ? "Copied" : "Copy"}
         icon={copied ? <Check className="h-4 w-4" /> : <Copy className="h-4 w-4" />}
         active={copied}
-      />
-      <div className="flex-1" />
-      <ActionButton
-        onClick={() => setVote(vote === "up" ? null : "up")}
-        label="Helpful"
-        icon={<ThumbsUp className="h-4 w-4" />}
-        active={vote === "up"}
-        activeColor="var(--accent)"
-      />
-      <ActionButton
-        onClick={() => setVote(vote === "down" ? null : "down")}
-        label="Not helpful"
-        icon={<ThumbsDown className="h-4 w-4" />}
-        active={vote === "down"}
-        activeColor="var(--danger)"
       />
     </div>
   );

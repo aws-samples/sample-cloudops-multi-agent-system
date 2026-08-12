@@ -289,7 +289,9 @@ main() {
     fi
   else
     local placeholder_image="public.ecr.aws/docker/library/python:3.12-slim"
-    for agent in "${SELECTED_AGENTS[@]}"; do
+    # SELECTED_AGENTS is empty in gateway-only/tools-only modes; guard the
+    # expansion so it doesn't trip `set -u` on bash 3.2 (macOS).
+    for agent in ${SELECTED_AGENTS[@]+"${SELECTED_AGENTS[@]}"}; do
       local existing
       existing=$(get_agent_image "$agent")
       if [ -z "$existing" ]; then

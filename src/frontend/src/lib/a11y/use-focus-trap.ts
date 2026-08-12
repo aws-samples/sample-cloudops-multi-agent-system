@@ -31,6 +31,17 @@ export function useFocusTrap<T extends HTMLElement = HTMLDivElement>(
   onEscape?: () => void,
 ) {
   const ref = useRef<T>(null);
+  // Keep the latest onEscape in a ref so the trap effect does NOT depend on its
+  // identity. Callers pass an inline arrow (e.g. `onClose={() => {...}}`), which
+  // is a new function on every parent render — with it in the dep array the trap
+  // tore down and re-engaged on each render, re-running `first?.focus()` and the
+  // `previouslyFocused?.focus()` cleanup. With the ReportPanel open (it ticks
+  // every 500ms while streaming) that stole focus into the panel over and over,
+  // scrolling it into view and pulling the user out of the chat mid-answer.
+  const onEscapeRef = useRef(onEscape);
+  useEffect(() => {
+    onEscapeRef.current = onEscape;
+  }, [onEscape]);
 
   useEffect(() => {
     if (!active || !ref.current) return;
@@ -44,7 +55,7 @@ export function useFocusTrap<T extends HTMLElement = HTMLDivElement>(
 
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
-        onEscape?.();
+        onEscapeRef.current?.();
         return;
       }
       if (e.key !== "Tab") return;
@@ -68,7 +79,7 @@ export function useFocusTrap<T extends HTMLElement = HTMLDivElement>(
       container.removeEventListener("keydown", handleKeyDown);
       previouslyFocused?.focus();
     };
-  }, [active, onEscape]);
+  }, [active]);
 
   return ref;
 }

@@ -16,7 +16,6 @@ import { VisualizerPanel } from "@/components/visualizer/VisualizerPanel";
 import { ReportTemplateEditor } from "@/components/ReportTemplateEditor";
 import { ReportTemplateList } from "@/components/ReportTemplateList";
 import { ThreadBusyCard } from "@/components/ThreadBusyCard";
-import { TourMenuButton } from "@/lib/tours/TourMenuButton";
 import { useTheme } from "@/lib/theme";
 import type { TopologyData, CombinedAssessment } from "@/lib/topology";
 import { extractVisualizerStateFromMemory } from "@/lib/visualizer-state";
@@ -56,6 +55,12 @@ export default function Home() {
   const [activeTraceMessageId, setActiveTraceMessageId] = useState<string | null>(null);
   const [activeVisualizerMessageId, setActiveVisualizerMessageId] = useState<string | null>(null);
   const [messagesLoading, setMessagesLoading] = useState(false);
+  // History-fetch failure state + manual retry trigger. Distinguishes "this
+  // conversation is empty" from "loading this conversation failed" — the two
+  // used to render identically (empty state), which read as the convo
+  // silently refusing to load after quick session switches.
+  const [loadFailed, setLoadFailed] = useState(false);
+  const [historyRetryTick, setHistoryRetryTick] = useState(0);
   const [sidebarOpen, setSidebarOpen] = useState(true);
   // When the visualizer is open, the user can collapse the main chat for a
   // full-bleed topology view. Resets to false when the visualizer closes so
@@ -87,10 +92,29 @@ export default function Home() {
   const prevLoadedThreadRef = useRef<string>("");
   useEffect(() => {
     if (prevThreadBusyRef.current && !threadBusyRemote) {
-      setRemoteRunCompletionTick((t) => t + 1);
+      // Only re-hydrate when THIS tab isn't mid-stream. The re-hydrate calls
+      // runtime.thread.reset(), rebuilding every message — harmless when we
+      // navigated back to a finished run (its whole purpose), but if it fires
+      // while a follow-up answer is streaming it rebuilds the thread under the
+      // user and throws the viewport back to the top. That's exactly what
+      // happened in report threads: the report's own running→idle transition
+      // landed while the follow-up was still streaming.
+      if (runtime.thread.getState().isRunning) {
+        // Defer: re-hydrate once our own stream finishes, so the refresh still
+        // happens (memory may hold content this tab never streamed) without
+        // yanking the viewport mid-answer.
+        const unsub = runtime.thread.subscribe(() => {
+          if (!runtime.thread.getState().isRunning) {
+            unsub();
+            setRemoteRunCompletionTick((t) => t + 1);
+          }
+        });
+      } else {
+        setRemoteRunCompletionTick((t) => t + 1);
+      }
     }
     prevThreadBusyRef.current = threadBusyRemote;
-  }, [threadBusyRemote]);
+  }, [threadBusyRemote, runtime]);
 
   // Build trace data from the current thread's last assistant message
   const [traceData, setTraceData] = useState<{ thinking?: string; tools: Array<{ name: string; input: Record<string, unknown>; output?: string; tool_trace?: Array<{ tool_name: string; duration_s?: number; status?: string; input?: Record<string, unknown>; output?: string; tool_trace?: Array<{ tool_name: string; duration_s?: number; status?: string; input?: Record<string, unknown>; output?: string }> }>; isStreaming?: boolean }>; isStreaming: boolean }>({ tools: [], isStreaming: false });
@@ -321,6 +345,7 @@ export default function Home() {
     const isTickReload = prevLoadedThreadRef.current === threadId;
     prevLoadedThreadRef.current = threadId;
     if (!isTickReload) setMessagesLoading(true);
+    setLoadFailed(false);
     (async () => {
       try {
         const { getSessionHistory } = await import("@/lib/runtime-client");
@@ -358,22 +383,33 @@ export default function Home() {
           let mainContent = m.content;
           let suggestionsPart: { type: "text"; text: string } | null = null;
           let artifactPart: { type: "text"; text: string } | null = null;
-          // Synthesize a <visualizer-state> part from any saved <tool> tags
-          // that contain DX topology/assessment data. The tag only ever exists
-          // in the live stream's synthetic segment — memory stores the raw
-          // tool output — so without reconstructing here, VisualizerCard
-          // vanishes on history reload. Same pattern the artifact/report
-          // branches use to rehydrate from memory.
-          const vizState =
-            m.role === "assistant"
-              ? extractVisualizerStateFromMemory(mainContent)
-              : null;
-          const vizStatePart = vizState
-            ? {
-                type: "text" as const,
-                text: `<visualizer-state>${JSON.stringify(vizState)}</visualizer-state>`,
+          // Rehydrate the VisualizerCard. Two save formats are supported:
+          //  (a) NEW: the backend persists a compact `<visualizer-state>` tag
+          //      directly (agui_server _save_enriched_response). Prefer it —
+          //      it's the clean state, no re-extraction needed. It MUST be
+          //      pulled OUT of mainContent, or the raw tag renders as literal
+          //      text in the chat bubble (the tag is only recognized as a
+          //      standalone content part, never inline in prose).
+          //  (b) OLD: pre-fix messages only have the raw `<tool>` output;
+          //      re-extract from that so old threads still show the card.
+          let vizStatePart: { type: "text"; text: string } | null = null;
+          if (m.role === "assistant") {
+            const embedded = mainContent.match(
+              /<visualizer-state>[\s\S]*?<\/visualizer-state>/,
+            );
+            if (embedded) {
+              vizStatePart = { type: "text" as const, text: embedded[0] };
+              mainContent = mainContent.replace(embedded[0], "").trim();
+            } else {
+              const vizState = extractVisualizerStateFromMemory(mainContent);
+              if (vizState) {
+                vizStatePart = {
+                  type: "text" as const,
+                  text: `<visualizer-state>${JSON.stringify(vizState)}</visualizer-state>`,
+                };
               }
-            : null;
+            }
+          }
           if (m.role === "assistant") {
             // Check if content already has <report-body> (template report from Memory)
             const hasReportBody = mainContent.includes("<report-body>");
@@ -562,14 +598,22 @@ export default function Home() {
           }, 100);
         }
       } catch {
-        if (!cancelled) runtime.thread.reset();
+        // A failed history fetch (throttle, transient network, expired token)
+        // used to reset the thread to EMPTY — indistinguishable from a
+        // conversation with no messages: no error, no retry, and the convo
+        // looked like it "stopped loading" until the user happened to click
+        // it again. Surface the failure instead and let the user retry.
+        if (!cancelled) {
+          runtime.thread.reset();
+          setLoadFailed(true);
+        }
       } finally {
         if (!cancelled) setMessagesLoading(false);
       }
     })();
     return () => { cancelled = true; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [threadId, remoteRunCompletionTick]);
+  }, [threadId, remoteRunCompletionTick, historyRetryTick]);
 
   // Thread-scoped panels (artifact, trace, visualizer) reference messages by
   // ID. The IDs don't survive thread switches — so dropping them here prevents
@@ -628,7 +672,6 @@ export default function Home() {
               <NotebookText className="h-3.5 w-3.5" aria-hidden="true" />
               Report Templates
             </button>
-            <TourMenuButton />
             <button
               onClick={toggleTheme}
               className="theme-toggle flex items-center w-full rounded-lg p-1 mb-2 cursor-pointer"
@@ -702,16 +745,39 @@ export default function Home() {
            button while the visualizer is open. Normal chat flow keeps its
            natural flex-1 width because `chatCollapsed` resets on viz close. */}
       <main
-        className="flex flex-col min-w-0"
+        // min-h-0 + overflow-hidden keep this column inside the h-dvh row even
+        // when the ThreadBusyCard adds height above the Thread. Without them
+        // the column grew past the viewport and the whole DOCUMENT scrolled
+        // (sidebar header scrolled away, view jumped while streaming).
+        className="flex flex-col min-w-0 min-h-0 overflow-hidden"
         style={{
           flex: chatCollapsed ? "0 0 0px" : "1 1 0%",
           width: chatCollapsed ? 0 : undefined,
-          overflow: chatCollapsed ? "hidden" : undefined,
         }}
       >
-        {threadBusyRemote && <ThreadBusyCard activity={threadActivity} />}
+        {/* `key` forces a fresh card per thread so its 1s elapsed-timer can
+             never carry a previous conversation's start time across a switch. */}
+        {threadBusyRemote && <ThreadBusyCard key={threadId} activity={threadActivity} />}
         <ThreadBusyProvider busy={threadBusyRemote}>
-          {messagesLoading ? <ChatSkeleton /> : <Thread />}
+          {messagesLoading ? (
+            <ChatSkeleton />
+          ) : loadFailed && !threadBusyRemote ? (
+            <div className="flex flex-col items-center justify-center h-full gap-3 px-4">
+              <p className="text-sm" style={{ color: "var(--text-muted)" }}>
+                Couldn&apos;t load this conversation.
+              </p>
+              <button
+                type="button"
+                onClick={() => setHistoryRetryTick((t) => t + 1)}
+                className="text-sm px-4 py-2 rounded-lg transition-colors hover:bg-[var(--bg-elevated)]"
+                style={{ color: "var(--text-primary)", border: "1px solid var(--border-default)" }}
+              >
+                Retry
+              </button>
+            </div>
+          ) : (
+            <Thread />
+          )}
         </ThreadBusyProvider>
       </main>
 

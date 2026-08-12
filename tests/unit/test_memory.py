@@ -6,6 +6,8 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from agents.shared.memory import (
+    _MAX_EVENT_TEXT,
+    _fit_event_text,
     build_enriched_text,
     load_history,
     save_assistant_message,
@@ -86,6 +88,31 @@ class TestLoadHistory:
         msgs = load_history("mem", "sess", "actor")
         assert len(msgs) == 1
         assert "<artifact>" not in msgs[0]["content"][0]["text"]
+
+    @patch("agents.shared.memory._get_client")
+    def test_strips_visualizer_state_from_model_history(self, mock_get):
+        # The compact topology JSON is for the browser card, NOT the model —
+        # leaving it in would feed 30-80KB of topology into every follow-up.
+        client = MagicMock()
+        client.list_events.return_value = {
+            "events": [
+                {
+                    "payload": [
+                        {
+                            "conversational": {
+                                "role": "ASSISTANT",
+                                "content": {"text": "Here is the setup.\n<visualizer-state>{\"topology\":{\"connections\":[1,2,3]}}</visualizer-state>"},
+                            }
+                        }
+                    ]
+                }
+            ]
+        }
+        mock_get.return_value = client
+        msgs = load_history("mem", "sess", "actor")
+        assert len(msgs) == 1
+        assert "<visualizer-state>" not in msgs[0]["content"][0]["text"]
+        assert "Here is the setup." in msgs[0]["content"][0]["text"]
 
     @patch("agents.shared.memory._get_client")
     def test_strips_suggestions_tags(self, mock_get):
@@ -238,3 +265,64 @@ class TestSaveAssistantMessage:
     def test_skips_empty_text(self):
         # Should not raise
         save_assistant_message("mem", "sess", "actor", "   ")
+
+
+class TestFitEventText:
+    """AgentCore Memory rejects events over 100k chars; oversized assistant
+    turns (large report follow-ups) used to be dropped whole, so the turn
+    vanished on history reload. _fit_event_text keeps them under the cap."""
+
+    def test_small_text_untouched(self):
+        t = "a short answer"
+        assert _fit_event_text(t) == t
+
+    def test_trims_largest_tool_blocks_first(self):
+        # A modest report body + one enormous tool output over the cap.
+        body = "<report-body>" + ("x" * 5000) + "</report-body>"
+        huge_tool = "<tool>" + ("y" * 150_000) + "</tool>"
+        out = _fit_event_text(body + huge_tool)
+        assert len(out) <= _MAX_EVENT_TEXT
+        assert "<report-body>" in out and "</report-body>" in out  # body preserved
+        assert '<tool>{"truncated":true}</tool>' in out            # tool sacrificed
+        # No half-open tags left for the frontend parser.
+        assert out.count("<tool>") == out.count("</tool>")
+
+    def test_hard_cut_when_body_itself_too_big(self):
+        giant = "<report-body>" + ("z" * 200_000) + "</report-body>"
+        out = _fit_event_text(giant)
+        assert len(out) <= _MAX_EVENT_TEXT
+        assert "truncated for storage" in out
+
+    def test_oversized_assistant_message_still_saves(self, monkeypatch):
+        client = MagicMock()
+        monkeypatch.setattr("agents.shared.memory._get_client", lambda region="us-east-1": client)
+        save_assistant_message("mem", "sess", "actor", "<tool>" + ("q" * 200_000) + "</tool>", "us-east-1")
+        # create_event was called (not skipped) and with text under the cap.
+        assert client.create_event.called
+        saved = client.create_event.call_args.kwargs["payload"][0]["conversational"]["content"]["text"]
+        assert len(saved) <= _MAX_EVENT_TEXT
+
+
+class TestFitEventPreservesUI:
+    """The trim protects the compact <visualizer-state> the card rehydrates from,
+    and only sacrifices bulky raw <tool> trace blocks."""
+
+    def test_visualizer_state_tag_survives_trim(self):
+        from agents.shared.memory import _fit_event_text, _MAX_EVENT_TEXT
+        viz = "<visualizer-state>" + ("v" * 32000) + "</visualizer-state>"
+        huge_tool = "<tool>" + ("y" * 150000) + "</tool>"
+        out = _fit_event_text("Here is the demo. " + huge_tool + "\n" + viz)
+        assert len(out) <= _MAX_EVENT_TEXT
+        assert viz in out                                   # card state intact
+        assert '<tool>{"truncated":true}</tool>' in out     # trace sacrificed
+        assert out.count("<tool>") == out.count("</tool>")
+
+    def test_visualizer_state_survives_even_hard_cut(self):
+        from agents.shared.memory import _fit_event_text, _MAX_EVENT_TEXT
+        # No <tool> blocks to trim; a giant report body + trailing viz-state.
+        body = "<report-body>" + ("z" * 200000) + "</report-body>"
+        viz = "<visualizer-state>" + ("v" * 30000) + "</visualizer-state>"
+        out = _fit_event_text(body + "\n" + viz)
+        assert len(out) <= _MAX_EVENT_TEXT
+        assert viz in out                                   # protected on hard-cut
+        assert "truncated for storage" in out

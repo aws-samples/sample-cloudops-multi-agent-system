@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import threading
+import time
 from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
 
@@ -640,3 +641,81 @@ class TestActorIdFromJwt:
         req = MagicMock()
         req.headers = {"authorization": "Bearer not.a.jwt"}
         assert _actor_id_from_jwt(req) == ""
+
+
+# ---------------------------------------------------------------------------
+# Chat turn survives client disconnect
+# ---------------------------------------------------------------------------
+
+
+class TestChatSurvivesDisconnect:
+    """A chat turn must finish + persist even if the browser walks away.
+
+    The agent run used to happen INSIDE the SSE generator, so when the user
+    navigated to another thread (page.tsx calls runtime.thread.cancelRun()),
+    Starlette stopped draining the generator and CANCELLED the run mid-flight.
+    Verified against the live stack: after a hard disconnect the session had
+    only the USER event — the assistant answer was lost forever. The producer
+    now owns the run + persistence and pushes to an unbounded queue, so the
+    consumer going away can't stop it.
+    """
+
+    def test_producer_is_a_coroutine_not_a_generator(self):
+        """Structural guard: if _producer ever regains a `yield`, it becomes an
+        async generator again and its lifetime re-couples to the client."""
+        import ast
+        import inspect
+
+        from agents.shared import agui_server
+
+        src = inspect.getsource(agui_server)
+        tree = ast.parse(src)
+        producers = [
+            n for n in ast.walk(tree)
+            if isinstance(n, ast.AsyncFunctionDef) and n.name == "_producer"
+        ]
+        assert producers, "_producer not found — was the split refactored away?"
+        for p in producers:
+            yields = [n for n in ast.walk(p) if isinstance(n, (ast.Yield, ast.YieldFrom))]
+            assert not yields, (
+                "_producer must not yield — it must stay a coroutine so the "
+                "turn outlives the client connection"
+            )
+
+    def test_inflight_task_refs_are_held(self):
+        """asyncio keeps only weak refs to tasks; a bare create_task can be GC'd
+        mid-run, which would silently reintroduce the cancellation bug."""
+        from agents.shared.agui_server import _INFLIGHT_TURNS
+
+        assert isinstance(_INFLIGHT_TURNS, set)
+
+    @patch("agents.shared.agui_server.mark_thread_idle")
+    @patch("agents.shared.agui_server.save_assistant_message")
+    def test_turn_completes_and_saves_when_consumer_stops_reading(
+        self, mock_save, mock_idle
+    ):
+        """Consume only the first SSE chunk, then abandon the response — the
+        producer must still run to completion and persist the turn."""
+        app = create_agui_app(
+            agent_builder=_make_agent_builder(),
+            config={
+                "agent_name": "test",
+                "memory_enabled": True,
+                "suggestions_enabled": False,
+            },
+        )
+        client = TestClient(app)
+        payload = _make_agui_payload()
+
+        # Stream, read one chunk, then close early (simulates navigate-away).
+        with client.stream("POST", "/invocations", json=payload) as resp:
+            assert resp.status_code == 200
+            for _ in resp.iter_lines():
+                break  # abandon the stream immediately
+
+        # The producer owns persistence, so it must have marked the thread idle
+        # (its finally) even though nobody drained the rest of the stream.
+        deadline = time.time() + 5
+        while time.time() < deadline and not mock_idle.called:
+            time.sleep(0.05)
+        assert mock_idle.called, "producer did not finish after consumer abandoned stream"

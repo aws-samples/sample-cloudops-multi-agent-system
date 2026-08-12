@@ -28,6 +28,7 @@ Usage::
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import logging
@@ -72,6 +73,11 @@ logger = logging.getLogger(__name__)
 AGENTCORE_MEMORY_ID = os.environ.get("AGENTCORE_MEMORY_ID", "")
 AWS_REGION = os.environ.get("AWS_REGION", "us-east-1")
 REPORT_TABLE_NAME = os.environ.get("REPORT_TABLE_NAME", "")
+
+# Strong refs to in-flight chat producer tasks. asyncio holds only weak refs to
+# tasks, so without this a turn whose client disconnected could be garbage
+# collected mid-run — reintroducing exactly the cancellation this guards against.
+_INFLIGHT_TURNS: set = set()
 
 
 def _sanitize_actor_id(email: str) -> str:
@@ -326,7 +332,28 @@ def create_agui_app(
         tool_starts: dict[str, dict] = {}
         buffered_run_finished = None
 
-        async def event_generator():
+        # --- Producer/consumer split so a turn survives client disconnect -----
+        #
+        # Previously the agent run happened INSIDE the SSE generator. When the
+        # browser navigated away (page.tsx calls runtime.thread.cancelRun()),
+        # Starlette stopped draining the generator, which CANCELLED
+        # `agui_agent.run()` mid-flight; the generator's finally then saved
+        # partial/empty segments and marked the thread idle. The user came back
+        # to an empty, idle-looking thread with the answer lost.
+        #
+        # Now a producer task owns the run AND all persistence (memory save,
+        # suggestions, session title, mark_thread_idle) and pushes encoded
+        # events onto an UNBOUNDED queue; the SSE generator only drains that
+        # queue. Live streaming behaviour is unchanged (events are relayed as
+        # they arrive), but if the client disappears the producer keeps going,
+        # finishes the turn, and persists it — so the thread genuinely keeps
+        # running server-side and the activity row stays `running` while it is.
+        # The queue is unbounded on purpose: a bounded one would let a
+        # disconnected consumer block the producer forever.
+        event_q: asyncio.Queue = asyncio.Queue()
+        _QUEUE_DONE = object()
+
+        async def _producer():
             nonlocal buffered_run_finished
             try:
                 run_input = RunAgentInput(**payload)
@@ -366,7 +393,7 @@ def create_agui_app(
                         )
 
                     if not is_run_finished:
-                        yield encoded
+                        event_q.put_nowait(encoded)
             except Exception as exc:
                 logger.error("AG-UI chat failed: %s", exc, exc_info=True)
                 mark_thread_error(thread_id, actor_id, str(exc))
@@ -392,11 +419,11 @@ def create_agui_app(
                                 message_id="suggestions",
                                 delta=suggestions_tag,
                             )
-                            yield encoder.encode(suggestions_event)
+                            event_q.put_nowait(encoder.encode(suggestions_event))
 
                     # Emit the buffered RUN_FINISHED
                     if buffered_run_finished:
-                        yield buffered_run_finished
+                        event_q.put_nowait(buffered_run_finished)
 
                     # Save enriched assistant response to Memory
                     if memory_enabled:
@@ -438,6 +465,28 @@ def create_agui_app(
                             cleanup_fn()
                         except Exception:
                             pass
+                    # Always release the consumer, even on error paths.
+                    event_q.put_nowait(_QUEUE_DONE)
+
+        # Launch the producer detached from this request's lifetime and keep a
+        # strong reference until it finishes — without one, asyncio can GC a
+        # bare task mid-flight (the very cancellation this fix exists to stop).
+        producer_task = asyncio.create_task(_producer())
+        _INFLIGHT_TURNS.add(producer_task)
+        producer_task.add_done_callback(_INFLIGHT_TURNS.discard)
+
+        async def event_generator():
+            """Relay producer events to the client; never cancel the producer.
+
+            If the client disconnects, this generator is abandoned mid-iteration
+            but the producer task keeps running to completion and persists the
+            turn — which is the whole point of the split above.
+            """
+            while True:
+                item = await event_q.get()
+                if item is _QUEUE_DONE:
+                    break
+                yield item
 
         return StreamingResponse(
             event_generator(),
@@ -1511,6 +1560,22 @@ def _save_enriched_response(
     """Build enriched text and save to Memory."""
     if not text_parts and not ordered_segments:
         return
+    # Persist a compact <visualizer-state> so the VisualizerCard rehydrates on
+    # reload WITHOUT depending on the raw <tool> topology surviving memory's
+    # 100KB event limit. The raw topology arrives JSON-escaped 3x (leaf ->
+    # orchestrator -> supervisor), which can triple a 49KB topology past the
+    # cap; the de-escaped compact state is ~32KB. See visualizer_extract.py.
+    try:
+        from agents.shared.visualizer_extract import extract_visualizer_state
+        viz = extract_visualizer_state(
+            [s for s in ordered_segments if s.get("type") == "tool"]
+        )
+        if viz and not any(s.get("type") == "visualizer_state" for s in ordered_segments):
+            ordered_segments.append(
+                {"type": "visualizer_state", "value": json.dumps(viz, separators=(",", ":"))}
+            )
+    except Exception as exc:  # never let viz extraction break the save
+        logger.warning("visualizer-state extraction failed: %s", exc)
     enriched_text = build_enriched_text(ordered_segments)
     save_assistant_message(memory_id, session_id, actor_id, enriched_text, region)
 

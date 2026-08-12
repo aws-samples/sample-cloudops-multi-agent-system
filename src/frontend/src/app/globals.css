@@ -90,6 +90,17 @@ pre {
   width: 6px;
 }
 
+/* Reserve the scrollbar lane up front on vertical scrollers. Without this,
+   content growing past the viewport (e.g. a streaming answer) toggles the
+   scrollbar on/off, which shifts content width by the scrollbar's 6px; every
+   Recharts ResponsiveContainer inside observes that resize and setStates, the
+   chart re-layout can flip the overflow back, and the observer<->state loop
+   escalates into React's "Maximum update depth exceeded" crash. A stable
+   gutter means scrollbar appearance never changes content width. */
+.overflow-y-auto {
+  scrollbar-gutter: stable;
+}
+
 ::-webkit-scrollbar-track {
   background: transparent;
 }
