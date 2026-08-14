@@ -1,4 +1,435 @@
 {
+    "cloudwatch": {
+        "handler": "handler.handler",
+        "runtime": "python3.12",
+        "timeout": 60,
+        "memory": 512,
+        "needs_cloudwatch_snapshots": true,
+        "env_vars": {
+            "CROSS_ACCOUNT_ROLE_ARN_CLOUDWATCH": "$CROSS_ACCOUNT_ROLE_ARN_CLOUDWATCH"
+        },
+        "iam_actions": [
+            "cloudwatch:Describe*",
+            "cloudwatch:Get*",
+            "cloudwatch:List*"
+        ],
+        "tools": [
+            {
+                "name": "get_metric_data",
+                "description": "Fetch CloudWatch metric data via GetMetricData. Two modes: (1) pass namespace + metric_name + dimensions + stat + period to build a single metric query, or (2) pass a `queries` array of raw MetricDataQuery objects for metric math and multi-metric pulls. The `stat` field accepts standard statistics (Average, Sum, Maximum, Minimum, SampleCount) AND percentiles (p50, p90, p95, p99, p99.9, tm99). Defaults to a 3-hour lookback ending now when start_time is omitted.",
+                "input_schema": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "namespace": {
+                            "type": "string",
+                            "description": "CloudWatch namespace, e.g. AWS/Lambda. Required unless `queries` is supplied."
+                        },
+                        "metric_name": {
+                            "type": "string",
+                            "description": "Metric name, e.g. Errors. Required unless `queries` is supplied."
+                        },
+                        "dimensions": {
+                            "type": "array",
+                            "description": "Metric dimensions as a list of {Name, Value} objects, e.g. [{\"Name\": \"FunctionName\", \"Value\": \"my-fn\"}].",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "Name": {"type": "string"},
+                                    "Value": {"type": "string"}
+                                }
+                            }
+                        },
+                        "stat": {
+                            "type": "string",
+                            "description": "Statistic. One of Average, Sum, Maximum, Minimum, SampleCount, or a percentile like p50, p90, p95, p99, p99.9, tm99. Defaults to Average."
+                        },
+                        "period": {
+                            "type": "integer",
+                            "description": "Aggregation period in seconds. Defaults to 300."
+                        },
+                        "queries": {
+                            "type": "array",
+                            "description": "Optional list of raw MetricDataQuery objects passed through to GetMetricData. Each entry is {Id, MetricStat: {Metric: {Namespace, MetricName, Dimensions}, Period, Stat}, ReturnData} for a metric, or {Id, Expression, ReturnData} for a metric-math expression. Use this for metric math or fetching multiple metrics in one call.",
+                            "items": {"type": "object"}
+                        },
+                        "start_time": {
+                            "type": "string",
+                            "description": "ISO-8601 start time (or epoch seconds). Defaults to 3 hours before end_time."
+                        },
+                        "end_time": {
+                            "type": "string",
+                            "description": "ISO-8601 end time (or epoch seconds). Defaults to now."
+                        },
+                        "scan_by": {
+                            "type": "string",
+                            "description": "Order of returned datapoints. One of TimestampDescending or TimestampAscending."
+                        },
+                        "region": {
+                            "type": "string",
+                            "description": "Optional AWS region. Defaults to the Lambda's region."
+                        }
+                    }
+                }
+            },
+            {
+                "name": "get_metric_metadata",
+                "description": "Look up vendored CloudWatch metric metadata by namespace and metric name, including description, recommended statistics, units, catalogue version, and any alarm recommendations. Local lookup; no AWS call.",
+                "input_schema": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "namespace": {"type": "string"},
+                        "metric_name": {"type": "string"}
+                    },
+                    "required": ["namespace", "metric_name"]
+                }
+            },
+            {
+                "name": "get_recommended_metric_alarms",
+                "description": "Look up AWS-recommended CloudWatch alarms for a (namespace, metric_name) pair from the vendored catalogue. Each recommendation includes comparisonOperator, threshold justification, statistic, period, evaluationPeriods, datapointsToAlarm, dimensions, intent, alarmDescription, and treatMissingData. Local lookup — no AWS call. Optionally pass a resource_arn instead of namespace/dimensions: the ARN is parsed to a CloudWatch namespace + dimensions list. Returns {namespace, metric_name, recommendations, dimensions, note}.",
+                "input_schema": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "namespace": {
+                            "type": "string",
+                            "description": "CloudWatch namespace. Optional if resource_arn is supplied (parsed namespace is used as fallback)."
+                        },
+                        "metric_name": {
+                            "type": "string",
+                            "description": "Metric name to look up recommendations for."
+                        },
+                        "dimensions": {
+                            "type": "array",
+                            "description": "Optional metric dimensions as [{Name, Value}]. If omitted and resource_arn is supplied, dimensions are derived from the ARN.",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "Name": {"type": "string"},
+                                    "Value": {"type": "string"}
+                                }
+                            }
+                        },
+                        "resource_arn": {
+                            "type": "string",
+                            "description": "Optional AWS resource ARN. Parsed to (namespace, dimensions) when dimensions aren't supplied directly."
+                        }
+                    }
+                }
+            },
+            {
+                "name": "analyse_metric",
+                "description": "Fetch a metric over a lookback window (default 14 days, configurable via lookback_days) and compute statistics: mean, median, p50/p90/p99, standard deviation, coefficient of variation, min, max, trend direction (INCREASING/DECREASING/NONE), dominant seasonality period in seconds (or null), a noise score, and data-quality density. Use this to calibrate alarm thresholds against real history. Returns an insufficient_history error when fewer than 50 datapoints are available.",
+                "input_schema": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "namespace": {
+                            "type": "string",
+                            "description": "CloudWatch namespace, e.g. AWS/Lambda."
+                        },
+                        "metric_name": {
+                            "type": "string",
+                            "description": "Metric name, e.g. Duration."
+                        },
+                        "dimensions": {
+                            "type": "array",
+                            "description": "Metric dimensions as [{Name, Value}].",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "Name": {"type": "string"},
+                                    "Value": {"type": "string"}
+                                }
+                            }
+                        },
+                        "statistic": {
+                            "type": "string",
+                            "description": "Statistic to fetch. One of Average, Sum, Maximum, Minimum, SampleCount, or a percentile like p99. Defaults to Average."
+                        },
+                        "lookback_days": {
+                            "type": "integer",
+                            "description": "Number of days of history to analyse. Defaults to 14. Use 30 for a longer window."
+                        },
+                        "period": {
+                            "type": "integer",
+                            "description": "Aggregation period in seconds. Defaults to 300."
+                        },
+                        "start_time": {
+                            "type": "string",
+                            "description": "ISO-8601 start time. Overrides lookback_days when supplied."
+                        },
+                        "end_time": {
+                            "type": "string",
+                            "description": "ISO-8601 end time. Defaults to now."
+                        },
+                        "region": {
+                            "type": "string",
+                            "description": "Optional AWS region. Defaults to the Lambda's region."
+                        }
+                    },
+                    "required": ["namespace", "metric_name"]
+                }
+            },
+            {
+                "name": "get_active_alarms",
+                "description": "List CloudWatch alarms currently in the ALARM state via DescribeAlarms. Returns trimmed summaries for both metric alarms (name, namespace, metric, dimensions, statistic, comparison operator, threshold, period, state reason) and composite alarms (name, rule, state reason). Bounded by max_items (default 50) to keep the response small.",
+                "input_schema": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "max_items": {
+                            "type": "integer",
+                            "description": "Maximum number of alarms of each type to return. Defaults to 50."
+                        },
+                        "region": {
+                            "type": "string",
+                            "description": "Optional AWS region. Defaults to the Lambda's region."
+                        }
+                    }
+                }
+            },
+            {
+                "name": "get_alarm_posture",
+                "description": "Return a bounded inventory of CloudWatch alarm configuration posture (metric and composite alarms) using DescribeAlarms without an ALARM-state filter. The canonical unfiltered request uses the scheduled configuration snapshot when available and includes data_source, data_as_of, and freshness_note; pass force_refresh=true for live configuration. This intentionally excludes current state/reason and alarm history, which remain live-only through get_active_alarms and get_alarm_history.",
+                "input_schema": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "max_items": {
+                            "type": "integer",
+                            "description": "Maximum configuration rows to return. Defaults to 100; capped at 1000."
+                        },
+                        "region": {
+                            "type": "string",
+                            "description": "Optional region. Only the Lambda's default region is snapshot-eligible; another region always uses the live API."
+                        },
+                        "force_refresh": {
+                            "type": "boolean",
+                            "description": "Set true to bypass the scheduled snapshot and retrieve current configuration from CloudWatch."
+                        }
+                    }
+                }
+            },
+            {
+                "name": "query_alarm_inventory",
+                "description": "Query the precomputed account-wide CloudWatch alarm inventory. Supports bounded region, namespace, alarm type, and alarm-name filters with opaque cursor pagination. Returns snapshot age and completeness. Use this for 'what alarms do I have'; active incident questions use get_active_alarms.",
+                "input_schema": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "account_id": {"type": "string"},
+                        "regions": {"type": "array", "items": {"type": "string"}},
+                        "namespace": {"type": "string"},
+                        "alarm_type": {"type": "string", "enum": ["metric", "composite"], "description": "Optional alarm type: metric or composite."},
+                        "alarm_names": {"type": "array", "items": {"type": "string"}},
+                        "page_size": {"type": "integer", "minimum": 1, "maximum": 200, "description": "Results per page from 1 through 200; defaults to 50."},
+                        "cursor": {"type": "string"},
+                        "force_refresh": {"type": "boolean"}
+                    }
+                }
+            },
+            {
+                "name": "analyze_alarm_coverage",
+                "description": "Query precomputed best-practice alarm coverage in account, tags, or resources mode. Tag keys are ANDed and values within a key are ORed. Returns paginated resources, candidate IDs, snapshot age, and completeness. Missing is authoritative only when both inventories were complete. Explicit resources mode can use a bounded live fallback for at most 100 ARNs when no usable snapshot exists.",
+                "input_schema": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "mode": {"type": "string", "enum": ["account", "tags", "resources"], "description": "Coverage scope: account, tags, or resources."},
+                        "account_id": {"type": "string"},
+                        "tags": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "oneOf": [
+                                    {"type": "string"},
+                                    {"type": "array", "items": {"type": "string"}}
+                                ]
+                            }
+                        },
+                        "resource_arns": {
+                            "type": "array",
+                            "maxItems": 100,
+                            "description": "Explicit resource ARNs; at most 100.",
+                            "items": {"type": "string"}
+                        },
+                        "regions": {"type": "array", "items": {"type": "string"}},
+                        "statuses": {"type": "array", "items": {"type": "string"}},
+                        "page_size": {"type": "integer", "minimum": 1, "maximum": 200, "description": "Results per page from 1 through 200; defaults to 50."},
+                        "cursor": {"type": "string"},
+                        "force_refresh": {"type": "boolean"}
+                    }
+                }
+            },
+            {
+                "name": "get_alarm_snapshot_status",
+                "description": "Return the current coverage snapshot identity, age, completeness, and refresh run status. force_refresh starts or reuses an asynchronous collection run.",
+                "input_schema": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "account_id": {"type": "string"},
+                        "force_refresh": {"type": "boolean"}
+                    }
+                }
+            },
+            {
+                "name": "prepare_alarm_deployment",
+                "description": "Prepare one deterministic CloudFormation artifact for selected snapshot candidate IDs. Requires an SNS topic ARN, live-revalidates candidates, excludes already implemented alarms, batches metric history for threshold calibration, and blocks candidates with insufficient history unless an override or fixed catalogue threshold exists.",
+                "input_schema": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "snapshot_id": {"type": "string"},
+                        "candidate_ids": {"type": "array", "maxItems": 100, "description": "Snapshot candidate IDs to deploy; at most 100.", "items": {"type": "string"}},
+                        "sns_topic_arn": {"type": "string"},
+                        "tags": {"type": "object", "additionalProperties": {"type": "string"}},
+                        "threshold_overrides": {"type": "object", "additionalProperties": {"type": "number"}}
+                    },
+                    "required": ["snapshot_id", "candidate_ids", "sns_topic_arn"]
+                }
+            },
+            {
+                "name": "analyze_alarm_tuning",
+                "description": "Analyze one existing alarm using live configuration, live state history, and a live metric baseline. Use for tuning noisy, flapping, or ineffective alarms.",
+                "input_schema": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "alarm_name": {"type": "string"},
+                        "region": {"type": "string"},
+                        "lookback_days": {"type": "integer"}
+                    },
+                    "required": ["alarm_name"]
+                }
+            },
+            {
+                "name": "get_alarm_history",
+                "description": "Fetch the history for a CloudWatch alarm via DescribeAlarmHistory — useful for spotting flapping. Returns state transitions and configuration changes. Defaults to a 24-hour lookback when start_time is omitted.",
+                "input_schema": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "alarm_name": {
+                            "type": "string",
+                            "description": "Name of the alarm to fetch history for."
+                        },
+                        "history_item_type": {
+                            "type": "string",
+                            "description": "Optional filter. One of StateUpdate, ConfigurationUpdate, or Action."
+                        },
+                        "start_time": {
+                            "type": "string",
+                            "description": "ISO-8601 start time. Defaults to 24 hours before end_time."
+                        },
+                        "end_time": {
+                            "type": "string",
+                            "description": "ISO-8601 end time. Defaults to now."
+                        },
+                        "max_items": {
+                            "type": "integer",
+                            "description": "Maximum number of history records to return. Defaults to 50."
+                        },
+                        "region": {
+                            "type": "string",
+                            "description": "Optional AWS region. Defaults to the Lambda's region."
+                        }
+                    },
+                    "required": ["alarm_name"]
+                }
+            },
+            {
+                "name": "build_cfn_alarm",
+                "description": "Assemble a CloudFormation AWS::CloudWatch::Alarm resource dict from an alarm recommendation. Pure assembler — no AWS call. Handles both static-threshold alarms (Statistic + Threshold + ComparisonOperator + Dimensions) and anomaly-detection alarms (Metrics + ThresholdMetricId). Injects AlarmActions with the supplied SNS topic ARN and an optional Tags list. Returns an invalid_sns_topic_arn error when sns_topic_arn doesn't match arn:aws:sns:<region>:<account>:<topic>. NOTE: this tool builds ONE resource. The agent normally calls assemble_cfn_template once with all agreed alarms instead of calling this per-alarm and serializing YAML itself — assemble_cfn_template guarantees the emitted template is complete and verbatim.",
+                "input_schema": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "alarm_dict": {
+                            "type": "object",
+                            "description": "One alarm recommendation (from get_recommended_metric_alarms), augmented with the metric identity. Keys: comparisonOperator, statistic, period, evaluationPeriods, datapointsToAlarm, treatMissingData, and optionally namespace, metric_name, alarmDescription, intent."
+                        },
+                        "dimensions": {
+                            "type": "array",
+                            "description": "Resolved metric dimensions as [{Name, Value}] with values filled in from the resource.",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "Name": {"type": "string"},
+                                    "Value": {"type": "string"}
+                                }
+                            }
+                        },
+                        "threshold": {
+                            "type": "number",
+                            "description": "Numeric threshold value for static-threshold alarms. Ignored on the anomaly-detection path."
+                        },
+                        "sns_topic_arn": {
+                            "type": "string",
+                            "description": "Required. SNS topic ARN to wire into AlarmActions. Must match arn:aws:sns:<region>:<12-digit-account>:<topic-name>."
+                        },
+                        "tags": {
+                            "type": "object",
+                            "description": "Optional {key: value} map rendered as a CFN Tags list. Omitted from output when empty."
+                        }
+                    },
+                    "required": ["alarm_dict", "sns_topic_arn"]
+                }
+            },
+            {
+                "name": "assemble_cfn_template",
+                "description": "Assemble a COMPLETE CloudFormation template (AWSTemplateFormatVersion + Description + Resources) from a list of alarm specs and serialize it to a deterministic YAML string. Pure Python — no AWS call. This is the single source of the template artifact payload: call it ONCE with all agreed alarms. The platform captures a successful typed result before it reaches a model response or trace, so do not reproduce template_yaml in chat. Calls build_cfn_alarm internally per alarm (single source of truth for the resource shape). Validates sns_topic_arn once up front and returns invalid_sns_topic_arn without building anything on failure. Per-alarm build_cfn_alarm errors are captured in summary.errors and the offending alarm is omitted from Resources — the rest of the template still builds.",
+                "input_schema": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "alarms": {
+                            "type": "array",
+                            "description": "Array of per-alarm specs. Each entry is {alarm_dict, dimensions, threshold, tags?}. alarm_dict is one entry from get_recommended_metric_alarms augmented with the metric identity (namespace, metric_name). dimensions is the resolved [{Name, Value}] list. threshold is the numeric threshold for static-threshold alarms (ignored for anomaly-detection alarms). Per-alarm tags override the template-level tags for that alarm.",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "alarm_dict": {
+                                        "type": "object",
+                                        "description": "Alarm recommendation dict — comparisonOperator, statistic, period, evaluationPeriods, datapointsToAlarm, treatMissingData, plus namespace and metric_name."
+                                    },
+                                    "dimensions": {
+                                        "type": "array",
+                                        "description": "Metric dimensions as [{Name, Value}].",
+                                        "items": {
+                                            "type": "object",
+                                            "properties": {
+                                                "Name": {"type": "string"},
+                                                "Value": {"type": "string"}
+                                            }
+                                        }
+                                    },
+                                    "threshold": {
+                                        "type": "number",
+                                        "description": "Numeric threshold for static-threshold alarms."
+                                    },
+                                    "tags": {
+                                        "type": "object",
+                                        "description": "Optional per-alarm tags. Overrides template-level tags for this alarm."
+                                    }
+                                }
+                            }
+                        },
+                        "sns_topic_arn": {
+                            "type": "string",
+                            "description": "Required. SNS topic ARN wired into every alarm's AlarmActions. Must match arn:aws:sns:<region>:<12-digit-account>:<topic-name>."
+                        },
+                        "tags": {
+                            "type": "object",
+                            "description": "Optional template-level {key: value} map applied to every alarm. Each alarm can override via its own tags entry."
+                        }
+                    },
+                    "required": ["alarms", "sns_topic_arn"]
+                }
+            }
+        ]
+    },
     "cost-explorer": {
         "handler": "handler.handler",
         "runtime": "python3.12",
@@ -1133,6 +1564,33 @@
                             "description": "Maximum number of remediation links to return (default 20). Links are ordered by bucket size descending, so the top-impact buckets are always included. When truncated, the response includes links_truncated=true and links_dropped with the count of buckets not shown."
                         }
                     }
+                }
+            },
+            {
+                "name": "find_resources_by_tag",
+                "description": "Resolve a tag selector to a bounded resource inventory via ResourceGroupsTaggingAPI GetResources. The cloudwatch-agent passes the full returned envelope to analyze_alarm_coverage in one call so scoped resources with zero alarms remain visible. Accepts a {key: value} (or {key: [values]}) tag_filters dict, an optional resource_types filter (e.g. ['ec2:instance', 'lambda:function']), and an optional region. Empty tag_filters returns {error: 'selector_required', message: ...} so the agent can prompt the user. Paginates the underlying API and caps at 1000 resources \u2014 when the cap is hit, the response sets truncated=true and a note recommending narrower filters. Returns {resources: [{arn, tags, region, account_id}], truncated, note}. Cross-account: routed through the same CROSS_ACCOUNT_ROLE_ARN_TAG_GOVERNANCE env var as the rest of this Lambda.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "tag_filters": {
+                            "type": "object",
+                            "description": "Required map of tag_key -> tag_value (or tag_key -> [values] for OR semantics within a key). At least one entry is required. Example: {'App': 'test'} or {'App': ['test', 'prod']}."
+                        },
+                        "resource_types": {
+                            "type": "array",
+                            "items": {
+                                "type": "string"
+                            },
+                            "description": "Optional list of service:resource_type tokens to narrow results (e.g. ['ec2:instance', 'lambda:function']). Maps to ResourceTypeFilters."
+                        },
+                        "region": {
+                            "type": "string",
+                            "description": "Optional AWS region to query. Omit to use the Lambda's AWS_REGION."
+                        }
+                    },
+                    "required": [
+                        "tag_filters"
+                    ]
                 }
             }
         ]

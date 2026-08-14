@@ -81,6 +81,12 @@ variable "cross_account_role_arn_tag_governance" {
   default     = ""
 }
 
+variable "cross_account_role_arn_cloudwatch" {
+  description = "CloudWatch cross-account role ARN — assumed by the cloudwatch MCP Lambda when reading metrics, alarms, and history from a spoke account. Mirrored to SSM at /<project>/<env>/config/cross_account/cloudwatch_role_arn per Requirement 6.4. Empty falls back to the Lambda execution role per Requirement 6.3."
+  type        = string
+  default     = ""
+}
+
 variable "cur_database_name" {
   description = "Glue database for CUR data."
   type        = string

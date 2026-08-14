@@ -60,6 +60,11 @@ from agents.shared.memory import (
 )
 from agents.shared.suggestions import generate_suggestions
 from agents.shared import reports
+from agents.shared.agent_base import (
+    _ABBREVIATED_TOOL_OUTPUT,
+    _NO_RELOAD_TRACE_TOOLS,
+)
+from agents.shared.registry import mark_frontend_container
 from agents.shared.thread_activity import (
     mark_thread_error,
     mark_thread_idle,
@@ -68,6 +73,12 @@ from agents.shared.thread_activity import (
 )
 
 logger = logging.getLogger(__name__)
+
+# This module is imported only by create_frontend_agent (the supervisor).
+# Flag the process so registry._delegate routes extracted CFN artifacts to
+# the local _pending queue (drained by this module's event loop) rather than
+# forwarding them up via the response dict (which is what orchestrators do).
+mark_frontend_container()
 
 # Environment-level defaults
 AGENTCORE_MEMORY_ID = os.environ.get("AGENTCORE_MEMORY_ID", "")
@@ -331,6 +342,19 @@ def create_agui_app(
         thinking_parts: list[str] = []
         tool_starts: dict[str, dict] = {}
         buffered_run_finished = None
+        # Defensive compatibility for stale model output. The typed MCP path is
+        # primary; this interceptor is only used if a model unexpectedly emits
+        # legacy `<cfn-artifact>` markup.
+        cfn_interceptor = _CfnArtifactInterceptor()
+        # Strips any `<report-pending>` marker the MODEL types (it sometimes
+        # mimics the platform-injected markers in its history with a
+        # fabricated id). Runs only on model-origin text — the platform's
+        # own injected markers are constructed separately and bypass it.
+        report_pending_stripper = _ReportPendingStripper()
+        # Request-scoped dedup across the primary typed-MCP path and the
+        # defensive legacy markup interceptor. A title collision intentionally
+        # keeps the first persisted report for this turn.
+        persisted_cfn_titles: set[str] = set()
 
         # --- Producer/consumer split so a turn survives client disconnect -----
         #
@@ -360,8 +384,9 @@ def create_agui_app(
                 async for event in agui_agent.run(run_input):
                     encoded = encoder.encode(event)
 
-                    # Check if this is RUN_FINISHED — buffer it to inject suggestions
+                    # Check if this is RUN_FINISHED — buffer it to inject suggestions.
                     is_run_finished = False
+                    is_text_message = False
                     if hasattr(event, "type"):
                         etype = (
                             str(event.type)
@@ -371,6 +396,8 @@ def create_agui_app(
                         if "RUN_FINISHED" in etype:
                             buffered_run_finished = encoded
                             is_run_finished = True
+                        elif "TEXT_MESSAGE_CONTENT" in etype:
+                            is_text_message = True
                         elif "TOOL_CALL_START" in etype:
                             tc_name = getattr(
                                 event, "tool_call_name", ""
@@ -382,7 +409,92 @@ def create_agui_app(
                                     _humanize_tool_step(tc_name),
                                 )
 
-                    # Track AG-UI events for enriched memory save
+                    # TEXT_MESSAGE_CONTENT: route through the cfn-artifact
+                    # interceptor. Non-text events pass through untouched.
+                    if is_text_message:
+                        delta = getattr(event, "delta", "")
+                        message_id = getattr(event, "message_id", "") or getattr(
+                            event, "messageId", ""
+                        )
+                        forwards, completed = cfn_interceptor.feed(delta)
+
+                        # Forward any text outside the artifact block — and
+                        # track it into the Memory enriched-save state. Strip
+                        # any model-typed <report-pending> marker first (the
+                        # only valid markers are platform-injected below).
+                        for chunk in forwards:
+                            chunk = report_pending_stripper.feed(chunk)
+                            if not chunk:
+                                continue
+                            forward_event = TextMessageContentEvent(
+                                type=EventType.TEXT_MESSAGE_CONTENT,
+                                message_id=message_id or "assistant-text",
+                                delta=chunk,
+                            )
+                            event_q.put_nowait(encoder.encode(forward_event))
+                            text_parts.append(chunk)
+                            ordered_segments.append({"type": "text", "value": chunk})
+
+                        # For each completed <cfn-artifact>: persist to the
+                        # reports table, then enqueue a synthetic
+                        # <report-pending> delta in its place.
+                        for title, yaml_text in completed:
+                            dedup_key = title or "CloudFormation alarm template"
+                            if dedup_key in persisted_cfn_titles:
+                                continue
+                            report_id = _new_cfn_artifact_report_id()
+                            persisted = False
+                            try:
+                                persisted = _persist_cfn_artifact_as_report(
+                                    report_id=report_id,
+                                    title=title,
+                                    template_yaml=yaml_text,
+                                    actor_id=actor_id,
+                                    report_table=REPORT_TABLE_NAME,
+                                    region=region,
+                                )
+                            except Exception as exc:
+                                logger.error(
+                                    "cfn-artifact persistence failed: %s",
+                                    exc,
+                                    exc_info=True,
+                                )
+                            if persisted:
+                                persisted_cfn_titles.add(dedup_key)
+                                pending_tag = (
+                                    f'<report-pending report_id="{report_id}" '
+                                    f'title="{title or "CloudFormation alarm template"}"/>'
+                                )
+                                pending_event = TextMessageContentEvent(
+                                    type=EventType.TEXT_MESSAGE_CONTENT,
+                                    message_id=f"report-pending-{report_id}",
+                                    delta=pending_tag,
+                                )
+                                event_q.put_nowait(encoder.encode(pending_event))
+                                text_parts.append(pending_tag)
+                                ordered_segments.append(
+                                    {"type": "text", "value": pending_tag}
+                                )
+                            else:
+                                fallback = (
+                                    "\nThe CloudFormation template could not be saved as an "
+                                    "artifact. Please retry the request.\n"
+                                )
+                                fallback_event = TextMessageContentEvent(
+                                    type=EventType.TEXT_MESSAGE_CONTENT,
+                                    message_id=message_id or "cfn-artifact-fallback",
+                                    delta=fallback,
+                                )
+                                event_q.put_nowait(encoder.encode(fallback_event))
+                                text_parts.append(fallback)
+                                ordered_segments.append(
+                                    {"type": "text", "value": fallback}
+                                )
+                        # Skip the default tracking and enqueue for this event:
+                        # the interceptor emitted sanitized replacements above.
+                        continue
+
+                    # Track AG-UI events for enriched memory save.
                     if hasattr(event, "type") and not is_run_finished:
                         _track_event(
                             event,
@@ -392,14 +504,69 @@ def create_agui_app(
                             tool_starts,
                         )
 
+                    # TOOL_CALL_RESULT: persist typed artifacts extracted at the
+                    # worker/MCP boundary and enqueue their report markers before
+                    # the sanitized tool-result event reaches the frontend.
+                    if hasattr(event, "type") and not is_run_finished:
+                        etype_check = (
+                            str(event.type)
+                            if hasattr(event.type, "value")
+                            else str(getattr(event, "type", ""))
+                        )
+                        if "TOOL_CALL_RESULT" in etype_check:
+                            cfn_events = _handle_cfn_artifacts_from_tool_result(
+                                event,
+                                actor_id,
+                                REPORT_TABLE_NAME,
+                                region,
+                                persisted_cfn_titles,
+                            )
+                            for pending_event in cfn_events:
+                                event_q.put_nowait(encoder.encode(pending_event))
+                                pending_delta = getattr(pending_event, "delta", "")
+                                text_parts.append(pending_delta)
+                                ordered_segments.append(
+                                    {"type": "text", "value": pending_delta}
+                                )
+
                     if not is_run_finished:
                         event_q.put_nowait(encoded)
+
+                # Stream ended — flush any text the interceptor was holding
+                # (e.g. an unterminated <cfn-artifact> block, or trailing
+                # text after a partial open-tag prefix). Run the held cfn
+                # text back through the report-pending stripper too, then
+                # release whatever the stripper itself was holding.
+                for chunk in cfn_interceptor.flush():
+                    chunk = report_pending_stripper.feed(chunk)
+                    if not chunk:
+                        continue
+                    flush_event = TextMessageContentEvent(
+                        type=EventType.TEXT_MESSAGE_CONTENT,
+                        message_id="cfn-artifact-flush",
+                        delta=chunk,
+                    )
+                    event_q.put_nowait(encoder.encode(flush_event))
+                    text_parts.append(chunk)
+                    ordered_segments.append({"type": "text", "value": chunk})
+                stripper_tail = report_pending_stripper.flush()
+                if stripper_tail:
+                    tail_event = TextMessageContentEvent(
+                        type=EventType.TEXT_MESSAGE_CONTENT,
+                        message_id="assistant-text-flush",
+                        delta=stripper_tail,
+                    )
+                    event_q.put_nowait(encoder.encode(tail_event))
+                    text_parts.append(stripper_tail)
+                    ordered_segments.append(
+                        {"type": "text", "value": stripper_tail}
+                    )
             except Exception as exc:
                 logger.error("AG-UI chat failed: %s", exc, exc_info=True)
                 mark_thread_error(thread_id, actor_id, str(exc))
             finally:
                 try:
-                    # Generate suggestions and emit before RUN_FINISHED
+                    # Generate suggestions and enqueue them before RUN_FINISHED.
                     if suggestions_enabled:
                         response_text = "".join(text_parts)
                         suggestions = generate_suggestions(
@@ -413,7 +580,6 @@ def create_agui_app(
                                 }
                             )
                             suggestions_tag = f"\n<suggestions>{json.dumps(suggestions)}</suggestions>"
-
                             suggestions_event = TextMessageContentEvent(
                                 type=EventType.TEXT_MESSAGE_CONTENT,
                                 message_id="suggestions",
@@ -421,11 +587,10 @@ def create_agui_app(
                             )
                             event_q.put_nowait(encoder.encode(suggestions_event))
 
-                    # Emit the buffered RUN_FINISHED
-                    if buffered_run_finished:
-                        event_q.put_nowait(buffered_run_finished)
-
-                    # Save enriched assistant response to Memory
+                    # Persist the replayable assistant event before terminal
+                    # completion. Browser clients stop reading on RUN_FINISHED,
+                    # so saving afterwards can be skipped by navigation or a
+                    # disconnect and leaves an optimistic-only session row.
                     if memory_enabled:
                         _save_enriched_response(
                             memory_id,
@@ -435,12 +600,6 @@ def create_agui_app(
                             text_parts,
                             region,
                         )
-                        # Best-effort: on the first assistant turn of this
-                        # session, ask Haiku for a short summary title and
-                        # save it as a tagged memory event. `maybe_generate_*`
-                        # is idempotent (checks for an existing title first)
-                        # and fail-safe (never raises — the sidebar falls
-                        # back to the first-user-msg preview on any error).
                         try:
                             from agents.shared.session_title import (
                                 maybe_generate_and_save_title,
@@ -457,6 +616,11 @@ def create_agui_app(
                             logger.warning(
                                 "session-title generation failed: %s", exc
                             )
+
+                    # RUN_FINISHED is terminal for the browser stream and is
+                    # deliberately enqueued only after the durable save above.
+                    if buffered_run_finished:
+                        event_q.put_nowait(buffered_run_finished)
                 finally:
                     mark_thread_idle(thread_id, actor_id)
                     # Clean up resources (e.g. gateway clients)
@@ -1546,6 +1710,16 @@ def _track_event(
         }
         if nested_trace:
             tool_data["tool_trace"] = nested_trace
+        # Drop the raw output of bulky no-reload-consumer tools (e.g.
+        # assemble_cfn_template) from the persisted trace — at the top level
+        # AND in every nested sub-agent trace entry. The CFN body is already
+        # in the reports table (rendered via <report-pending>), and the saved
+        # <tool> trace is display-only for these tools. This is what keeps the
+        # assistant turn under AgentCore Memory's 100k-char per-event limit;
+        # without it the CreateEvent silently fails and the whole turn vanishes
+        # on reload. DX-topology traces are intentionally exempt (the visualizer
+        # rebuilds from them) — see _NO_RELOAD_TRACE_TOOLS.
+        tool_data = _abbreviate_bulky_tool_traces(tool_data)
         ordered_segments.append({"type": "tool", "value": json.dumps(tool_data)})
 
 
@@ -1578,6 +1752,518 @@ def _save_enriched_response(
         logger.warning("visualizer-state extraction failed: %s", exc)
     enriched_text = build_enriched_text(ordered_segments)
     save_assistant_message(memory_id, session_id, actor_id, enriched_text, region)
+
+
+# ---------------------------------------------------------------------------
+# Primary typed CloudFormation artifact delivery
+# ---------------------------------------------------------------------------
+#
+# The CloudWatch MCP adapter captures a successful `assemble_cfn_template`
+# result before Strands exposes it to an LLM. Leaf and intermediate runtimes
+# forward its internal `cloudformation-template` envelope through registry.py.
+# This event-loop boundary persists the template to DynamoDB and returns the
+# compact `<report-pending>` event that is saved in chat history.
+
+
+def _handle_cfn_artifacts_from_tool_result(
+    event: Any,
+    actor_id: str,
+    report_table: str,
+    region: str,
+    persisted_titles: set[str] | None = None,
+) -> list:
+    """Persist pending typed CloudFormation artifacts and emit report markers.
+
+    The worker captured each template from the raw `assemble_cfn_template`
+    MCP result before it reached an LLM or tool trace. Artifacts arrive through
+    the internal registry queue, never from model-produced markup.
+    """
+    from agents.shared.registry import get_pending_cfn_artifacts
+
+    artifacts = get_pending_cfn_artifacts()
+    if not artifacts:
+        return []
+
+    events_out = []
+    for artifact in artifacts:
+        if artifact.get("kind") != "cloudformation-template":
+            logger.warning("Ignoring unknown artifact kind: %s", artifact.get("kind"))
+            continue
+        title = artifact.get("title", "CloudWatch alarm template")
+        yaml_text = artifact.get("template_yaml", "")
+        if not isinstance(yaml_text, str) or not yaml_text:
+            continue
+
+        dedup_key = title or "CloudFormation alarm template"
+        if persisted_titles is not None and dedup_key in persisted_titles:
+            continue
+
+        report_id = _new_cfn_artifact_report_id()
+        persisted = False
+        try:
+            persisted = _persist_cfn_artifact_as_report(
+                report_id=report_id,
+                title=title,
+                template_yaml=yaml_text,
+                actor_id=actor_id,
+                report_table=report_table,
+                region=region,
+            )
+        except Exception as exc:
+            logger.error(
+                "cfn-artifact persistence (tool-result path) failed: %s",
+                exc,
+                exc_info=True,
+            )
+
+        if persisted:
+            if persisted_titles is not None:
+                persisted_titles.add(dedup_key)
+            pending_tag = (
+                f'<report-pending report_id="{report_id}" '
+                f'title="{title}"/>'
+            )
+            events_out.append(
+                TextMessageContentEvent(
+                    type=EventType.TEXT_MESSAGE_CONTENT,
+                    message_id=f"report-pending-{report_id}",
+                    delta=pending_tag,
+                )
+            )
+        else:
+            fallback = (
+                "\nThe CloudFormation template could not be saved as an artifact. "
+                "Please retry the request.\n"
+            )
+            events_out.append(
+                TextMessageContentEvent(
+                    type=EventType.TEXT_MESSAGE_CONTENT,
+                    message_id="cfn-artifact-fallback",
+                    delta=fallback,
+                )
+            )
+
+    return events_out
+
+
+# ---------------------------------------------------------------------------
+# <cfn-artifact> streaming interceptor — DEFENSIVE FALLBACK
+# ---------------------------------------------------------------------------
+#
+# If the primary path above fails (e.g. the model somehow re-emits
+# <cfn-artifact> in its text reply despite the sanitized tool result), this
+# streaming interceptor catches it and handles it the same way. It is a
+# no-op for any agent that doesn't emit the tag in its text stream.
+#
+# When the cloudwatch-agent emits a CloudFormation template, it places the
+# YAML inside a `<cfn-artifact title="...">…</cfn-artifact>` block in the
+# chat stream. The supervisor's chat-mode AG-UI loop pipes every
+# TEXT_MESSAGE_CONTENT delta through `_CfnArtifactInterceptor` which:
+#
+#   1. Buffers the YAML body between the open and close tags so it is NEVER
+#      streamed to the client and NEVER tracked into Memory's enriched-save
+#      `text_parts`.
+#   2. On the close tag, persists the YAML to the existing reports DynamoDB
+#      table as a complete single-section freeform report (matching the
+#      shape `agents.shared.reports.save_report` already writes).
+#   3. Emits a synthetic `<report-pending report_id="…" title="…"/>` delta
+#      in place of the entire artifact block. The frontend's existing
+#      ReportCard polling + ReportPanel rendering + history-reload paths
+#      pick this up unchanged.
+#
+# Memory only stores the small `<report-pending …/>` marker (~150 bytes),
+# well under AgentCore's 100k-char per-event limit. On reload, the history
+# loader rehydrates the same ReportCard from the marker, the card polls
+# `/reports/{id}/status`, finds status=complete, and becomes clickable —
+# rendering the YAML from DynamoDB.
+#
+# Other agents are unaffected: the interceptor is a no-op unless the
+# substring `<cfn-artifact` ever appears in a delta, which only the
+# cloudwatch-agent emits (and the supervisor prompt explicitly tells the
+# model to pass through verbatim).
+
+# Open-tag pattern allows attributes in any order; only `title` is consumed.
+_CFN_ARTIFACT_OPEN = re.compile(
+    r"<cfn-artifact\b(?P<attrs>[^>]*)>", re.DOTALL
+)
+_CFN_ARTIFACT_CLOSE = "</cfn-artifact>"
+_CFN_TITLE_ATTR = re.compile(r'title\s*=\s*"([^"]*)"')
+
+
+class _CfnArtifactInterceptor:
+    """Stateful streaming filter for `<cfn-artifact …>…</cfn-artifact>` tags.
+
+    States:
+      * PASSTHROUGH — forward deltas as-is.
+      * BUFFERING   — the open tag has been seen; accumulate inner text,
+        emit nothing until the close tag arrives.
+
+    The matcher carries a cross-delta straddle buffer because the open or
+    close tag may be split across deltas by the model's tokenizer. Every
+    delta starts by appending to the carry and re-scanning.
+
+    ``feed(delta)`` returns ``(forward_deltas, completed_artifacts)``:
+      * forward_deltas — list of strings the supervisor should yield as
+        TEXT_MESSAGE_CONTENT events to the client (and track into Memory).
+        May be empty if the entire delta was buffered.
+      * completed_artifacts — list of ``(title, yaml_text)`` for any
+        ``<cfn-artifact>`` blocks that closed during this delta. The
+        supervisor persists each and emits a ``<report-pending>`` delta.
+    """
+
+    # Maximum carry size — caps memory if a malformed open-tag never closes.
+    _MAX_CARRY = 512
+
+    def __init__(self) -> None:
+        self._buffering = False
+        self._carry = ""           # straddle buffer for tag detection
+        self._captured_title = ""  # title from the current open tag
+        self._captured_yaml: list[str] = []  # body parts inside current tag
+
+    def feed(self, delta: str) -> tuple[list[str], list[tuple[str, str]]]:
+        if not delta:
+            return ([], [])
+
+        forwards: list[str] = []
+        completed: list[tuple[str, str]] = []
+
+        # Append to the carry then re-scan from the start. The carry
+        # captures a partial open or close tag from the previous delta.
+        self._carry += delta
+
+        while self._carry:
+            if self._buffering:
+                # Looking for </cfn-artifact>. If found, capture preceding
+                # YAML, emit a completed artifact, reset state.
+                idx = self._carry.find(_CFN_ARTIFACT_CLOSE)
+                if idx == -1:
+                    # No close tag yet. Keep most of the carry as YAML body
+                    # but retain the tail (up to len(close_tag)-1 chars) in
+                    # case a partial close is straddling the next delta.
+                    keep = max(0, len(self._carry) - (len(_CFN_ARTIFACT_CLOSE) - 1))
+                    if keep > 0:
+                        self._captured_yaml.append(self._carry[:keep])
+                        self._carry = self._carry[keep:]
+                    break
+
+                # Close tag found: everything before idx is YAML body.
+                self._captured_yaml.append(self._carry[:idx])
+                yaml_text = "".join(self._captured_yaml)
+                completed.append((self._captured_title, yaml_text))
+
+                # Consume up to and including the close tag.
+                self._carry = self._carry[idx + len(_CFN_ARTIFACT_CLOSE):]
+                self._buffering = False
+                self._captured_title = ""
+                self._captured_yaml = []
+                # Loop continues — the carry may now contain text following
+                # the close tag, or even another open tag.
+
+            else:
+                # PASSTHROUGH: look for an open tag.
+                m = _CFN_ARTIFACT_OPEN.search(self._carry)
+                if m is None:
+                    # Regex didn't match — there's no complete `<cfn-artifact …>`
+                    # in the carry yet. Two ways the carry could still be
+                    # mid-tag:
+                    #   (a) The full literal `<cfn-artifact` is present but
+                    #       the closing `>` hasn't arrived yet (the model
+                    #       is still streaming the title attribute). Hold
+                    #       back everything from the literal onward.
+                    #   (b) The carry's tail ends with a PREFIX of
+                    #       `<cfn-artifact` (e.g. `…<cfn-art`). Hold that
+                    #       tail back; forward the rest.
+                    open_lit_idx = self._carry.find("<cfn-artifact")
+                    if open_lit_idx >= 0:
+                        # Case (a): forward everything before the literal,
+                        # keep the literal-and-after as carry, and break
+                        # (we need more deltas to complete the tag). The
+                        # _MAX_CARRY guard below catches malformed tags
+                        # that never close.
+                        if open_lit_idx > 0:
+                            forwards.append(self._carry[:open_lit_idx])
+                            self._carry = self._carry[open_lit_idx:]
+                        if len(self._carry) > self._MAX_CARRY:
+                            forwards.append(self._carry)
+                            self._carry = ""
+                        break
+                    # Case (b): no full literal anywhere. The carry might
+                    # end with a partial `<cfn-art` prefix — hold that
+                    # tail back, forward the rest.
+                    safe_end = self._safe_passthrough_end(self._carry)
+                    if safe_end > 0:
+                        forwards.append(self._carry[:safe_end])
+                        self._carry = self._carry[safe_end:]
+                    if len(self._carry) > self._MAX_CARRY:
+                        # Defensive: never let an unmatched partial grow
+                        # unbounded. Flush as plain text.
+                        forwards.append(self._carry)
+                        self._carry = ""
+                    break
+
+                # Forward everything before the open tag.
+                if m.start() > 0:
+                    forwards.append(self._carry[: m.start()])
+
+                # Capture the title attribute (optional).
+                attrs = m.group("attrs") or ""
+                title_match = _CFN_TITLE_ATTR.search(attrs)
+                self._captured_title = title_match.group(1) if title_match else ""
+
+                # Switch into BUFFERING. Discard the open tag itself.
+                self._buffering = True
+                self._carry = self._carry[m.end():]
+                # Loop continues — the carry may already contain the body
+                # and even the close tag for very small artifacts.
+
+        return (forwards, completed)
+
+    def flush(self) -> list[str]:
+        """Release non-artifact carry and report an incomplete legacy artifact.
+
+        A truncated legacy block must not stream its captured YAML: that would
+        bypass the typed artifact path and reintroduce a large Memory event.
+        """
+        flushed: list[str] = []
+        if self._buffering:
+            flushed.append(
+                "\nThe CloudFormation template artifact was incomplete and could "
+                "not be saved. Please retry the request.\n"
+            )
+            self._buffering = False
+            self._captured_title = ""
+            self._captured_yaml = []
+            self._carry = ""
+        elif self._carry:
+            # Passthrough state at end-of-stream: the carry is a held-back
+            # partial-open prefix (e.g. "<cfn-art"). Release it as text.
+            flushed.append(self._carry)
+            self._carry = ""
+        return flushed
+
+    @staticmethod
+    def _safe_passthrough_end(carry: str) -> int:
+        """Find the largest prefix of `carry` that's safe to forward.
+
+        If the carry's tail matches a prefix of "<cfn-artifact", that tail
+        is held back for the next delta — the rest is safe to forward.
+        """
+        marker = "<cfn-artifact"
+        max_check = min(len(marker), len(carry))
+        for back in range(max_check, 0, -1):
+            tail = carry[-back:]
+            if marker.startswith(tail):
+                return len(carry) - back
+        return len(carry)
+
+
+# ---------------------------------------------------------------------------
+# Model-emitted <report-pending> stripper
+#
+# `<report-pending …/>` markers are injected EXCLUSIVELY by the platform —
+# the cfn-artifact interceptor (above) and _handle_report_streaming mint a
+# real `rpt-cfn-{12 hex}` id, persist the row to DynamoDB, and emit the
+# marker as their OWN TextMessageContentEvent (which never passes through a
+# model delta). The model is never asked to type the marker.
+#
+# But once a turn's <report-pending> marker is saved to Memory (so the model
+# can resolve "open that report" via no-fabrication rule 9), it shows up in
+# the model's history. On a follow-up the model is liable to MIMIC the format
+# and type its own `<report-pending report_id="rpt-cfn-tuned-…"/>` with a
+# FABRICATED id alongside the legitimate <cfn-artifact> it emits. That id
+# matches no DynamoDB row, so the frontend renders a ReportCard that polls a
+# 404 forever (observed live: a tune follow-up produced both the real
+# `rpt-cfn-77da92d85e4a` AND a bogus `rpt-cfn-tuned-a7b92c01`, same title).
+#
+# This stateful filter drops any `<report-pending …>` the MODEL emits from
+# the chat stream (and therefore from the Memory save). It runs only on
+# model-origin deltas — the platform's own injected markers bypass it.
+# Self-closing tag: we drop from the literal `<report-pending` up to and
+# including the next `>` (attribute values are quoted and contain no `>`).
+class _ReportPendingStripper:
+    """Stateful streaming filter that removes model-typed `<report-pending>`.
+
+    ``feed(text)`` returns the text with any complete `<report-pending …>`
+    marker removed, holding back a partial tag straddling the next delta.
+    ``flush()`` releases anything still held when the stream ends.
+    """
+
+    _LITERAL = "<report-pending"
+    _MAX_CARRY = 1024  # cap: a malformed never-closing tag is flushed as text
+
+    def __init__(self) -> None:
+        self._dropping = False
+        self._carry = ""
+
+    def feed(self, text: str) -> str:
+        if not text:
+            return ""
+        out: list[str] = []
+        self._carry += text
+        while self._carry:
+            if self._dropping:
+                gt = self._carry.find(">")
+                if gt == -1:
+                    # Tag not closed yet. Defensive cap so a malformed marker
+                    # that never closes can't swallow the rest of the reply.
+                    if len(self._carry) > self._MAX_CARRY:
+                        out.append(self._carry)
+                        self._carry = ""
+                        self._dropping = False
+                    break
+                # Drop through the closing '>'.
+                self._carry = self._carry[gt + 1:]
+                self._dropping = False
+            else:
+                idx = self._carry.find(self._LITERAL)
+                if idx >= 0:
+                    if idx > 0:
+                        out.append(self._carry[:idx])
+                    self._carry = self._carry[idx:]
+                    self._dropping = True
+                    continue
+                # No full literal. Hold back a tail that's a prefix of the
+                # literal (it may complete on the next delta); forward rest.
+                safe_end = self._safe_end(self._carry)
+                if safe_end > 0:
+                    out.append(self._carry[:safe_end])
+                    self._carry = self._carry[safe_end:]
+                if len(self._carry) > self._MAX_CARRY:
+                    out.append(self._carry)
+                    self._carry = ""
+                break
+        return "".join(out)
+
+    def flush(self) -> str:
+        """Release any held text at end-of-stream.
+
+        A held partial-open prefix (e.g. `<report-p`) is real text → release.
+        A tag we were mid-drop on never closed → discard it (it was a
+        malformed marker, not content worth showing).
+        """
+        if self._dropping:
+            self._carry = ""
+            self._dropping = False
+            return ""
+        held = self._carry
+        self._carry = ""
+        return held
+
+    @classmethod
+    def _safe_end(cls, carry: str) -> int:
+        """Largest prefix of `carry` safe to forward without splitting the
+        literal `<report-pending` across a delta boundary."""
+        max_check = min(len(cls._LITERAL), len(carry))
+        for back in range(max_check, 0, -1):
+            if cls._LITERAL.startswith(carry[-back:]):
+                return len(carry) - back
+        return len(carry)
+
+
+def _new_cfn_artifact_report_id() -> str:
+    """Stable prefix lets a future migration script find these rows."""
+    import uuid as _uuid
+
+    return f"rpt-cfn-{_uuid.uuid4().hex[:12]}"
+
+
+# Defense-in-depth backstop for the source-level drop in
+# `agent_base.create_leaf_agent` (which removes no-reload-consumer tool output
+# BEFORE it is ever serialized into a trace). This walker re-applies the same
+# rule to the parsed `<tool>` structure at memory-save time, catching any path
+# that bypasses the leaf loop (e.g. the report-mode tool extractor). It only
+# traverses PARSED dict/list structure — it does NOT descend into
+# string-encoded nested traces, which is exactly why the source-level drop is
+# the primary fix. Shares `_NO_RELOAD_TRACE_TOOLS` / `_ABBREVIATED_TOOL_OUTPUT`
+# with agent_base (imported above) so the two never diverge.
+def _abbreviate_bulky_tool_traces(node: Any) -> Any:
+    """Recursively replace the `output` of any no-reload-consumer tool (see
+    `_NO_RELOAD_TRACE_TOOLS`) with a short placeholder, in a `<tool>` segment
+    dict and every nested `tool_trace` entry beneath it.
+
+    Keyed on the tool name (`name` at the top level, `tool_name` in nested
+    trace entries), with the gateway "<target>___" prefix stripped before
+    matching. Mutates a shallow copy so the live in-flight trace is untouched;
+    only the about-to-be-persisted copy is abbreviated.
+    """
+    if isinstance(node, list):
+        return [_abbreviate_bulky_tool_traces(x) for x in node]
+    if not isinstance(node, dict):
+        return node
+    out = dict(node)
+    name = out.get("name") or out.get("tool_name") or ""
+    bare_name = name.split("___")[-1] if "___" in name else name
+    if bare_name in _NO_RELOAD_TRACE_TOOLS and "output" in out:
+        out["output"] = _ABBREVIATED_TOOL_OUTPUT
+    if isinstance(out.get("tool_trace"), list):
+        out["tool_trace"] = [
+            _abbreviate_bulky_tool_traces(x) for x in out["tool_trace"]
+        ]
+    return out
+
+
+def _persist_cfn_artifact_as_report(
+    *,
+    report_id: str,
+    title: str,
+    template_yaml: str,
+    actor_id: str,
+    report_table: str,
+    region: str,
+) -> bool:
+    """Persist a `<cfn-artifact>` body as a complete single-section report.
+
+    Writes a row to ``REPORT_TABLE_NAME`` shaped exactly like a freeform
+    template report so the frontend's existing GET /reports/{id} +
+    ReportPanel paths render it without any frontend changes:
+
+      * ``user_id`` = ``actor_id`` (so ``userId`` partition key resolves
+        to ``"report:<actor_id>"`` per the existing ``save_report`` schema).
+      * ``status`` = ``"complete"`` so the ReportCard's first poll resolves
+        immediately and the card becomes clickable.
+      * One section: id=``"template"``, title=``"CloudFormation Template"``,
+        ``status="complete"``, content wraps the YAML in a ```yaml fenced
+        block (ReportPanel renders it with syntax highlighting).
+
+    Returns True on success, False on any error (caller falls back to
+    streaming the buffered YAML through as plain text).
+    """
+    if not report_table:
+        logger.warning(
+            "REPORT_TABLE_NAME not set — cannot persist cfn-artifact %s", report_id
+        )
+        return False
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    fenced_yaml = f"```yaml\n{template_yaml}\n```"
+    section = {
+        "id": "template",
+        "title": "CloudFormation Template",
+        "status": "complete",
+        "content": fenced_yaml,
+        "error": "",
+        "generated_at": now_iso,
+    }
+    report_data = {
+        "report_id": report_id,
+        "user_id": actor_id,
+        "title": title or "CloudFormation alarm template",
+        "status": "complete",
+        # Reuse the month/year fields (existing schema) — purely cosmetic
+        # for the sidebar entry's date display.
+        "month": datetime.now(timezone.utc).strftime("%B"),
+        "year": datetime.now(timezone.utc).strftime("%Y"),
+        "created_at": now_iso,
+        "updated_at": now_iso,
+        "sections": [section],
+        "current_section": 1,
+        "total_sections": 1,
+        "parent_report_id": "",
+        "version": 1,
+    }
+    return reports.save_report(
+        report_data, report_table=report_table, region=region
+    )
 
 
 def _handle_legacy_chat(

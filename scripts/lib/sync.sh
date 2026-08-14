@@ -518,12 +518,35 @@ sync_gateway_tools() {
   fi
 
   info "Syncing gateway tool schemas..."
-  .venv/bin/python -c "
+  if .venv/bin/python -c "
 import boto3, json, sys
 
 gateway_id = '${gateway_id}'
 region = '${AWS_REGION}'
 client = boto3.client('bedrock-agentcore-control', region_name=region)
+
+def sanitize_schema(schema):
+    \"\"\"Keep only JSON Schema fields supported by AgentCore gateway targets.\"\"\"
+    if not isinstance(schema, dict):
+        return {}
+
+    sanitized = {}
+    for key in ('type', 'description', 'required'):
+        if key in schema:
+            sanitized[key] = schema[key]
+
+    properties = schema.get('properties')
+    if isinstance(properties, dict):
+        sanitized['properties'] = {
+            name: sanitize_schema(value)
+            for name, value in properties.items()
+        }
+
+    items = schema.get('items')
+    if isinstance(items, dict):
+        sanitized['items'] = sanitize_schema(items)
+
+    return sanitized
 
 # Load tools.json
 with open('src/lambda/mcp/tools.json') as f:
@@ -537,9 +560,10 @@ try:
         existing[t['name']] = t['targetId']
 except Exception as e:
     print(f'Failed to list targets: {e}')
-    sys.exit(0)
+    sys.exit(1)
 
 # For each tool config that has a 'tools' array, update the target
+sync_failed = False
 for target_name, config in tools_config.items():
     tool_schemas = config.get('tools', [])
     if not tool_schemas:
@@ -548,6 +572,7 @@ for target_name, config in tools_config.items():
     target_id = existing.get(target_name)
     if not target_id:
         print(f'  {target_name}: target not found in gateway, skipping')
+        sync_failed = True
         continue
 
     # Build inline tool schemas
@@ -560,15 +585,7 @@ for target_name, config in tools_config.items():
         }
         schema = tool.get('input_schema', {})
         if schema.get('properties'):
-            inline_tool['inputSchema'] = {
-                'type': 'object',
-                'properties': {
-                    k: {kk: vv for kk, vv in v.items()}
-                    for k, v in schema['properties'].items()
-                },
-            }
-            if schema.get('required'):
-                inline_tool['inputSchema']['required'] = schema['required']
+            inline_tool['inputSchema'] = sanitize_schema(schema)
         inline_tools.append(inline_tool)
 
     # Get current target to preserve Lambda ARN
@@ -598,8 +615,14 @@ for target_name, config in tools_config.items():
         print(f'  {target_name}: updated with {len(inline_tools)} tool schemas')
     except Exception as e:
         print(f'  {target_name}: update failed — {e}')
-" 2>&1 || warn "Gateway tool schema sync failed (non-fatal)"
+        sync_failed = True
 
-  # Save hash on success
-  echo "$current_hash" > "$hash_file"
+if sync_failed:
+    sys.exit(1)
+" 2>&1; then
+    echo "$current_hash" > "$hash_file"
+  else
+    warn "Gateway tool schema sync failed (non-fatal)"
+    rm -f "$hash_file"
+  fi
 }

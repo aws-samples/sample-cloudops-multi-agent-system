@@ -144,7 +144,7 @@ package: $(HASH_DIR) ## Package Lambda tools (only changed ones, parallel)
 	@# every tool zip — it has no standalone handler. Compute its hash once
 	@# and fold it into each tool's hash so edits there force a rebuild of
 	@# every tool (same idea as hierarchy.json triggering agent rebuilds).
-	@shared_hash=$$(find src/lambda/mcp/shared -type f \( -name '*.py' \) -exec shasum {} + 2>/dev/null | sort | shasum | cut -d' ' -f1); \
+	@shared_hash=$$(find src/lambda/mcp/shared -type f \( -name '*.py' -o -name '*.json' \) -exec shasum {} + 2>/dev/null | sort | shasum | cut -d' ' -f1); \
 	_pids=""; _failed=0; \
 	for dir in src/lambda/mcp/*/; do \
 		tool=$$(basename "$$dir"); \
@@ -158,9 +158,13 @@ package: $(HASH_DIR) ## Package Lambda tools (only changed ones, parallel)
 			( \
 				echo "  Packaging $$tool..."; \
 				rm -rf "$$dir/package"; \
+				rm -f "src/lambda/mcp/$$tool.zip"; \
 				mkdir -p "$$dir/package/"; \
 				if grep -qvE '^[[:space:]]*(#|$$)' "$$dir/requirements.txt" 2>/dev/null; then \
-					pip install -r "$$dir/requirements.txt" -t "$$dir/package/" --quiet 2>/dev/null; \
+					pip install -r "$$dir/requirements.txt" -t "$$dir/package/" \
+						--platform manylinux_2_28_x86_64 --platform manylinux2014_x86_64 \
+						--python-version 3.12 --implementation cp \
+						--only-binary=:all: --upgrade --quiet || exit 1; \
 				fi; \
 				cp $$dir/*.py "$$dir/package/" 2>/dev/null; \
 				for sub in "$$dir"*/; do \
@@ -227,7 +231,7 @@ package: $(HASH_DIR) ## Package Lambda tools (only changed ones, parallel)
 	@# collector zip exactly like it is for MCP tools above — one source of
 	@# truth for assume-role logic. Its hash folds into each collector's hash
 	@# so edits there force all collectors to rebuild.
-	@shared_hash=$$(find src/lambda/mcp/shared -type f \( -name '*.py' \) -exec shasum {} + 2>/dev/null | sort | shasum | cut -d' ' -f1); \
+	@shared_hash=$$(find src/lambda/mcp/shared -type f \( -name '*.py' -o -name '*.json' \) -exec shasum {} + 2>/dev/null | sort | shasum | cut -d' ' -f1); \
 	for dir in src/lambda/collectors/*/; do \
 		name=$$(basename "$$dir"); \
 		zip_path="$$dir$$name-collector.zip"; \

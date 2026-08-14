@@ -208,6 +208,66 @@ def get_current_handler() -> Any:
     return _current_handler
 
 
+# ---------------------------------------------------------------------------
+# Typed CloudFormation artifact transport
+#
+# CloudWatch extracts templates from its raw MCP tool result before that result
+# is exposed to an agent model or a trace. The envelope below is internal-only:
+# leaf agents attach it to their runtime response, each orchestrator forwards
+# it one hop, and the supervisor persists it as a report. The template body is
+# never parsed from model text.
+#
+# Module-level state is safe because AgentCore Runtime processes one request
+# at a time per container (same rationale as _current_handler).
+# ---------------------------------------------------------------------------
+
+_pending_cfn_artifacts: list[dict] = []
+_outbound_cfn_artifacts: list[dict] = []
+_is_frontend_container = False
+
+
+def mark_frontend_container() -> None:
+    """Flag this process as the supervisor/frontend container."""
+    global _is_frontend_container
+    _is_frontend_container = True
+
+
+def get_pending_cfn_artifacts() -> list[dict]:
+    """Pop typed artifacts awaiting supervisor report persistence."""
+    global _pending_cfn_artifacts
+    items = list(_pending_cfn_artifacts)
+    _pending_cfn_artifacts = []
+    return items
+
+
+def drain_outbound_cfn_artifacts() -> list[dict]:
+    """Pop typed artifacts an intermediate agent must forward upstream."""
+    global _outbound_cfn_artifacts
+    items = list(_outbound_cfn_artifacts)
+    _outbound_cfn_artifacts = []
+    return items
+
+
+def _queue_cfn_artifacts(artifacts: list[dict]) -> None:
+    """Route validated typed CloudFormation artifacts by container role."""
+    valid = [
+        artifact
+        for artifact in artifacts
+        if isinstance(artifact, dict)
+        and artifact.get("kind") == "cloudformation-template"
+        and isinstance(artifact.get("template_yaml"), str)
+        and artifact["template_yaml"]
+    ]
+    if len(valid) != len(artifacts):
+        logger.warning("Ignoring malformed CloudFormation artifact envelope")
+    if not valid:
+        return
+    if _is_frontend_container:
+        _pending_cfn_artifacts.extend(valid)
+    else:
+        _outbound_cfn_artifacts.extend(valid)
+
+
 def _make_agent_tool(
     agent_name: str,
     endpoint: str,
@@ -308,6 +368,20 @@ def _make_agent_tool(
                 if isinstance(parsed, dict):
                     if "tool_trace" in parsed:
                         result["tool_trace"] = parsed["tool_trace"]
+                    # An intermediate (orchestrator) child forwards already
+                    # extracted artifacts out of band under "cfn_artifacts".
+                    # Re-queue them here so they continue travelling up to
+                    # the supervisor (where they finally get persisted +
+                    # emitted). The child already stripped the YAML from its
+                    # text, so the model never sees it at this hop either.
+                    forwarded_artifacts = parsed.get("cfn_artifacts")
+                    if isinstance(forwarded_artifacts, list) and forwarded_artifacts:
+                        _queue_cfn_artifacts(forwarded_artifacts)
+                        logger.info(
+                            "Delegate %s: forwarded %d cfn-artifact(s) from child",
+                            agent_name,
+                            len(forwarded_artifacts),
+                        )
                     result["data"] = parsed.get(
                         "response", parsed.get("data", result_text)
                     )
@@ -327,16 +401,6 @@ def _make_agent_tool(
             if handler:
                 output_val = str(result.get("data", ""))
                 nested_val = result.get("tool_trace")
-                # Debug: print to stdout so it appears in runtime logs
-                import sys
-
-                print(
-                    f"[TRACE_DEBUG] {agent_name}: output_len={len(output_val)}, "
-                    f"nested={len(nested_val) if nested_val else 'None'}, "
-                    f"result_keys={list(result.keys())}",
-                    file=sys.stderr,
-                    flush=True,
-                )
                 handler.complete_tool(
                     tool_name=agent_name,
                     output=output_val,

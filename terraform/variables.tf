@@ -132,6 +132,18 @@ variable "selected_tools" {
   default     = []
 }
 
+variable "enable_cloudwatch_coverage" {
+  description = "Deploy the scheduled CloudWatch alarm coverage snapshot pipeline when the cloudwatch tool is selected."
+  type        = bool
+  default     = true
+}
+
+variable "cloudwatch_snapshot_schedule" {
+  description = "EventBridge schedule for CloudWatch alarm coverage collection."
+  type        = string
+  default     = "rate(6 hours)"
+}
+
 variable "gateway_auth" {
   description = "Gateway auth type: iam (default) or oauth (Cognito JWT)"
   type        = string

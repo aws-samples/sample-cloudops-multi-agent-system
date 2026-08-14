@@ -42,10 +42,12 @@ from typing import Any
 from bedrock_agentcore.runtime import BedrockAgentCoreApp
 from strands import Agent
 from strands.models import BedrockModel
+from strands.tools.mcp.mcp_client import MCPAgentTool
 
 from agents.shared.prompt import build_dynamic_prompt
 from agents.shared.registry import (
     build_agent_tools,
+    drain_outbound_cfn_artifacts,
     load_agent_registry,
     set_current_handler,
 )
@@ -63,6 +65,45 @@ DEFAULT_MODEL_ID = os.environ.get(
 )
 AGENTCORE_MEMORY_ID = os.environ.get("AGENTCORE_MEMORY_ID", "")
 AWS_REGION = os.environ.get("AWS_REGION", "us-east-1")
+
+# Tools whose raw output must NOT be persisted into the tool trace. They return
+# very large payloads (a many-alarm CFN template runs 100k+ chars) AND have no
+# functional consumer on reload — the saved trace is a display-only collapsed
+# view, and the actual artifact is persisted separately to the reports DynamoDB
+# table (rendered via the <report-pending> marker). We drop the output at the
+# SOURCE (the leaf agent that calls the tool), so it never gets serialized into
+# this agent's trace and therefore never appears in any enclosing agent's trace
+# or the AgentCore Memory event. Matching is by bare tool name (the gateway
+# "<target>___" prefix is stripped before comparison).
+#
+# The CloudWatch alarm-recommendation read tools belong here too: a single
+# many-resource run fans out get_recommended_metric_alarms ~26× (one per
+# metric), and each result is a full AWS recommendation-catalogue JSON. That
+# nested trace bubbles worker -> orchestrator -> supervisor and, even after the
+# CFN YAML itself is dropped, was the dominant term that pushed the saved
+# assistant turn past AgentCore Memory's 100k-char per-event limit (observed
+# live: a 26-alarm run produced a ~155 KB <tool> blob and a CreateEvent
+# ValidationException, silently dropping the turn on reload). Their output has
+# NO reload consumer — the recommendations are reflected in the generated CFN
+# template, which is persisted separately to the reports table and rendered via
+# ReportPanel. analyse_metric / get_metric_metadata are included for the same
+# reason (verbose 14-day stats / metadata with no reload-time render path).
+#
+# Contrast: the DX-topology tools (discover_dx_topology / assess_dx_resiliency)
+# are deliberately NOT here — the frontend rebuilds the diagram from their saved
+# trace output on reload, so they must keep full fidelity.
+_NO_RELOAD_TRACE_TOOLS = frozenset(
+    {
+        "assemble_cfn_template",
+        "prepare_alarm_deployment",
+        "build_cfn_alarm",
+        "get_recommended_metric_alarms",
+        "get_metric_metadata",
+        "analyze_alarm_coverage",
+        "analyse_metric",
+    }
+)
+_ABBREVIATED_TOOL_OUTPUT = "[tool output omitted from chat memory — see ReportPanel]"
 
 
 def _build_model(model_id: str) -> "BedrockModel":
@@ -136,6 +177,12 @@ _NO_FABRICATION_PREAMBLE = """\
    If the user references a report and your history contains NO
    `<report-pending>` markers, do NOT guess a `report_id`. Tell the
    user the report isn't in this conversation.
+   NEVER write a `<report-pending>` marker yourself. These markers are
+   injected by the platform when it persists a report; they are records
+   you READ, never output. When a tool reports that a CloudFormation
+   template artifact was generated, summarize the result but never output
+   its YAML or a `<cfn-artifact>` block. The platform stores the typed
+   artifact separately and injects the matching report marker.
 
 Breaking any of these rules constitutes a serious operational failure.
 These rules override every other instruction in this prompt.
@@ -275,6 +322,121 @@ def cleanup_gateway(gateway_client: Any) -> None:
             pass
 
 
+def _decode_json_content(value: Any) -> dict[str, Any] | None:
+    """Decode an MCP JSON result that may have been serialized repeatedly."""
+    decoded = value
+    for _ in range(3):
+        if isinstance(decoded, dict):
+            return decoded
+        if not isinstance(decoded, str):
+            return None
+        try:
+            decoded = json.loads(decoded)
+        except json.JSONDecodeError:
+            return None
+    return decoded if isinstance(decoded, dict) else None
+
+
+def _extract_cloudformation_artifact(tool_result: dict) -> dict[str, Any] | None:
+    """Return a typed artifact from a successful assembler result, if present."""
+    if tool_result.get("status") != "success":
+        return None
+
+    candidates: list[Any] = [tool_result.get("structuredContent")]
+    for content in tool_result.get("content", []):
+        if isinstance(content, dict):
+            candidates.append(content.get("json"))
+            candidates.append(content.get("text"))
+
+    for candidate in candidates:
+        payload = _decode_json_content(candidate)
+        if not payload:
+            continue
+        template_yaml = payload.get("template_yaml")
+        if not isinstance(template_yaml, str) or not template_yaml:
+            continue
+        summary = payload.get("summary")
+        if not isinstance(summary, dict):
+            summary = {}
+        alarm_count = summary.get("alarm_count")
+        title = (
+            f"CloudWatch alarms ({alarm_count})"
+            if isinstance(alarm_count, int)
+            else "CloudWatch alarm template"
+        )
+        return {
+            "kind": "cloudformation-template",
+            "title": title,
+            "template_yaml": template_yaml,
+            "summary": summary,
+        }
+    return None
+
+
+def _artifact_acknowledgement(artifact: dict[str, Any]) -> dict[str, Any]:
+    """Build the compact result that is safe to send back to the worker model."""
+    return {
+        "artifact": {
+            "kind": artifact["kind"],
+            "title": artifact["title"],
+            "summary": artifact["summary"],
+        },
+        "message": "CloudFormation template generated and attached as an artifact.",
+    }
+
+
+class _CloudFormationArtifactTool(MCPAgentTool):
+    """MCP adapter that diverts template YAML before an LLM receives it."""
+
+    def __init__(self, source: MCPAgentTool, artifacts: list[dict[str, Any]]) -> None:
+        super().__init__(
+            source.mcp_tool,
+            source.mcp_client,
+            name_override=source.tool_name,
+            timeout=source.timeout,
+        )
+        self._artifacts = artifacts
+
+    async def stream(
+        self, tool_use: Any, invocation_state: dict[str, Any], **kwargs: Any
+    ):
+        async for event in super().stream(tool_use, invocation_state, **kwargs):
+            tool_result = getattr(event, "tool_result", None)
+            artifact = (
+                _extract_cloudformation_artifact(tool_result)
+                if isinstance(tool_result, dict)
+                else None
+            )
+            if not artifact:
+                yield event
+                continue
+
+            self._artifacts.append(artifact)
+            sanitized_result = dict(tool_result)
+            sanitized_result.pop("structuredContent", None)
+            sanitized_result["content"] = [
+                {"text": json.dumps(_artifact_acknowledgement(artifact))}
+            ]
+            yield type(event)(sanitized_result, getattr(event, "exception", None))
+
+
+def _wrap_cloudformation_template_tool(
+    tools: list, artifacts: list[dict[str, Any]]
+) -> list:
+    """Wrap only the CloudWatch template assembler; all other tools are unchanged."""
+    wrapped = []
+    for gateway_tool in tools:
+        tool_name = getattr(gateway_tool, "tool_name", "")
+        bare_name = tool_name.split("___")[-1]
+        if bare_name in {"assemble_cfn_template", "prepare_alarm_deployment"} and isinstance(
+            gateway_tool, MCPAgentTool
+        ):
+            wrapped.append(_CloudFormationArtifactTool(gateway_tool, artifacts))
+        else:
+            wrapped.append(gateway_tool)
+    return wrapped
+
+
 # ---------------------------------------------------------------------------
 # Mid-level agent factory
 # ---------------------------------------------------------------------------
@@ -340,7 +502,20 @@ def create_mid_level_agent(
 
             agent = Agent(**kwargs)
             response = agent(prompt)
-            return build_traced_response(response, handler)
+            traced = build_traced_response(response, handler)
+
+            # Forward any CFN artifacts extracted during this run up to the
+            # parent (ultimately the supervisor). Orchestrators have no event
+            # loop draining the queue, so we attach them to the response dict;
+            # the parent's _delegate re-queues them one hop up. Promote a
+            # plain-string response to a dict when needed so the field
+            # survives the hop.
+            outbound = drain_outbound_cfn_artifacts()
+            if outbound:
+                if isinstance(traced, str):
+                    traced = {"response": traced}
+                traced["cfn_artifacts"] = outbound
+            return traced
         except Exception as exc:
             logger.error("%s failed: %s", agent_name, exc, exc_info=True)
             return json.dumps({"error": str(exc)})
@@ -382,6 +557,8 @@ def create_leaf_agent(
             from agents.shared.prompt import _inject_date
 
             tools, gateway_client = load_gateway_tools(allowed_tools=allowed_tools)
+            captured_artifacts: list[dict[str, Any]] = []
+            tools = _wrap_cloudformation_template_tool(tools, captured_artifacts)
 
             # Fail-closed: a leaf worker with zero tools cannot answer a data
             # question without fabricating. Refuse rather than let the model
@@ -421,6 +598,17 @@ def create_leaf_agent(
             )
             response = agent(prompt)
 
+            # Map toolUseId -> tool name from the assistant's toolUse blocks so
+            # we can identify each result by tool name (the toolResult block
+            # itself carries no name). Names are gateway-prefixed here, e.g.
+            # "cloudwatch___assemble_cfn_template".
+            tool_names_by_id: dict[str, str] = {}
+            for msg in getattr(agent, "messages", []):
+                for block in msg.get("content", []):
+                    if isinstance(block, dict) and "toolUse" in block:
+                        tu = block["toolUse"]
+                        tool_names_by_id[tu.get("toolUseId", "")] = tu.get("name", "")
+
             # Extract MCP tool results from agent's message history
             # (callback_handler can't capture them — ToolResultEvent.is_callback_event=False)
             for msg in getattr(agent, "messages", []):
@@ -432,6 +620,25 @@ def create_leaf_agent(
                     tr = block["toolResult"]
                     tid = tr.get("toolUseId", "")
                     status = tr.get("status", "success")
+                    # Drop the output of no-reload-consumer tools (e.g.
+                    # assemble_cfn_template) AT THE SOURCE — before it is ever
+                    # serialized into this leaf's trace. The CFN body is already
+                    # persisted to the reports table and rendered via the
+                    # ReportPanel; keeping it in the trace only bloats every
+                    # enclosing agent's trace (worker -> orchestrator ->
+                    # supervisor) and the AgentCore Memory event past its 100k
+                    # char limit, which silently drops the whole turn on reload.
+                    # Killing it here means no enclosing level ever has to find
+                    # it inside a deeply string-encoded nested trace.
+                    raw_name = tool_names_by_id.get(tid, "")
+                    bare_name = (
+                        raw_name.split("___")[-1] if "___" in raw_name else raw_name
+                    )
+                    if bare_name in _NO_RELOAD_TRACE_TOOLS:
+                        handler.complete_tool_by_id(
+                            tid, output=_ABBREVIATED_TOOL_OUTPUT, status=status
+                        )
+                        continue
                     content = tr.get("content", "")
                     if isinstance(content, list):
                         content = " ".join(
@@ -446,7 +653,12 @@ def create_leaf_agent(
                         content = str(content)
                     handler.complete_tool_by_id(tid, output=content, status=status)
 
-            return build_traced_response(response, handler)
+            traced = build_traced_response(response, handler)
+            if captured_artifacts:
+                if isinstance(traced, str):
+                    traced = {"response": traced}
+                traced["cfn_artifacts"] = captured_artifacts
+            return traced
         except Exception as exc:
             logger.error("%s failed: %s", agent_name, exc, exc_info=True)
             return json.dumps({"error": str(exc)})
