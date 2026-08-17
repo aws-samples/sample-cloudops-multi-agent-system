@@ -1,24 +1,2 @@
-# cloudwatch Lambda dependencies.
-#
-# Pin numpy and pandas to exact versions per project convention (see
-# cost-explorer/requirements.txt rationale): unpinned deps allow silent
-# minor bumps to ship into the deployed Lambda zip on every rebuild.
-# Targets are the latest stable 2.x as of vendoring (numpy 2.4.6 +
-# pandas 2.3.3) — picked together because pandas 2.3.x is the last
-# stable 2.x line built against the numpy 2.x ABI. When bumping,
-# verify both move in lockstep and rerun the Task 3 analysis.py fixtures.
-#
-# boto3 is provided by the Python 3.12 Lambda runtime — declared here
-# without a pin so we always use the runtime version (avoids zip bloat
-# and keeps cross-account behavior aligned with the rest of the platform).
-#
-# PyYAML powers assemble_cfn_template's deterministic YAML serialization.
-# Pinned (same rationale as numpy/pandas) — silent minor bumps shouldn't
-# ship into the deployed Lambda zip on every rebuild. PyYAML 6.0.3 is the
-# latest stable as of vendoring; ships manylinux wheels with the _yaml
-# C-extension, so the Makefile's --platform manylinux_2_28_x86_64 path
-# pulls the right binary into the zip for Lambda's Python 3.12 runtime.
 numpy==2.4.6
-pandas==2.3.3
 pyyaml==6.0.3
-boto3

@@ -9,9 +9,9 @@
             "CROSS_ACCOUNT_ROLE_ARN_CLOUDWATCH": "$CROSS_ACCOUNT_ROLE_ARN_CLOUDWATCH"
         },
         "iam_actions": [
-            "cloudwatch:Describe*",
-            "cloudwatch:Get*",
-            "cloudwatch:List*"
+            "cloudwatch:DescribeAlarms",
+            "cloudwatch:DescribeAlarmHistory",
+            "cloudwatch:GetMetricData"
         ],
         "tools": [
             {
@@ -264,7 +264,7 @@
             },
             {
                 "name": "get_alarm_snapshot_status",
-                "description": "Return the current coverage snapshot identity, age, completeness, and refresh run status. force_refresh starts or reuses an asynchronous collection run.",
+                "description": "Return the current coverage snapshot identity, age, inventory exhaustiveness, and asynchronous run progress. Region progress distinguishes successful collection from partial resource inventory. force_refresh starts or reuses an asynchronous collection run.",
                 "input_schema": {
                     "type": "object",
                     "additionalProperties": false,

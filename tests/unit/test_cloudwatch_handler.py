@@ -479,6 +479,71 @@ def test_alarm_posture_snapshot_miss_falls_back_to_live(monkeypatch):
     live.assert_called_once()
 
 
+def test_snapshot_status_normalizes_legacy_markers_and_pending_regions(monkeypatch):
+    account_id = "123456789012"
+    current = {
+        "run_id": "published-run",
+        "snapshot_id": "published-run",
+        "collected_at": "2026-08-17T00:00:00+00:00",
+    }
+    refresh = {"run_id": "refresh-run", "status": "started"}
+    run = {
+        "pk": "RUN#refresh-run",
+        "sk": "META",
+        "run_id": "refresh-run",
+        "regions": ["eu-west-1", "us-east-1"],
+        "expected_region_count": 2,
+    }
+    legacy_marker = {
+        "pk": "RUN#refresh-run",
+        "sk": "REGION#us-east-1",
+        "region": "us-east-1",
+        "status": "complete",
+        "completeness": {
+            "complete": False,
+            "resource_inventory": False,
+            "alarm_inventory": True,
+            "source": "tagging_api",
+        },
+    }
+    table = MagicMock()
+
+    def get_item(*, Key):
+        if Key["sk"] == "REFRESH":
+            return {"Item": refresh}
+        if Key["sk"] == "META":
+            return {"Item": run}
+        return {}
+
+    table.get_item.side_effect = get_item
+    table.query.return_value = {"Items": [legacy_marker]}
+    monkeypatch.setattr(handler_mod, "_SNAPSHOT_TABLE", "coverage")
+    monkeypatch.setattr(handler_mod, "_snapshot_account_id", lambda: account_id)
+    monkeypatch.setattr(handler_mod, "_current_snapshot", lambda _: current)
+    monkeypatch.setattr(handler_mod, "_snapshot_table", lambda: table)
+
+    result = handler_mod.get_alarm_snapshot_status({})
+
+    progress = result["run_progress"]
+    assert progress["expected"] == 2
+    assert progress["succeeded"] == 1
+    assert progress["pending_or_retrying"] == 1
+    assert progress["expected_region_count"] == 2
+    assert progress["succeeded_region_count"] == 1
+    assert progress["pending_or_retrying_region_count"] == 1
+    assert progress["regions"]["eu-west-1"] == {
+        "status": "pending_or_retrying",
+        "collection_status": "pending_or_retrying",
+    }
+    completed = progress["regions"]["us-east-1"]
+    assert completed["status"] == "succeeded"
+    assert completed["resource_inventory_status"] == "partial"
+    assert completed["alarm_inventory_status"] == "complete"
+    assert completed["incomplete_reasons"] == [
+        "tagging_api_fallback_may_omit_untagged_resources"
+    ]
+
+
 # ---------------------------------------------------------------------------
 # analyze_alarm_coverage — grade existing alarms vs recommended catalogue
 # ---------------------------------------------------------------------------

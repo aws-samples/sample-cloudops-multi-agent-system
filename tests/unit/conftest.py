@@ -1,6 +1,6 @@
 """Shared setup for the unit-test package.
 
-Two things are centralized here so individual test modules don't each
+Three things are centralized here so individual test modules don't each
 re-implement them (which is how conventions drift — see the sys.modules
 pollution that once lived in test_lambda_runtime_tool.py):
 
@@ -12,17 +12,29 @@ pollution that once lived in test_lambda_runtime_tool.py):
    place before any handler import. Dummy credentials ensure a stray boto3
    call can never reach a real account from the unit suite.
 
-2. Automatic `unit` marker. Every test under tests/unit/ is a unit test, so
+2. MCP shared-package import path. Tests exercise multiple Lambda packages
+   that import `shared.*` during collection. Prepending src/lambda/mcp makes
+   the deployed shared package resolve before test modules are imported.
+
+3. Automatic `unit` marker. Every test under tests/unit/ is a unit test, so
    rather than repeat `pytestmark = pytest.mark.unit` in 15 files (only one
    did), we tag them all here. This makes `pytest -m unit` actually select
    the whole unit suite.
 """
 
 import os
+import sys
+from pathlib import Path
 
 import pytest
 
-# --- 1. Deterministic AWS env (module scope → runs at conftest import,
+# --- 1. MCP shared-package import path --------------------------------------
+MCP_ROOT = Path(__file__).resolve().parents[2] / "src" / "lambda" / "mcp"
+if str(MCP_ROOT) not in sys.path:
+    sys.path.insert(0, str(MCP_ROOT))
+
+
+# --- 2. Deterministic AWS env (module scope → runs at conftest import,
 #        before test modules import their handlers) --------------------------
 os.environ.setdefault("AWS_REGION", "us-east-1")
 os.environ.setdefault("AWS_DEFAULT_REGION", "us-east-1")
@@ -35,7 +47,7 @@ os.environ.setdefault("AWS_SECRET_ACCESS_KEY", "testing")
 os.environ.setdefault("AWS_SESSION_TOKEN", "testing")
 
 
-# --- 2. Auto-apply the `unit` marker to everything in this package ----------
+# --- 3. Auto-apply the `unit` marker to everything in this package ----------
 def pytest_collection_modifyitems(config, items):
     """Tag every test collected under tests/unit/ with the `unit` marker,
     so `pytest -m unit` selects the full suite without each file having to

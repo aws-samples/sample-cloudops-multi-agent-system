@@ -14,7 +14,11 @@ the Resource Groups Tagging API with explicit incomplete-inventory status.
 Each Region inventories all alarms, resolves resource tags and dimensions,
 computes coverage, and writes immutable rows to DynamoDB. A run publishes the
 `ACCOUNT#<id> / CURRENT` pointer only after every expected Region has completed.
-A failed or partial run never replaces the previous successful snapshot.
+A run with missing Region markers never replaces the previous snapshot.
+Collection outcome and inventory exhaustiveness are separate: a Region can
+finish successfully while reporting partial resource inventory when the
+Tagging API fallback may have omitted untagged resources. Alarm inventory is
+complete whenever the Region marker is written.
 
 Application freshness is independent of DynamoDB TTL:
 
@@ -37,7 +41,8 @@ complete.
 
 - `query_alarm_inventory`: snapshot-backed alarm configuration inventory.
 - `analyze_alarm_coverage`: account, tags, or explicit-resources coverage.
-- `get_alarm_snapshot_status`: current snapshot age, completeness, and run state.
+- `get_alarm_snapshot_status`: current snapshot age, inventory exhaustiveness,
+  and per-Region collection progress. Missing markers are pending or retrying.
 - `prepare_alarm_deployment`: live-revalidates selected candidate IDs, batches
   threshold calibration, and emits one typed CloudFormation artifact.
 - `analyze_alarm_tuning`: live alarm configuration, history, and metric baseline.

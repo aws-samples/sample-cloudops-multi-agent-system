@@ -16,7 +16,7 @@ Nine tools, all sync (boto3 calls are blocking; no asyncio):
   * analyze_alarm_coverage        — compare bounded alarm posture with catalogue
                                     recommendations for one scope or an inventory.
   * analyse_metric                — cloudwatch:GetMetricData over a 14-day window,
-                                    fed into the pure numpy/pandas analysis.
+                                    fed into the pure numpy analysis.
   * get_active_alarms             — cloudwatch:DescribeAlarms filtered to ALARM.
   * get_alarm_posture             — bounded alarm configuration inventory.
   * get_alarm_history             — cloudwatch:DescribeAlarmHistory.
@@ -1670,34 +1670,133 @@ def analyze_alarm_coverage_snapshot(event: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _run_region_progress(table, run: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Summarize completed markers and normalize markers from older runs."""
+    if not run:
+        return None
+    expected_regions = list(run.get("regions") or [])
+    rows: list[dict[str, Any]] = []
+    kwargs: dict[str, Any] = {
+        "KeyConditionExpression": (
+            Key("pk").eq(run["pk"]) & Key("sk").begins_with("REGION#")
+        )
+    }
+    while True:
+        page = table.query(**kwargs)
+        rows.extend(page.get("Items", []))
+        last_key = page.get("LastEvaluatedKey")
+        if not last_key:
+            break
+        kwargs["ExclusiveStartKey"] = last_key
+
+    markers = {row["region"]: row for row in rows if row.get("region")}
+    regions: dict[str, dict[str, Any]] = {}
+    for region in expected_regions:
+        marker = markers.get(region)
+        if not marker:
+            regions[region] = {
+                "status": "pending_or_retrying",
+                "collection_status": "pending_or_retrying",
+            }
+            continue
+
+        completeness = dict(marker.get("completeness") or {})
+        collection_status = completeness.get("collection_status") or (
+            "succeeded"
+            if marker.get("status") == "complete"
+            else "pending_or_retrying"
+        )
+        resource_status = completeness.get("resource_inventory_status")
+        if not resource_status:
+            resource_status = (
+                "complete"
+                if completeness.get("resource_inventory", False)
+                else "partial"
+            )
+        alarm_status = completeness.get("alarm_inventory_status")
+        if not alarm_status:
+            alarm_status = (
+                "complete"
+                if completeness.get("alarm_inventory", False)
+                else "partial"
+            )
+        reasons = list(completeness.get("incomplete_reasons") or [])
+        if (
+            resource_status == "partial"
+            and completeness.get("source") == "tagging_api"
+            and "tagging_api_fallback_may_omit_untagged_resources" not in reasons
+        ):
+            reasons.append("tagging_api_fallback_may_omit_untagged_resources")
+        if alarm_status == "partial" and "alarm_inventory_incomplete" not in reasons:
+            reasons.append("alarm_inventory_incomplete")
+
+        regions[region] = {
+            **completeness,
+            "status": collection_status,
+            "collection_status": collection_status,
+            "resource_inventory_status": resource_status,
+            "alarm_inventory_status": alarm_status,
+            "incomplete_reasons": reasons,
+        }
+
+    succeeded = sum(
+        item["collection_status"] == "succeeded" for item in regions.values()
+    )
+    pending_or_retrying = len(expected_regions) - succeeded
+    return {
+        "expected": len(expected_regions),
+        "succeeded": succeeded,
+        "pending_or_retrying": pending_or_retrying,
+        "expected_region_count": len(expected_regions),
+        "succeeded_region_count": succeeded,
+        "pending_or_retrying_region_count": pending_or_retrying,
+        "regions": regions,
+    }
+
+
 def get_alarm_snapshot_status(event: dict[str, Any]) -> dict[str, Any]:
     account_id = _snapshot_account_id()
     if event.get("account_id") not in (None, "", account_id):
         return {"error": "account_mismatch"}
     current = _current_snapshot(account_id)
+    if not _SNAPSHOT_TABLE:
+        return {
+            "account_id": account_id,
+            "current": current,
+            "refresh": _trigger_refresh() if event.get("force_refresh") else None,
+            "run_progress": None,
+        }
+    table = _snapshot_table()
+    refresh = table.get_item(
+        Key={"pk": f"ACCOUNT#{account_id}", "sk": "REFRESH"}
+    ).get("Item")
+    refresh_run_id = (refresh or {}).get("run_id") or (
+        current.get("run_id") if current else None
+    )
+    run = (
+        table.get_item(Key={"pk": f"RUN#{refresh_run_id}", "sk": "META"}).get(
+            "Item"
+        )
+        if refresh_run_id
+        else None
+    )
+    run_progress = _run_region_progress(table, run)
     if not current:
         return {
             "account_id": account_id,
             "current": None,
             "refresh": _trigger_refresh() if event.get("force_refresh") else None,
+            "run": run,
+            "refresh_run": refresh,
+            "run_progress": run_progress,
         }
-    refresh = (
-        _snapshot_table()
-        .get_item(Key={"pk": f"ACCOUNT#{account_id}", "sk": "REFRESH"})
-        .get("Item")
-    )
-    refresh_run_id = (refresh or {}).get("run_id") or current["run_id"]
-    run = (
-        _snapshot_table()
-        .get_item(Key={"pk": f"RUN#{refresh_run_id}", "sk": "META"})
-        .get("Item")
-    )
     return {
         "account_id": account_id,
         "current": current,
         "freshness": snapshot_domain.freshness(current["collected_at"]),
         "run": run,
         "refresh_run": refresh,
+        "run_progress": run_progress,
         "refresh_request": _trigger_refresh() if event.get("force_refresh") else None,
     }
 

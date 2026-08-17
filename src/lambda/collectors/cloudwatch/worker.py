@@ -30,6 +30,7 @@ METRIC_NAMESPACE = os.environ.get(
 RESOURCE_EXPLORER_REGION = os.environ.get(
     "RESOURCE_EXPLORER_AGGREGATOR_REGION", os.environ.get("AWS_REGION", "us-east-1")
 )
+TAGGING_API_FALLBACK_REASON = "tagging_api_fallback_may_omit_untagged_resources"
 
 
 def _table():
@@ -270,6 +271,16 @@ def region_job(message: dict[str, Any]) -> dict[str, Any]:
         "resource_inventory": bool(message["resource_inventory_complete"]),
         "alarm_inventory": True,
         "source": message["inventory_source"],
+        "collection_status": "succeeded",
+        "resource_inventory_status": (
+            "complete" if message["resource_inventory_complete"] else "partial"
+        ),
+        "alarm_inventory_status": "complete",
+        "incomplete_reasons": (
+            []
+            if message["resource_inventory_complete"]
+            else [TAGGING_API_FALLBACK_REASON]
+        ),
     }
     storage.complete_region(
         table,
