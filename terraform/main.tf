@@ -75,6 +75,7 @@ module "shared_config" {
   cross_account_role_arn                = try(var.tool_env_vars["cost-explorer"]["CROSS_ACCOUNT_ROLE_ARN"], "")
   cross_account_role_arn_coh            = try(var.tool_env_vars["cost-optimization-hub"]["CROSS_ACCOUNT_ROLE_ARN_COH"], "")
   cross_account_role_arn_tag_governance = try(var.tool_env_vars["tag-governance"]["CROSS_ACCOUNT_ROLE_ARN_TAG_GOVERNANCE"], "")
+  cross_account_role_arn_cloudwatch     = try(var.tool_env_vars["cloudwatch"]["CROSS_ACCOUNT_ROLE_ARN_CLOUDWATCH"], "")
   cur_database_name                     = try(var.tool_env_vars["cur-athena"]["CUR_DATABASE_NAME"], "")
   cur_table_name                        = try(var.tool_env_vars["cur-athena"]["CUR_TABLE_NAME"], "")
   athena_workgroup                      = try(var.tool_env_vars["cur-athena"]["ATHENA_WORKGROUP"], "")
@@ -198,6 +199,25 @@ module "tag_governance_collection" {
   tool_function_name = "${var.project_tag}-tag-governance-tool"
   tool_role_name     = "${var.project_tag}-tag-governance-tool-role"
   snapshot_schedule  = var.tag_snapshot_schedule
+  log_retention_days = var.log_retention_days
+}
+
+# -----------------------------------------------------------------------------
+# CloudWatch Coverage Collection
+# -----------------------------------------------------------------------------
+module "cloudwatch_collection" {
+  source = "./modules/custom/cloudwatch-collection"
+  count = (
+    var.enable_cloudwatch_coverage
+    && var.deploy_tools
+    && (contains(var.selected_tools, "cloudwatch") || length(var.selected_tools) == 0)
+  ) ? 1 : 0
+
+  project_tag        = var.project_tag
+  environment_tag    = var.environment_tag
+  collector_zip_path = "${path.module}/../src/lambda/collectors/cloudwatch/cloudwatch-collector.zip"
+  target_role_arn    = try(var.tool_env_vars["cloudwatch"]["CROSS_ACCOUNT_ROLE_ARN_CLOUDWATCH"], "")
+  snapshot_schedule  = var.cloudwatch_snapshot_schedule
   log_retention_days = var.log_retention_days
 }
 
@@ -331,10 +351,45 @@ module "lambda_tools" {
     lookup(each.value, "needs_tag_snapshots", false) && length(module.tag_governance_collection) > 0 ? {
       TAG_SNAPSHOT_TABLE_NAME = module.tag_governance_collection[0].table_name
     } : {},
+    lookup(each.value, "needs_cloudwatch_snapshots", false) && length(module.cloudwatch_collection) > 0 ? {
+      CLOUDWATCH_COVERAGE_TABLE_NAME       = module.cloudwatch_collection[0].table_name
+      CLOUDWATCH_COVERAGE_COORDINATOR_NAME = module.cloudwatch_collection[0].coordinator_function_name
+      CLOUDWATCH_COVERAGE_CURSOR_SECRET    = "${var.project_tag}:${var.environment_tag}:cloudwatch-coverage"
+    } : {},
   )
 
   kms_key_arn        = module.kms.key_arn
   log_retention_days = var.log_retention_days
+}
+
+# Keep the generic tool role policy limited to CloudWatch API reads. Snapshot
+# access and asynchronous refresh invocation are scoped to concrete module
+# outputs here, without deriving role names.
+resource "aws_iam_role_policy" "cloudwatch_snapshot_read" {
+  for_each = length(module.cloudwatch_collection) > 0 && contains(keys(module.lambda_tools), "cloudwatch") ? {
+    cloudwatch = module.lambda_tools["cloudwatch"].lambda_role_name
+  } : {}
+
+  name = "${var.project_tag}-cloudwatch-coverage-read"
+  role = each.value
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "dynamodb:GetItem",
+          "dynamodb:Query",
+        ]
+        Resource = module.cloudwatch_collection[0].table_arn
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["lambda:InvokeFunction"]
+        Resource = module.cloudwatch_collection[0].coordinator_function_arn
+      },
+    ]
+  })
 }
 
 # -----------------------------------------------------------------------------

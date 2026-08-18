@@ -22,6 +22,39 @@ import { extractVisualizerStateFromMemory } from "@/lib/visualizer-state";
 import { useThreadActivity } from "@/lib/thread-activity";
 import { ThreadBusyProvider } from "@/lib/thread-busy-context";
 
+// Split a saved text blob into ordered parts, peeling any
+// `<report-pending report_id="…" title="…"/>` markers into their OWN parts.
+// On reload, Thread.tsx only renders a clickable ReportCard when a text part
+// matches the anchored `^<report-pending …/>$` regex — a marker glued to
+// surrounding markdown (e.g. `</tool>\n<report-pending …/>Here's the…`)
+// otherwise renders as literal code. Markers are de-duped by report_id
+// because both the _delegate extraction path and the streaming interceptor
+// can persist the same pending marker.
+function splitReportPendingParts(
+  text: string,
+  seen: Set<string>,
+): { type: "text"; text: string }[] {
+  const parts: { type: "text"; text: string }[] = [];
+  const re = /<report-pending\s+[^>]*\/>/g;
+  let lastIdx = 0;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(text)) !== null) {
+    const before = text.slice(lastIdx, m.index).trim();
+    if (before) parts.push({ type: "text" as const, text: before });
+    const marker = m[0];
+    const idMatch = marker.match(/report_id="([^"]*)"/);
+    const reportId = idMatch ? idMatch[1] : marker;
+    if (!seen.has(reportId)) {
+      seen.add(reportId);
+      parts.push({ type: "text" as const, text: marker });
+    }
+    lastIdx = m.index + marker.length;
+  }
+  const after = text.slice(lastIdx).trim();
+  if (after) parts.push({ type: "text" as const, text: after });
+  return parts;
+}
+
 function ChatSkeleton() {
   return (
     <div className="flex-1 flex flex-col px-4 pt-8 pb-4 max-w-2xl mx-auto w-full">
@@ -528,20 +561,22 @@ export default function Home() {
             const toolTagRegex = /<tool>[\s\S]*?<\/tool>/g;
             if (toolTagRegex.test(mainContent)) {
               toolTagRegex.lastIndex = 0; // reset after test
+              const seenPending = new Set<string>();
               const segments: { type: "text"; text: string }[] = [];
               let lastIdx = 0;
               let match;
               while ((match = toolTagRegex.exec(mainContent)) !== null) {
-                // Text before this tool tag
+                // Text before this tool tag — peel any report-pending markers
+                // into their own parts so the ReportCard renders on reload.
                 const before = mainContent.slice(lastIdx, match.index).trim();
-                if (before) segments.push({ type: "text" as const, text: before });
+                if (before) segments.push(...splitReportPendingParts(before, seenPending));
                 // The tool tag itself
                 segments.push({ type: "text" as const, text: match[0] });
                 lastIdx = match.index + match[0].length;
               }
-              // Remaining text after last tool tag
+              // Remaining text after last tool tag — same marker peeling.
               const after = mainContent.slice(lastIdx).trim();
-              if (after) segments.push({ type: "text" as const, text: after });
+              if (after) segments.push(...splitReportPendingParts(after, seenPending));
               // Use segments as the ordered content — skip the toolParts/mainContent split
               const extraParts = [
                 ...(artifactPart ? [artifactPart] : []),
@@ -572,10 +607,17 @@ export default function Home() {
             ...(vizStatePart ? [vizStatePart] : []),
           ];
 
+          // Peel any report-pending markers out of the residual mainContent
+          // so they render as ReportCards rather than literal code.
+          const mainParts =
+            m.role === "assistant" && mainContent.includes("<report-pending")
+              ? splitReportPendingParts(mainContent, new Set<string>())
+              : [{ type: "text" as const, text: mainContent }];
+
           const contentParts = toolParts.length || extraParts.length
             ? [
               ...toolParts,
-              { type: "text" as const, text: mainContent },
+              ...mainParts,
               ...extraParts,
             ]
             : mainContent;

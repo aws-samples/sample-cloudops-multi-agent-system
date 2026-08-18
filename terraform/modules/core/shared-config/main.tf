@@ -42,6 +42,7 @@ locals {
     "cross_account/default_role_arn"             = { type = "String", value = var.cross_account_role_arn }
     "cross_account/coh_role_arn"                 = { type = "String", value = var.cross_account_role_arn_coh }
     "cross_account/tag_governance_role_arn"      = { type = "String", value = var.cross_account_role_arn_tag_governance }
+    "cross_account/cloudwatch_role_arn"          = { type = "String", value = var.cross_account_role_arn_cloudwatch }
     "cross_account/health_role_arn"              = { type = "String", value = var.health_events_cross_account_role_arn }
     "cross_account/network_resilience_role_arns" = { type = "String", value = var.network_resilience_cross_account_role_arns }
     "cur/database_name"                          = { type = "String", value = var.cur_database_name }

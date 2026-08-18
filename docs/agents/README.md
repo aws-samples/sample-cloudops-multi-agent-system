@@ -15,6 +15,7 @@ in `../architecture.md`.
 | [`health-events.md`](health-events.md) | `health-events-agent` | AWS Health events ingestion + query. Four deploy modes (single-account / org-mgmt / org-delegated / cross-account), rules-based risk scoring, LLM enrichment, backfill. |
 | [`network-resiliency.md`](network-resiliency.md) | `network-resiliency-agent` | Direct Connect topology discovery + 22-rule resilience assessment + DX pricing. Shared rule engine across MCP and frontend REST Lambdas. |
 | [`tag-governance.md`](tag-governance.md) | `tag-governance-agent` | Read-only org-wide tag compliance via Resource Explorer + Organizations Tag Policies, with remediation deep-links and cost-allocation activation health. Three deploy modes, requires Resource Explorer multi-account search. |
+| [`cloudwatch.md`](cloudwatch.md) | `cloudwatch-agent` | Read-only CloudWatch alarm assistant — recommends best-practice alarms from a vendored metric catalogue and tunes thresholds from real metric history, emitting CloudFormation the user applies. Single-account or one cross-account spoke per deploy. |
 
 ## When to add a file here
 
