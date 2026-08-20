@@ -395,6 +395,7 @@ Skills provide the platform's analytical capabilities as portable workflows that
 | `/finops-analysis` | "what are my top costs?" | Cost breakdown, trends, forecasts, savings |
 | `/health-events-digest` | "any critical health events?" | Health event digest with risk scoring |
 | `/tag-governance-assessment` | "how's my tag compliance?" | Tag compliance scoring + remediation links |
+| `/lambda-runtime-upgrade` | "find deprecated lambda functions" | Multi-region deprecated-runtime discovery + migration report |
 
 ### How to use skills
 
