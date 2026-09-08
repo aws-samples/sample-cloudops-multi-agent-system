@@ -802,6 +802,228 @@
             }
         ]
     },
+    "commitments": {
+        "handler": "handler.handler",
+        "runtime": "python3.12",
+        "timeout": 300,
+        "memory": 1024,
+        "env_vars": {
+            "CROSS_ACCOUNT_ROLE_ARN": "$CROSS_ACCOUNT_ROLE_ARN",
+            "CROSS_ACCOUNT_ROLE_ARN_COH": "$CROSS_ACCOUNT_ROLE_ARN_COH"
+        },
+        "iam_actions": [
+            "ce:GetSavingsPlansPurchaseRecommendation",
+            "ce:GetReservationPurchaseRecommendation",
+            "ce:GetSavingsPlansCoverage",
+            "ce:GetSavingsPlansUtilization",
+            "ce:GetReservationCoverage",
+            "ce:GetReservationUtilization",
+            "ce:GetCostAndUsage",
+            "cost-optimization-hub:ListEnrollmentStatuses",
+            "cost-optimization-hub:ListRecommendations",
+            "savingsplans:DescribeSavingsPlans",
+            "ec2:DescribeReservedInstances",
+            "rds:DescribeReservedDBInstances",
+            "elasticache:DescribeReservedCacheNodes",
+            "redshift:DescribeReservedNodes",
+            "es:DescribeReservedInstances",
+            "memorydb:DescribeReservedNodes",
+            "sts:GetCallerIdentity"
+        ],
+        "tools": [
+            {
+                "name": "generate_commitment_analysis",
+                "description": "ONE-SHOT: produce a complete AWS discounted-commitment (Savings Plan + Reserved Instance) purchase analysis. Sweeps every requested term/payment permutation in parallel, risk-adjusts each AWS recommendation down to the commitment level the workload sustains on its quietest hour, checks whether EXISTING commitments are healthy enough to add more, and reconciles totals against Cost Optimization Hub. Returns a fully rendered 'report_markdown' plus structured recommendations. PREFER this over calling the sizing tools separately — it is one call and includes the posture gate and reconciliation the numbers are only defensible with. Read-only: purchases nothing. Takes up to ~90s for a full sweep.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "lookback": {
+                            "type": "string",
+                            "description": "Usage history window AWS bases recommendations on: SEVEN_DAYS, THIRTY_DAYS, SIXTY_DAYS (default: THIRTY_DAYS)"
+                        },
+                        "terms": {
+                            "type": "array",
+                            "items": {
+                                "type": "string"
+                            },
+                            "description": "Commitment terms to evaluate: ONE_YEAR, THREE_YEARS (default: both)"
+                        },
+                        "payment_options": {
+                            "type": "array",
+                            "items": {
+                                "type": "string"
+                            },
+                            "description": "Payment options to evaluate: NO_UPFRONT, PARTIAL_UPFRONT, ALL_UPFRONT (default: NO_UPFRONT and ALL_UPFRONT)"
+                        },
+                        "account_scope": {
+                            "type": "string",
+                            "description": "PAYER aggregates the whole organization; LINKED scopes to this account only (default: PAYER)"
+                        },
+                        "families": {
+                            "type": "array",
+                            "items": {
+                                "type": "string"
+                            },
+                            "description": "Commitment families to analyze: 'sp' (Savings Plans), 'ri' (Reserved Instances), or both (default: both)"
+                        },
+                        "savings_plan_types": {
+                            "type": "array",
+                            "items": {
+                                "type": "string"
+                            },
+                            "description": "Savings Plan types: COMPUTE_SP, EC2_INSTANCE_SP, SAGEMAKER_SP, DATABASE_SP, or 'all' (default: all)"
+                        },
+                        "ri_services": {
+                            "type": "array",
+                            "items": {
+                                "type": "string"
+                            },
+                            "description": "RI-eligible services, by short label (EC2, RDS, Redshift, ElastiCache, OpenSearch, Elasticsearch, MemoryDB, DynamoDB) or exact Cost Explorer name, or 'all' (default: all). Narrow this to cut runtime."
+                        },
+                        "posture_days": {
+                            "type": "integer",
+                            "description": "Window for existing coverage/utilization metrics (default: 30)"
+                        },
+                        "regions": {
+                            "type": "array",
+                            "items": {
+                                "type": "string"
+                            },
+                            "description": "Pass regions to ALSO inventory existing commitments and report what expires soon (e.g. ['ap-northeast-1','us-east-1']). Reservations are regional, so only the regions listed are checked; Savings Plans are account-level and are fetched once regardless. Omit to skip the expiry inventory entirely — it needs Describe* permissions beyond Cost Explorer."
+                        },
+                        "expiry_horizon_days": {
+                            "type": "integer",
+                            "description": "How far ahead to look for expiring commitments, in days (default: 90). Only used when 'regions' is supplied."
+                        }
+                    }
+                }
+            },
+            {
+                "name": "size_savings_plans",
+                "description": "Savings Plans purchase recommendations only, risk-adjusted to the commitment level the workload sustains at its measured hourly spend floor. Returns achievable vs AWS best-case monthly savings, upfront cost, break-even months, waste exposure, and confidence per plan type. Use when the user asks specifically about Savings Plans; use generate_commitment_analysis for a full report. Read-only.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "savings_plan_types": {
+                            "type": "array",
+                            "items": {
+                                "type": "string"
+                            },
+                            "description": "COMPUTE_SP, EC2_INSTANCE_SP, SAGEMAKER_SP, DATABASE_SP, or 'all' (default: all)"
+                        },
+                        "lookback": {
+                            "type": "string",
+                            "description": "SEVEN_DAYS, THIRTY_DAYS, SIXTY_DAYS (default: THIRTY_DAYS)"
+                        },
+                        "terms": {
+                            "type": "array",
+                            "items": {
+                                "type": "string"
+                            },
+                            "description": "ONE_YEAR, THREE_YEARS (default: both)"
+                        },
+                        "payment_options": {
+                            "type": "array",
+                            "items": {
+                                "type": "string"
+                            },
+                            "description": "NO_UPFRONT, PARTIAL_UPFRONT, ALL_UPFRONT (default: NO_UPFRONT and ALL_UPFRONT)"
+                        },
+                        "account_scope": {
+                            "type": "string",
+                            "description": "PAYER or LINKED (default: PAYER)"
+                        }
+                    }
+                }
+            },
+            {
+                "name": "size_reservations",
+                "description": "Reserved Instance purchase recommendations only, risk-adjusted. Commitments are quoted in whole instance or capacity units, rounded down to the count the workload never drops below. Covers EC2, RDS, Redshift, ElastiCache, OpenSearch, MemoryDB, and DynamoDB. Use when the user asks specifically about reservations; use generate_commitment_analysis for a full report. Read-only.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "ri_services": {
+                            "type": "array",
+                            "items": {
+                                "type": "string"
+                            },
+                            "description": "Short labels (EC2, RDS, Redshift, ElastiCache, OpenSearch, Elasticsearch, MemoryDB, DynamoDB), exact Cost Explorer service names, or 'all' (default: all)"
+                        },
+                        "lookback": {
+                            "type": "string",
+                            "description": "SEVEN_DAYS, THIRTY_DAYS, SIXTY_DAYS (default: THIRTY_DAYS)"
+                        },
+                        "terms": {
+                            "type": "array",
+                            "items": {
+                                "type": "string"
+                            },
+                            "description": "ONE_YEAR, THREE_YEARS (default: both)"
+                        },
+                        "payment_options": {
+                            "type": "array",
+                            "items": {
+                                "type": "string"
+                            },
+                            "description": "NO_UPFRONT, PARTIAL_UPFRONT, ALL_UPFRONT (default: NO_UPFRONT and ALL_UPFRONT)"
+                        },
+                        "account_scope": {
+                            "type": "string",
+                            "description": "PAYER or LINKED (default: PAYER)"
+                        }
+                    }
+                }
+            },
+            {
+                "name": "get_commitment_posture",
+                "description": "Health of EXISTING Savings Plans and Reserved Instances: coverage, utilization, unused commitment, unused reservation hours, and realized savings. Returns explicit blockers (utilization under 95%, coverage over 90%) plus 'safe_to_buy_more', Cost Optimization Hub enrollment, and commitment-addressable spend by service. Call this BEFORE recommending any purchase — buying on top of an under-utilized commitment compounds waste instead of saving money. Read-only.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "posture_days": {
+                            "type": "integer",
+                            "description": "Window for coverage/utilization metrics (default: 30)"
+                        },
+                        "spend_days": {
+                            "type": "integer",
+                            "description": "Window for the eligible-spend breakdown (default: 60)"
+                        }
+                    }
+                }
+            },
+            {
+                "name": "get_commitment_expiry",
+                "description": "Which EXISTING Savings Plans and Reserved Instances expire soon, and what to do about each. Inventories active commitments across EC2, RDS, ElastiCache, Redshift, OpenSearch, MemoryDB and Savings Plans, derives each end date, and returns them bucketed as urgent (<=30 days), soon (<=60) or upcoming, each with a renew / renew-smaller / let-lapse / review verdict driven by measured utilization. Use this when the user asks what is expiring, what needs renewing, or before recommending a new purchase — a lapsing commitment silently returns that spend to on-demand rates, and expiry is the one moment resizing costs nothing. Note: AWS publishes utilization only at the account level, not per commitment, so the verdicts are directional. DynamoDB reserved capacity has no describe API and is reported as a blind spot. Read-only: renews nothing.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "regions": {
+                            "type": "array",
+                            "items": {
+                                "type": "string"
+                            },
+                            "description": "Regions to inventory reservations in (e.g. ['ap-northeast-1','us-east-1']). Reservations are regional and are only found in the regions listed; Savings Plans are account-level and are fetched once regardless. Defaults to the Lambda's own region."
+                        },
+                        "services": {
+                            "type": "array",
+                            "items": {
+                                "type": "string"
+                            },
+                            "description": "Reservation families to inventory: ec2, rds, elasticache, redshift, opensearch, memorydb (default: all). Savings Plans are always included."
+                        },
+                        "horizon_days": {
+                            "type": "integer",
+                            "description": "How far ahead to look, in days (default: 90). Commitments ending beyond this are counted but not listed."
+                        },
+                        "posture_days": {
+                            "type": "integer",
+                            "description": "Window for the utilization figures the renew/let-lapse verdicts are based on (default: 30)"
+                        }
+                    }
+                }
+            }
+        ]
+    },
     "health-events": {
         "handler": "handler.handler",
         "runtime": "python3.12",
