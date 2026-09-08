@@ -7,7 +7,7 @@ FinOps domain under `finops-agent` (peer of `pricing-agent`).
 
 ## 1. What the feature does
 
-Answers spending questions using three complementary surfaces, from
+Answers spending questions using four complementary surfaces, from
 narrowest to broadest:
 
 - **Cost Explorer API** — monthly / daily cost and usage, optional
@@ -19,6 +19,12 @@ narrowest to broadest:
 - **Cost Optimization Hub** — savings recommendations (right-sizing,
   idle resources, Savings Plans, Reserved Instances) aggregated
   across the org.
+- **Commitments** — risk-adjusted Savings Plan / Reserved Instance
+  purchase sizing. The only surface that reaches
+  `GetSavingsPlansPurchaseRecommendation` and
+  `GetReservationPurchaseRecommendation`, so it is the only one that can
+  size a commitment rather than just report existing coverage. Full
+  reference: [`docs/skills/discounted-commitments.md`](../skills/discounted-commitments.md).
 
 Representative prompts:
 
@@ -182,6 +188,17 @@ Lambda hardcodes `region_name="us-east-1"`. Same pattern as
 }
 ```
 
+### `generate_commitment_analysis` (commitments)
+
+Returns a `report_markdown` field holding the complete pre-formatted
+report, alongside the structured envelope (`recommendations`, `count`,
+`total_estimated_monthly_savings`, `aws_best_case_monthly_savings`,
+`reconciliation`, `existing_commitment_posture`, `blockers`). The agent
+prompt requires emitting `report_markdown` verbatim rather than rebuilding
+the table from the structured fields. Response shape and the other three
+commitment tools:
+[`docs/skills/discounted-commitments.md`](../skills/discounted-commitments.md).
+
 ### `start_query_execution` (CUR/Athena)
 
 Synchronous — the Lambda waits for the Athena query to complete (up
@@ -209,3 +226,5 @@ savings, anomalies, and forecast sections. See
 | Cost Explorer shows different totals than the bill | Metric mismatch (UnblendedCost vs AmortizedCost vs NetAmortizedCost) + Credits/Refunds exclusion | Specify the metric explicitly; match what the finance team uses for reconciliation |
 | Forecast returns an error for start_date in the past | `get_cost_forecast` requires future start_date | Use `get_cost_and_usage` for historical; forecast is future-only |
 | Model called `group_by=["SERVICE"]` when the user only asked "how much" | Model embellishing beyond the ask | The worker prompt already gates this; if it recurs, tighten the "ONE call, no group_by unless asked" rule |
+| Model answered a "should we buy an SP?" question from `cost-optimization-hub` alone | COH publishes commitment recommendations but cannot size one | The worker prompt routes all SP/RI purchase questions to the `commitments` tools; see [`docs/skills/discounted-commitments.md`](../skills/discounted-commitments.md) |
+| Unexpected Cost Explorer charges after a commitment question | CE bills $0.01 per recommendation request; a full default sweep is 48 | Narrow `savings_plan_types` / `ri_services` on `generate_commitment_analysis` |

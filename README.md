@@ -247,8 +247,6 @@ scripts/
 
 docs/
   architecture.md               # system internals
-skills/
-  developer-guide/SKILL.md      # Adding agents / tools / collectors (interactive)
   agents/                       # Per-leaf-agent references (deploy modes, data model, gotchas)
     README.md                   # When to add a file + section template
     cost-operations.md          # Cost Explorer / CUR / COH reference
@@ -257,7 +255,13 @@ skills/
     network-resiliency.md       # Direct Connect topology + resilience rules
     tag-governance.md           # Tag governance feature reference
     lambda-upgrade.md           # Lambda runtime upgrade discovery + migration
+  skills/                       # Per-skill references (method, API surface, portability)
+    discounted-commitments.md   # SP/RI risk-adjusted sizing + commitments MCP tool
   observability-tuning.md       # X-Ray + Transaction Search knobs
+
+skills/                         # Portable agent skills (invocable as /skill-name)
+  developer-guide/SKILL.md      # Adding agents / tools / collectors (interactive)
+  discounted-commitments/       # SP/RI sizing — 3 markdown files, no code
 
 tests/unit/                     # pytest + moto
 ```
@@ -339,6 +343,13 @@ See `.env.example` for the canonical identity-only `.env` template and
     setup, tag-policy bring-up commands, read-only-by-design rationale.
   - [docs/agents/lambda-upgrade.md](docs/agents/lambda-upgrade.md)
     — Lambda runtime discovery, code analysis, and migration guidance.
+- [docs/skills/](docs/skills/) — per-skill reference files for skills
+  with a non-trivial method or a platform counterpart.
+  - [docs/skills/discounted-commitments.md](docs/skills/discounted-commitments.md)
+    — Savings Plan / Reserved Instance risk-adjusted sizing: the
+    volatility bands and break-even guards, the Cost Explorer API
+    surface and its per-request cost, the `commitments` MCP tool, and
+    how the portable skill and the deployed Lambda stay in agreement.
 - [docs/observability-tuning.md](docs/observability-tuning.md) —
   X-Ray sampling and Transaction Search indexing knobs.
 
@@ -356,6 +367,7 @@ Skills provide the system's analytical capabilities as portable workflows that w
 | `/health-events-digest` | "any critical health events?" | Health event digest with risk scoring |
 | `/tag-governance-assessment` | "how's my tag compliance?" | Tag compliance scoring + remediation links |
 | `/lambda-runtime-upgrade` | "find deprecated lambda functions" | Multi-region deprecated-runtime discovery + migration report |
+| `/discounted-commitments` | "what savings plans should we buy?" | Risk-adjusted SP/RI sizing — achievable vs AWS best case ([docs](docs/skills/discounted-commitments.md)) |
 
 ### How to use skills
 
