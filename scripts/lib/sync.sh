@@ -552,12 +552,24 @@ def sanitize_schema(schema):
 with open('src/lambda/mcp/tools.json') as f:
     tools_config = json.load(f)
 
-# Get existing targets
+# Get existing targets. This has to page: the API returns a bounded page and
+# boto3 does not follow nextToken on its own, so a single call silently drops
+# the newest targets once the gateway holds more than one page of them — and a
+# dropped target reads as 'not found', which fails the sync for a target that
+# is actually present.
 existing = {}
 try:
-    resp = client.list_gateway_targets(gatewayIdentifier=gateway_id)
-    for t in resp.get('items', []):
-        existing[t['name']] = t['targetId']
+    next_token = None
+    while True:
+        kwargs = {'gatewayIdentifier': gateway_id, 'maxResults': 100}
+        if next_token:
+            kwargs['nextToken'] = next_token
+        resp = client.list_gateway_targets(**kwargs)
+        for t in resp.get('items', []):
+            existing[t['name']] = t['targetId']
+        next_token = resp.get('nextToken')
+        if not next_token:
+            break
 except Exception as e:
     print(f'Failed to list targets: {e}')
     sys.exit(1)
