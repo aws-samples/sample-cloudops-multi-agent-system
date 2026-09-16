@@ -86,7 +86,7 @@ interchangeable.
 | Who executes | The host agent, via Bash | The Lambda, called through the gateway |
 | Arithmetic by | The agent, following `reference/method.md` | `commitments/analyze.py` |
 | Portable | Yes — copy the directory anywhere | No — platform-coupled |
-| Tests | None (no code to test) | 274 tests, `tests/unit/test_commitments_*.py` |
+| Tests | None (no code to test) | 331 tests, `tests/unit/test_commitments_*.py` |
 
 The skill is the portable expression: it must run in any coding agent
 with a shell, with nothing installed, so it drives the AWS CLI and states
@@ -926,7 +926,7 @@ registration.
 
 ```bash
 .venv/bin/python -m pytest tests/unit/test_commitments_*.py -q
-# 274 passed
+# 331 passed
 ```
 
 | File | Covers |
@@ -937,6 +937,7 @@ registration.
 | `test_commitments_expiry.py` | Per-family field mapping and derived end dates, date coercion across SDK/CLI shapes, expiry buckets and renewal verdicts at their boundaries, unit separation, region validation, expiry rendering, and that the Savings Plans job is **not** multiplied per region |
 | `test_commitments_spec.py` | The per-service spec shapes (all seven, including the OpenSearch two-field type and the DynamoDB container), `MultiAZ` as a boolean, per-line breakdown and ranking, whole-unit rounding and its disclosure, the report's line-items and expiry `Spec` columns, and `line_items` in the envelope |
 | `test_commitments_tool.py` | Handler parameter validation, error normalization, `TestHandlerDiscipline`, and `tools.json` wiring |
+| `test_commitments_contracts.py` | Every AWS field name in `RECOMMENDATION_SPECS` and `RESERVATION_INVENTORY` checked against botocore's shipped service models — see below |
 
 The band tests pin the risk-adjustment thresholds *at* their boundaries
 (0.80, 0.50, 95%, 90%, and the 30/60/90-day expiry cutoffs), which is what
@@ -956,6 +957,59 @@ The spec tests exist for the same reason: a mistyped field name in
 exception, and writing them surfaced a real defect — `str(None)` rendering as the
 literal `"None"`, which would have printed a fabricated specification into a
 customer-facing report.
+
+### Contract tests: field names, checked against botocore
+
+`test_commitments_spec.py` proves the *logic* using fixtures, but a fixture
+written from the same table as the code cannot catch a wrong field name — it
+agrees with the typo and stays green. Every read goes through `.get(field)`,
+which returns `None` for a misspelling exactly as it does for a field AWS
+genuinely omitted, so `InstanceTpye` does not raise: it produces a
+recommendation with no instance type, and the report renders around the hole.
+
+`test_commitments_contracts.py` closes that gap without needing an account.
+botocore ships the same service models the SDK dispatches on, so the real field
+names are already on disk:
+
+```python
+model = session.get_service_model("ce").operation_model(
+    "GetReservationPurchaseRecommendation"
+)
+```
+
+Every name in `RECOMMENDATION_SPECS` and `RESERVATION_INVENTORY` is asserted to
+be a member of the matching output shape — containers, size fields, attribute
+fields, `Family`, `Region`, the six differently-named identifier/count/type
+fields, and the `Duration` fallback for the five families that return no explicit
+end date. Three further assertions pin things a rename would quietly break:
+
+- **`MultiAZ` is still `boolean`.** This is why the code tests it against `None`
+  rather than truthiness — `False` means Single-AZ, a real and expensive
+  specification.
+- **`commitment` is still a `string`.** AWS returns `"1.00000000"`, so the
+  `float()` conversion is load-bearing; summing without it concatenates.
+- **`ACTIVE_SP_STATES` are valid `SavingsPlanState` enum values.** These go to
+  the API as a server-side filter, so an invalid one is a ValidationException in
+  a Lambda against a live account rather than a red test here.
+
+Two coverage facts worth knowing, both asserted rather than assumed:
+
+- **DynamoDB has no `SizeFlexEligible`/`CurrentGeneration`.** There is no
+  instance, so there is no size to flex. `describe_recommendation_spec` reading
+  both unconditionally yields `False`, which is the correct answer, not a data
+  gap — pinned so nobody "fixes" the absence by inventing a field name.
+- **`test_every_recommendation_container_is_covered`** compares the modelled
+  `*InstanceDetails`/`*CapacityDetails` containers against the ones
+  `RECOMMENDATION_SPECS` knows. `describe_recommendation_spec` degrades to `{}`
+  for an unknown shape, so a service AWS adds later would cost the report its
+  spec column silently; this turns that into a failing test instead.
+
+What these tests do **not** do is prove a field is populated for a given
+account. That needs an account holding the commitment or recommendation in
+question — specifically one with OpenSearch or DynamoDB steady-state usage for
+those two shapes, which the dev account has none of. What they guarantee is that
+when such an account is used, a blank column means "AWS omitted it", never "we
+spelled it wrong".
 
 `test_tools_json_declares_every_dispatched_tool` reads the dispatcher table out
 of `handler.py` rather than restating it, so a tool added to one and not the
