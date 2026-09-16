@@ -1004,12 +1004,13 @@ Two coverage facts worth knowing, both asserted rather than assumed:
   for an unknown shape, so a service AWS adds later would cost the report its
   spec column silently; this turns that into a failing test instead.
 
-What these tests do **not** do is prove a field is populated for a given
-account. That needs an account holding the commitment or recommendation in
-question — specifically one with OpenSearch or DynamoDB steady-state usage for
-those two shapes, which the dev account has none of. What they guarantee is that
-when such an account is used, a blank column means "AWS omitted it", never "we
-spelled it wrong".
+What these tests do **not** do is prove a field is *populated* for a given
+account — that needs an account holding the commitment or recommendation in
+question. OpenSearch and DynamoDB are the two shapes with no live coverage,
+because neither service is in scope for this deployment and there is no usage to
+size a reservation against; both rest on the contract tests and unit fixtures.
+That is the guarantee worth having here: a blank spec column can only mean AWS
+omitted the field, never that the field name is wrong.
 
 `test_tools_json_declares_every_dispatched_tool` reads the dispatcher table out
 of `handler.py` rather than restating it, so a tool added to one and not the
