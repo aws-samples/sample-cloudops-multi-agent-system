@@ -10,7 +10,7 @@
     "lint": "next lint"
   },
   "dependencies": {
-    "@assistant-ui/react": "^0.10.20",
+    "@assistant-ui/react": "^0.15.28",
     "@xyflow/react": "^12.10.1",
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
