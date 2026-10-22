@@ -821,6 +821,7 @@
             "ce:GetCostAndUsage",
             "cost-optimization-hub:ListEnrollmentStatuses",
             "cost-optimization-hub:ListRecommendations",
+            "cost-optimization-hub:GetPreferences",
             "savingsplans:DescribeSavingsPlans",
             "ec2:DescribeReservedInstances",
             "rds:DescribeReservedDBInstances",
@@ -833,7 +834,7 @@
         "tools": [
             {
                 "name": "generate_commitment_analysis",
-                "description": "ONE-SHOT: produce a complete AWS discounted-commitment (Savings Plan + Reserved Instance) purchase analysis. Sweeps every requested term/payment permutation in parallel, risk-adjusts each AWS recommendation down to the commitment level the workload sustains on its quietest hour, checks whether EXISTING commitments are healthy enough to add more, and reconciles totals against Cost Optimization Hub. Returns a fully rendered 'report_markdown' plus structured recommendations. PREFER this over calling the sizing tools separately — it is one call and includes the posture gate and reconciliation the numbers are only defensible with. Read-only: purchases nothing. Takes up to ~90s for a full sweep.",
+                "description": "ONE-SHOT: produce a complete AWS discounted-commitment (Savings Plan + Reserved Instance) purchase analysis. Sweeps every requested term/payment permutation in parallel, risk-adjusts each AWS recommendation line by line down to the commitment level its quietest hour sustains, checks per service whether EXISTING commitments are healthy enough to add more, reconciles against Cost Optimization Hub, and recommends ONE purchase per usage pool — a Compute SP, an EC2 Instance SP and EC2 RIs are alternatives for the same usage, never additive. Returns a fully rendered 'report_markdown' plus structured recommendations, each with a role ('recommended', 'alternative', 'do-not-buy'). If every Cost Explorer query fails it returns 'error' and 'hint' instead of a report. PREFER this over calling the sizing tools separately. Read-only: purchases nothing. Cost Explorer bills $0.01 per request: the default sweep makes about 50-70 requests (~$0.50-0.70), reported as 'queries_run' — narrow it with savings_plan_types / ri_services / families when the question is narrow. Bounded by a 150 s time budget; queries still running then are reported as collection warnings.",
                 "input_schema": {
                     "type": "object",
                     "properties": {
@@ -857,7 +858,7 @@
                         },
                         "account_scope": {
                             "type": "string",
-                            "description": "PAYER aggregates the whole organization; LINKED scopes to this account only (default: PAYER)"
+                            "description": "PAYER sizes against the whole organization's usage; LINKED sizes each member account individually, returning one line per account (default: PAYER)"
                         },
                         "families": {
                             "type": "array",
@@ -889,7 +890,7 @@
                             "items": {
                                 "type": "string"
                             },
-                            "description": "Pass regions to ALSO inventory existing commitments and report what expires soon (e.g. ['ap-northeast-1','us-east-1']). Reservations are regional, so only the regions listed are checked; Savings Plans are account-level and are fetched once regardless. Omit to skip the expiry inventory entirely — it needs Describe* permissions beyond Cost Explorer."
+                            "description": "Pass regions to ALSO inventory existing commitments and report what expires soon (e.g. ['ap-northeast-1','us-east-1']). Reservations are regional, so only the regions listed are checked; Savings Plans are account-level and are fetched once regardless. Omit to skip the expiry inventory entirely — no Describe* calls are made."
                         },
                         "expiry_horizon_days": {
                             "type": "integer",
@@ -931,7 +932,7 @@
                         },
                         "account_scope": {
                             "type": "string",
-                            "description": "PAYER or LINKED (default: PAYER)"
+                            "description": "PAYER sizes against the whole organization's usage; LINKED sizes each member account individually, returning one line per account (default: PAYER)"
                         }
                     }
                 }
@@ -969,14 +970,14 @@
                         },
                         "account_scope": {
                             "type": "string",
-                            "description": "PAYER or LINKED (default: PAYER)"
+                            "description": "PAYER sizes against the whole organization's usage; LINKED sizes each member account individually, returning one line per account (default: PAYER)"
                         }
                     }
                 }
             },
             {
                 "name": "get_commitment_posture",
-                "description": "Health of EXISTING Savings Plans and Reserved Instances: coverage, utilization, unused commitment, unused reservation hours, and realized savings. Returns explicit blockers (utilization under 95%, coverage over 90%) plus 'safe_to_buy_more', Cost Optimization Hub enrollment, and commitment-addressable spend by service. Call this BEFORE recommending any purchase — buying on top of an under-utilized commitment compounds waste instead of saving money. Read-only.",
+                "description": "Health of EXISTING Savings Plans and Reserved Instances: coverage, utilization, unused commitment, unused reservation hours, and realized savings — reservations measured per service. Returns explicit blockers (utilization under 95%, coverage over 90%) plus 'safe_to_buy_more' (true, false, or null when health could not be measured — see 'unmeasured'), Cost Optimization Hub enrollment, and commitment-addressable spend by service. Call this BEFORE recommending any purchase — buying on top of an under-utilized commitment compounds waste instead of saving money. Each reservation service costs two $0.01 Cost Explorer requests; pass ri_services to measure only the ones that matter. Read-only.",
                 "input_schema": {
                     "type": "object",
                     "properties": {
@@ -987,13 +988,17 @@
                         "spend_days": {
                             "type": "integer",
                             "description": "Window for the eligible-spend breakdown (default: 60)"
+                        },
+                        "ri_services": {
+                            "type": "string",
+                            "description": "Reservation services to measure, by short label (EC2, RDS, Redshift, ElastiCache, OpenSearch, Elasticsearch, MemoryDB, DynamoDB) or 'all' (default: all)."
                         }
                     }
                 }
             },
             {
                 "name": "get_commitment_expiry",
-                "description": "Which EXISTING Savings Plans and Reserved Instances expire soon, and what to do about each. Inventories active commitments across EC2, RDS, ElastiCache, Redshift, OpenSearch, MemoryDB and Savings Plans, derives each end date, and returns them bucketed as urgent (<=30 days), soon (<=60) or upcoming, each with a renew / renew-smaller / let-lapse / review verdict driven by measured utilization. Use this when the user asks what is expiring, what needs renewing, or before recommending a new purchase — a lapsing commitment silently returns that spend to on-demand rates, and expiry is the one moment resizing costs nothing. Note: AWS publishes utilization only at the account level, not per commitment, so the verdicts are directional. DynamoDB reserved capacity has no describe API and is reported as a blind spot. Read-only: renews nothing.",
+                "description": "Which EXISTING Savings Plans and Reserved Instances expire soon, and what to do about each. Inventories active and queued commitments across EC2, RDS, ElastiCache, Redshift, OpenSearch, MemoryDB and Savings Plans, derives each end date, and returns them bucketed as urgent (<=30 days), soon (<=60) or upcoming, each with a renew / renew-smaller / let-lapse / review / renewal-queued verdict. Verdicts use that service's own utilization (one Cost Explorer query per service found); a commitment with a matching queued purchase reads 'renewal-queued' so it is never bought twice. Use this when the user asks what is expiring or needs renewing, or before recommending a new purchase. AWS publishes utilization per service, not per commitment, so verdicts are directional. Lists only the calling account's own purchases; DynamoDB reserved capacity has no describe API. Read-only: renews nothing.",
                 "input_schema": {
                     "type": "object",
                     "properties": {

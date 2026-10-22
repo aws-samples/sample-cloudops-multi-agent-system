@@ -99,10 +99,55 @@ on a delegated admin account that's separate from the payer.
      cost-optimization-hub:GetRecommendation
      cost-optimization-hub:ListRecommendationSummaries
      ```
-  3. `make reconfigure-shared` — fill in
+  3. **The `commitments` tool reuses the same `CROSS_ACCOUNT_ROLE_ARN`**, so
+     the payer role from step 1 must also trust the ops-account
+     `<project>-commitments-tool-role` and grant the commitment reads.
+     Trust policy (both tool roles):
+     ```json
+     {
+       "Version": "2012-10-17",
+       "Statement": [{
+         "Effect": "Allow",
+         "Principal": {"AWS": [
+           "arn:aws:iam::<OPS_ACCOUNT_ID>:role/<project>-cost-explorer-tool-role",
+           "arn:aws:iam::<OPS_ACCOUNT_ID>:role/<project>-commitments-tool-role"
+         ]},
+         "Action": "sts:AssumeRole"
+       }]
+     }
+     ```
+     Additional actions on the payer role for `commitments` (read-only):
+     ```
+     ce:GetSavingsPlansPurchaseRecommendation
+     ce:GetReservationPurchaseRecommendation
+     ce:GetSavingsPlansCoverage
+     ce:GetSavingsPlansUtilization
+     ce:GetReservationCoverage
+     ce:GetReservationUtilization
+     savingsplans:DescribeSavingsPlans
+     ec2:DescribeReservedInstances
+     rds:DescribeReservedDBInstances
+     elasticache:DescribeReservedCacheNodes
+     redshift:DescribeReservedNodes
+     es:DescribeReservedInstances
+     memorydb:DescribeReservedNodes
+     sts:GetCallerIdentity
+     ```
+     The seven `Describe*` actions are needed only for the expiry inventory
+     (the `regions` parameter). If `CROSS_ACCOUNT_ROLE_ARN_COH` is set, the COH
+     role also needs `cost-optimization-hub:GetPreferences` and must trust the
+     commitments tool role; if it is not set, `commitments` reads COH through
+     the payer role above, so grant `ListEnrollmentStatuses`,
+     `ListRecommendations` and `GetPreferences` there.
+
+     If the role cannot be assumed, `commitments` fails with
+     `CrossAccountRoleError` rather than falling back to the ops account's own
+     (empty) billing data. The canonical list is `iam_actions` for
+     `commitments` in `src/lambda/mcp/tools.json`.
+  4. `make reconfigure-shared` — fill in
      `CROSS_ACCOUNT_ROLE_ARN` and (optional)
      `CROSS_ACCOUNT_ROLE_ARN_COH`.
-  4. `make deploy-auto` in the ops account.
+  5. `make deploy-auto` in the ops account.
 
 ---
 
@@ -191,12 +236,15 @@ Lambda hardcodes `region_name="us-east-1"`. Same pattern as
 ### `generate_commitment_analysis` (commitments)
 
 Returns a `report_markdown` field holding the complete pre-formatted
-report, alongside the structured envelope (`recommendations`, `count`,
-`total_estimated_monthly_savings`, `aws_best_case_monthly_savings`,
-`reconciliation`, `existing_commitment_posture`, `blockers`). The agent
-prompt requires emitting `report_markdown` verbatim rather than rebuilding
-the table from the structured fields. Response shape and the other three
-commitment tools:
+report, alongside the structured envelope (`recommendations` — each with a
+`role` of `recommended`, `alternative` or `do-not-buy` — `count`,
+`total_estimated_monthly_savings` and `aws_best_case_monthly_savings` over
+recommended rows only, `usage_pools`, `reconciliation`,
+`existing_commitment_posture`, `safe_to_buy_more`, `blockers`, `queries_run`).
+If every recommendation query fails it returns `error` + `hint` instead of a
+report. The agent prompt requires emitting `report_markdown` verbatim rather
+than rebuilding the table from the structured fields. Response shape and the
+other four commitment tools:
 [`docs/skills/discounted-commitments.md`](../skills/discounted-commitments.md).
 
 ### `start_query_execution` (CUR/Athena)

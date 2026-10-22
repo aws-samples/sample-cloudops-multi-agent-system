@@ -53,18 +53,6 @@ sys.modules["commitments_handler"] = handler
 # ---------------------------------------------------------------------------
 
 
-@pytest.fixture(autouse=True)
-def _reset_client_cache():
-    """Clear the module-scope client cache between tests.
-
-    _get_clients memoizes for warm-container reuse; leaving a previous test's
-    stub in place would make later tests pass for the wrong reason.
-    """
-    handler._clients = None
-    yield
-    handler._clients = None
-
-
 def _make_context(tool_name: str) -> SimpleNamespace:
     """Build the AgentCore Gateway context shape the dispatcher reads."""
     return SimpleNamespace(
@@ -105,10 +93,16 @@ def _sp_response(hourly="10.0", monthly_savings="1000.0", minimum="6.0",
             },
             "SavingsPlansPurchaseRecommendationDetails": [
                 {
+                    "HourlyCommitmentToPurchase": hourly,
+                    "EstimatedMonthlySavingsAmount": monthly_savings,
                     "CurrentMinimumHourlyOnDemandSpend": minimum,
                     "CurrentAverageHourlyOnDemandSpend": average,
                     "UpfrontCost": upfront,
                     "EstimatedAverageUtilization": "95.0",
+                    # SP cost and savings at the same scale, so the on-demand
+                    # floor converts to commitment dollars (~16% effective rate).
+                    "EstimatedSPCost": str(float(hourly) * 730),
+                    "EstimatedSavingsAmount": monthly_savings,
                 }
             ],
         },
@@ -167,6 +161,11 @@ def _coh_stub(enrolled=True, recommendations=()):
         "items": [{"status": "Active" if enrolled else "Inactive",
                    "accountId": "123456789012"}],
         "includeMemberAccounts": True,
+    }
+    # COH prices at one preferred term/payment; matching the sweep below keeps
+    # the reconciliation like-for-like.
+    coh.get_preferences.return_value = {
+        "preferredCommitment": {"term": "OneYear", "paymentOption": "NoUpfront"}
     }
     paginator = MagicMock()
     paginator.paginate.return_value = [{"items": list(recommendations)}]
@@ -273,33 +272,70 @@ class TestDispatcher:
 
 
 class TestGetClients:
-    def test_builds_clients_from_cross_account_with_coh_role_alias(self, monkeypatch):
-        calls = []
+    @staticmethod
+    def _recording(calls, accounts=None):
+        accounts = accounts or {}
 
         def fake_get_aws_client(service, region_name=None, role_alias=None, **kw):
-            calls.append((service, region_name, role_alias))
+            calls.append((service, region_name, role_alias, kw))
             client = MagicMock()
             if service == "sts":
-                client.get_caller_identity.return_value = {"Account": "999888777666"}
+                client.get_caller_identity.return_value = {
+                    "Account": accounts.get(role_alias, "999888777666")
+                }
             return client
 
-        monkeypatch.setattr(handler, "get_aws_client", fake_get_aws_client)
+        return fake_get_aws_client
 
+    def test_coh_reads_in_the_cost_explorer_account_by_default(self, monkeypatch):
+        """With only CROSS_ACCOUNT_ROLE_ARN set, COH must not read elsewhere."""
+        monkeypatch.delenv("CROSS_ACCOUNT_ROLE_ARN_COH", raising=False)
+        calls = []
+        monkeypatch.setattr(handler, "get_aws_client", self._recording(calls))
         clients = handler._get_clients()
         assert clients.account_id == "999888777666"
+        assert clients.coh_account_id == "999888777666"
         assert clients.profile is None
-        # COH must go through its own role alias, matching cost-optimization-hub.
-        assert ("cost-optimization-hub", handler.api.COH_REGION, "COH") in calls
-        assert ("ce", handler.api.CE_REGION, None) in calls
+        assert [c[:3] for c in calls if c[0] == "cost-optimization-hub"] == [
+            ("cost-optimization-hub", handler.api.COH_REGION, None)
+        ]
 
-    def test_clients_are_cached_across_invocations(self, monkeypatch):
+    def test_coh_uses_its_own_role_only_when_one_is_configured(self, monkeypatch):
+        monkeypatch.setenv("CROSS_ACCOUNT_ROLE_ARN_COH", "arn:aws:iam::222222222222:role/COH")
+        calls = []
         monkeypatch.setattr(
-            handler, "get_aws_client", lambda *a, **k: MagicMock()
+            handler, "get_aws_client",
+            self._recording(calls, {None: "111111111111", "COH": "222222222222"}),
         )
-        monkeypatch.setattr(handler, "_account_id", lambda: "111122223333")
-        first = handler._get_clients()
-        second = handler._get_clients()
-        assert first is second
+        clients = handler._get_clients()
+        assert ("cost-optimization-hub", handler.api.COH_REGION, "COH") in [c[:3] for c in calls]
+        assert clients.coh_account_id == "222222222222"
+        assert clients.account_id == "111111111111"
+
+    def test_every_client_fails_closed_and_retries_throttling(self, monkeypatch):
+        calls = []
+        monkeypatch.setattr(handler, "get_aws_client", self._recording(calls))
+        clients = handler._get_clients()
+        clients.make_client("rds", "eu-west-1")
+        assert calls and all(c[3]["require_role"] is True for c in calls)
+        assert all(c[3]["config"] is handler.api.RETRY_CONFIG for c in calls)
+
+    def test_clients_are_built_per_invocation_not_cached(self, monkeypatch):
+        """A cached client outlives its 15-minute assumed-role credentials."""
+        monkeypatch.setattr(handler, "get_aws_client", lambda *a, **k: MagicMock())
+        monkeypatch.setattr(handler, "_account_id", lambda alias=None: "111122223333")
+        assert handler._get_clients() is not handler._get_clients()
+        assert not hasattr(handler, "_clients")
+
+    def test_an_unassumable_role_propagates_instead_of_reading_the_ops_account(self, monkeypatch):
+        def refuse(service, **kw):
+            raise handler.CrossAccountRoleError("could not assume")
+
+        monkeypatch.setattr(handler, "get_aws_client", refuse)
+        with pytest.raises(handler.CrossAccountRoleError):
+            handler._account_id()
+        result = handler._aws_error(handler.CrossAccountRoleError("could not assume"))
+        assert "trust policy" in result["hint"]
 
     def test_account_id_failure_is_not_fatal(self, monkeypatch):
         def boom(service, **kw):
@@ -542,7 +578,8 @@ class TestGenerateCommitmentAnalysis:
         assert result["count"] == 1
 
         rec = result["recommendations"][0]
-        # Risk adjustment: the $8/hr floor caps the AWS-recommended $10/hr.
+        # Risk adjustment: the $6/hr on-demand floor, in commitment dollars,
+        # trims the AWS-recommended $10/hr.
         assert rec["achievable_commitment"] < rec["aws_recommended_commitment"]
         assert rec["estimated_monthly_savings"] < rec["aws_best_case_monthly_savings"]
 
@@ -596,17 +633,76 @@ class TestGenerateCommitmentAnalysis:
 
     def test_failed_permutation_is_reported_as_a_warning(self, monkeypatch):
         ce = _ce_stub()
+        good = _sp_response()
+
+        def some_fail(**kw):
+            if kw["SavingsPlansType"] == "SAGEMAKER_SP":
+                raise RuntimeError("ThrottlingException")
+            return good
+
+        ce.get_savings_plans_purchase_recommendation.side_effect = some_fail
+        _stub_clients(monkeypatch, ce=ce, coh=_coh_stub())
+        result = handler.handle_generate_commitment_analysis(
+            {"families": ["sp"], "savings_plan_types": "COMPUTE_SP,SAGEMAKER_SP",
+             "terms": ["ONE_YEAR"], "payment_options": ["NO_UPFRONT"]}
+        )
+        assert "error" not in result
+        assert [w["query"] for w in result["collection_warnings"]] == [
+            "SP SageMaker Savings Plan ONE_YEAR NO_UPFRONT"
+        ]
+
+    def test_every_query_failing_is_an_error_not_an_empty_report(self, monkeypatch):
+        """'No opportunity' would be a confident answer to a question AWS never answered."""
+        ce = _ce_stub()
         ce.get_savings_plans_purchase_recommendation.side_effect = RuntimeError(
-            "ThrottlingException"
+            "AccessDeniedException"
         )
         _stub_clients(monkeypatch, ce=ce, coh=_coh_stub())
         result = handler.handle_generate_commitment_analysis(
             {"families": ["sp"], "savings_plan_types": "COMPUTE_SP",
              "terms": ["ONE_YEAR"], "payment_options": ["NO_UPFRONT"]}
         )
-        assert "error" not in result
-        assert result["collection_warnings"]
+        assert "report_markdown" not in result
+        assert "not a 'no opportunity' result" in result["error"]
+        assert result["hint"]
         assert result["queries_run"] == 1
+        assert result["collection_warnings"]
+
+    def test_queries_run_counts_every_cost_explorer_request(self, monkeypatch):
+        """Coverage, utilization and spend are billed like recommendations."""
+        ce = _ce_stub()
+        _stub_clients(monkeypatch, ce=ce, coh=_coh_stub())
+        result = handler.handle_generate_commitment_analysis(
+            {"families": ["sp"], "savings_plan_types": "COMPUTE_SP",
+             "terms": ["ONE_YEAR"], "payment_options": ["NO_UPFRONT"]}
+        )
+        # 1 recommendation + SP coverage + SP utilization + cost-and-usage.
+        assert result["queries_run"] == 4
+        assert result["estimated_api_cost_usd"] == pytest.approx(0.04)
+
+    def test_omitting_regions_skips_the_inventory_entirely(self, monkeypatch):
+        calls = []
+        clients = _stub_clients(monkeypatch, ce=_ce_stub(), coh=_coh_stub())
+        monkeypatch.setattr(
+            handler, "_get_clients",
+            lambda: handler.api.Clients(
+                ce=clients.ce, coh=clients.coh, account_id="123456789012", profile=None,
+                make_client=lambda s, r: calls.append((s, r)) or MagicMock(),
+            ),
+        )
+        result = handler.handle_generate_commitment_analysis({"families": ["sp"]})
+        assert result["expiry"] is None
+        assert calls == []
+
+    def test_report_carries_the_line_items_so_the_json_does_not(self, monkeypatch):
+        _stub_clients(monkeypatch, ce=_ce_stub(), coh=_coh_stub())
+        result = handler.handle_generate_commitment_analysis(
+            {"families": ["sp"], "savings_plan_types": "COMPUTE_SP",
+             "terms": ["ONE_YEAR"], "payment_options": ["NO_UPFRONT"]}
+        )
+        assert result["recommendations"]
+        assert all("line_items" not in r for r in result["recommendations"])
+        assert "Line items — what to buy" in result["report_markdown"]
 
     def test_families_filter_skips_the_other_sweep(self, monkeypatch):
         ce = _ce_stub()
@@ -621,7 +717,8 @@ class TestGenerateCommitmentAnalysis:
         monkeypatch.setattr(handler, "_get_clients", boom)
         result = handler.handle_generate_commitment_analysis({})
         assert "AccessDenied" in result["error"]
-        assert "ce:GetSavingsPlansPurchaseRecommendation" in result["hint"]
+        assert "iam_actions" in result["hint"]
+        assert "Mode B" in result["hint"]
 
     def test_data_unavailable_gets_its_own_hint(self, monkeypatch):
         def boom():

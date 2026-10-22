@@ -84,6 +84,8 @@ Source: [AgentCore pricing](https://aws.amazon.com/bedrock/agentcore/pricing/).
 - **$0.01 per API request** (against the primary billing view).
 - **No free tier.**
 - Platform usage: `cost-operations-agent` calls `ce:GetCostAndUsage` / `ce:GetCostForecast` / `ce:GetCostAndUsageComparisons` — typically 1–3 calls per spending-related turn.
+- **Every request is billed, each page included** — coverage, utilization and purchase-recommendation reads as much as cost-and-usage.
+- **Commitment questions are the expensive exception.** One default `generate_commitment_analysis` call (the `commitments` tool) sweeps 16 Savings Plan + 32 Reserved Instance recommendation permutations, then measures posture: **~51–67 requests, ~$0.51–0.67 per question** (~$0.75–0.91 with `PARTIAL_UPFRONT`). The response reports the exact `queries_run`; the agent narrows the sweep when the question names specific services.
 - **This is the one AWS API we use that is NOT free.** It's not dominant, but it's visible at medium-team scale upwards.
 
 Source: [Cost Explorer API pricing](https://aws.amazon.com/aws-cost-management/aws-cost-explorer/pricing/).
@@ -317,9 +319,10 @@ Deployed in every topology. Not a module you opt into — listed for completenes
 
 | Item | Cost | Trigger |
 |---|---|---|
-| Leaf Lambdas (cost-explorer, cur-athena, cost-optimization-hub) | $0 (Lambda free tier) | Always — but only run on invocation |
+| Leaf Lambdas (cost-explorer, cur-athena, cost-optimization-hub, commitments) | $0 (Lambda free tier) | Always — but only run on invocation |
 | Leaf Bedrock (Sonnet 4.6) on every FinOps turn | ~$0.034 / turn | User asks a spend / CUR / COH question |
 | **Cost Explorer API** | **$0.01 / request** — 1–3 requests per spending turn | FinOps turns only |
+| **Cost Explorer API — commitment analysis** | **~$0.51–0.67 / question** (~51–67 requests) for a full Savings Plan + RI sweep; ~$0.08 for a single plan type | Savings Plan / RI purchase questions only |
 | Athena scans (if `cur-athena` enabled + CUR configured) | $5 / TB scanned | CUR queries only — well-scoped queries ~50–500 MB → cents |
 | Cost Optimization Hub API | Free | COH enrollment required separately |
 
@@ -330,6 +333,7 @@ Deployed in every topology. Not a module you opt into — listed for completenes
 | Occasional check-ins | 30 | 60 | Bedrock ~$2.60 + CE ~$0.60 = **~$3** |
 | Active FinOps user | 300 | 600 | Bedrock ~$26 + CE ~$6 = **~$32** |
 | FinOps-heavy team (5 users × 200 turns) | 1 000 | 2 000 | Bedrock ~$86 + CE ~$20 = **~$106** |
+| Monthly commitment review (+4 full analyses) | +4 | +~240 | + CE ~$2.40 |
 
 **Notes / callouts**
 

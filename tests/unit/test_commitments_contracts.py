@@ -31,9 +31,11 @@ guarantee is that when such an account is finally used, a blank column means
 
 import botocore.session
 import pytest
-from commitments.api import (
-    ACTIVE_SP_STATES,
-    RECOMMENDATION_SPECS,
+from commitments.api import RECOMMENDATION_SPECS
+from commitments.inventory import (
+    ACTIVE_RESERVATION_STATES,
+    INVENTORY_SP_STATES,
+    QUEUED_STATES,
     RESERVATION_INVENTORY,
 )
 
@@ -331,14 +333,14 @@ def test_savings_plan_fields_exist(savings_plan_model):
 
 
 def test_active_sp_states_are_valid_enum_values(savings_plan_model):
-    """`ACTIVE_SP_STATES` are real API enum values.
+    """`INVENTORY_SP_STATES` (active plus queued) are real API enum values.
 
     These go to the API as a server-side `states` filter, so an invalid value is
     a ValidationException at collection time — in a Lambda, against a live
     account, rather than here.
     """
     valid = savings_plan_model.shape_for("SavingsPlanState").enum
-    invalid = [state for state in ACTIVE_SP_STATES if state not in valid]
+    invalid = [state for state in INVENTORY_SP_STATES if state not in valid]
     assert not invalid, f"{invalid} are not SavingsPlanState values; valid: {valid}"
 
 
@@ -355,3 +357,49 @@ def test_savings_plan_commitment_is_a_string_on_the_wire(savings_plan_model):
         )["savingsPlans"]
     )
     assert members["commitment"].type_name == "string"
+
+
+@pytest.mark.parametrize("spec", RESERVATION_INVENTORY, ids=lambda s: s.key)
+def test_inventory_pagination_follows_the_models_token(spec, botocore_session):
+    """Every family either has a botocore paginator, takes `NextToken` (which
+    `_inventory_rows` follows by hand), or does not paginate at all (EC2)."""
+    import boto3
+
+    client = boto3.client(spec.service, region_name="us-east-1")
+    if client.can_paginate(spec.method):
+        return
+    operation = operation_for(botocore_session.get_service_model(spec.service), spec.method)
+    inputs = set(operation.input_shape.members) if operation.input_shape else set()
+    outputs = set(operation.output_shape.members)
+    assert ("NextToken" in inputs and "NextToken" in outputs) or not (
+        {"NextToken", "Marker"} & outputs
+    ), f"{spec.key} pages with a token _inventory_rows does not follow"
+
+
+@pytest.mark.parametrize("spec", RESERVATION_INVENTORY, ids=lambda s: s.key)
+def test_inventory_ce_service_is_a_reservation_service_cost_explorer_knows(spec):
+    """Per-service utilization filters on this value; a wrong one returns no data."""
+    from commitments.api import RI_SERVICES
+
+    assert spec.ce_service in RI_SERVICES
+
+
+def test_reservation_states_cover_redshifts_spelling():
+    assert "pending-payment" in ACTIVE_RESERVATION_STATES
+    assert "payment-pending" in ACTIVE_RESERVATION_STATES
+    assert QUEUED_STATES == ("queued",)
+
+
+def test_new_reads_exist_in_the_models(botocore_session):
+    """Reads added for like-for-like reconciliation, per-service posture and paging."""
+    coh = botocore_session.get_service_model("cost-optimization-hub")
+    assert "preferredCommitment" in structure_members(
+        coh.operation_model("GetPreferences").output_shape
+    )
+    ce = botocore_session.get_service_model("ce")
+    for op in ("GetReservationUtilization", "GetReservationCoverage"):
+        assert "Filter" in ce.operation_model(op).input_shape.members
+    assert "NextToken" in ce.operation_model("GetSavingsPlansCoverage").input_shape.members
+    for op in ("GetSavingsPlansPurchaseRecommendation", "GetReservationPurchaseRecommendation",
+               "GetReservationUtilization", "GetReservationCoverage", "GetCostAndUsage"):
+        assert "NextPageToken" in ce.operation_model(op).input_shape.members

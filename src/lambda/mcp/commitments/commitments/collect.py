@@ -2,8 +2,8 @@
 
 This module exists so that a caller only has to supply credentials. Everything
 between "here are my clients" and "here is the finished payload" lives here:
-the permutation sweep, the thread pools, the per-query error tolerance, and the
-two output shapes (markdown payload, JSON envelope).
+the permutation sweep, the thread pools, the per-query error tolerance, the
+time budget, and the output shapes (markdown payload, JSON envelope).
 
 Any host can drive the analysis with four lines::
 
@@ -21,45 +21,70 @@ gets the same pipeline without touching this file.
 from __future__ import annotations
 
 import re
+import time
 from collections.abc import Callable
+from dataclasses import replace
 from datetime import date, datetime, timezone
 from typing import Any
 
 from .analyze import (
-    EXPIRY_HORIZON_DAYS,
     Finding,
-    LineItem,
-    analyze_expiry,
     analyze_ri_recommendation,
     analyze_sp_recommendation,
-    assess_existing_posture,
-    reconcile_with_coh,
-    select_best_findings,
 )
 from .api import (
-    INVENTORY_BLIND_SPOTS,
-    INVENTORY_KEYS,
+    CE_PRICE_PER_REQUEST,
     RI_SERVICE_LABELS,
     RI_SERVICES,
     SP_TYPE_LABELS,
     SP_TYPES,
     Clients,
+    CountingClient,
     get_coh_commitment_recommendations,
     get_coh_enrollment,
+    get_coh_preferences,
     get_eligible_spend,
-    get_reservation_inventory,
     get_ri_coverage,
     get_ri_recommendation,
     get_ri_utilization,
-    get_savings_plan_inventory,
     get_sp_coverage,
     get_sp_recommendation,
     get_sp_utilization,
 )
+from .expiry import EXPIRY_HORIZON_DAYS, analyze_expiry
+from .inventory import (
+    INVENTORY_BLIND_SPOTS,
+    INVENTORY_KEYS,
+    INVENTORY_SPECS,
+    get_reservation_inventory,
+    get_savings_plan_inventory,
+)
+from .pools import plan_purchases, select_best_findings
+from .posture import assess_existing_posture, reconcile_with_coh, safe_to_buy_more
+from .shape import (
+    LINE_ITEM_LIMIT,
+    TIME_BUDGET_ERROR,
+    diagnose_failure,
+    envelope,
+    no_data_only,
+    serialize_finding,
+    serialize_line_item,
+)
+
+# Re-exported: hosts drive the whole pipeline through this module.
+__all__ = [
+    "LINE_ITEM_LIMIT",
+    "TIME_BUDGET_ERROR",
+    "diagnose_failure",
+    "envelope",
+    "no_data_only",
+    "serialize_finding",
+    "serialize_line_item",
+]
 
 # Cost Explorer throttles aggressively on the recommendation APIs; 6 keeps a
 # full permutation sweep inside the rate limit while still finishing in
-# reasonable wall-clock time (and inside a 300s Lambda timeout).
+# reasonable wall-clock time.
 MAX_WORKERS = 6
 
 TERMS = ("ONE_YEAR", "THREE_YEARS")
@@ -69,8 +94,8 @@ ACCOUNT_SCOPES = ("PAYER", "LINKED")
 FAMILIES = ("sp", "ri")
 
 # Defaults chosen to keep a first run cheap: Cost Explorer bills $0.01 per
-# recommendation request, so evaluating both terms against the two payment
-# extremes (rather than all three) halves the sweep without losing the
+# request, so evaluating both terms against the two payment extremes (rather
+# than all three) cuts the sweep by a third without losing the
 # no-upfront/all-upfront spread that drives the break-even discussion.
 DEFAULT_TERMS = ("ONE_YEAR", "THREE_YEARS")
 DEFAULT_PAYMENTS = ("NO_UPFRONT", "ALL_UPFRONT")
@@ -79,6 +104,14 @@ DEFAULT_ACCOUNT_SCOPE = "PAYER"
 DEFAULT_POSTURE_DAYS = 30
 DEFAULT_SPEND_DAYS = 60
 DEFAULT_EXPIRY_HORIZON_DAYS = EXPIRY_HORIZON_DAYS
+
+# Wall-clock budget for the recommendation sweep. The Lambda, the gateway's MCP
+# read and the supervisor's delegation to the leaf agent all share one 300 s
+# ceiling, and the agents still need time to read the result and answer. A
+# permutation still running at the deadline is abandoned and reported as a
+# collection warning, so a slow or throttled account returns a partial,
+# clearly-labelled report instead of a timeout.
+DEFAULT_TIME_BUDGET_SECONDS = 150.0
 
 # Region names reach the AWS SDK as an endpoint component, so they are checked
 # against the shape AWS actually uses rather than passed through. Caller input
@@ -97,8 +130,8 @@ def resolve_ri_services(tokens: list[str]) -> list[str]:
     Accepts the full API name or the short label, case-insensitively. Labels
     carrying a parenthetical qualifier ("Elasticsearch (legacy)") also match on
     their base word alone, since nobody types the parentheses. Duplicates are
-    dropped: Cost Explorer bills per recommendation request, so asking for
-    "EC2, ec2" must not pay twice for the same answer.
+    dropped: Cost Explorer bills per request, so asking for "EC2, ec2" must not
+    pay twice for the same answer.
 
     Raises `ValueError` on an unknown token — callers translate that into
     whatever their host expects (a CLI `SystemExit`, a tool error envelope).
@@ -156,132 +189,13 @@ def validate_choices(values: list[str], allowed: tuple[str, ...], label: str) ->
     return values
 
 
-# ---------------------------------------------------------------------------
-# Parallel collection
-# ---------------------------------------------------------------------------
-
-
-def run_jobs(jobs: list[tuple[str, Callable[[], dict]]]) -> tuple[list[dict], list[dict]]:
-    """Run labelled callables in parallel, tolerating per-query failure.
-
-    One throttled or unauthorized permutation must not lose the other 40, so
-    failures are collected as warnings and the report is reported as a lower
-    bound rather than aborted.
-    """
-    # Imported lazily so that importing this module costs nothing on hosts that
-    # only want the pure helpers (serialize_finding, envelope).
-    from concurrent.futures import ThreadPoolExecutor
-
-    results: list[dict] = []
-    errors: list[dict] = []
-    if not jobs:
-        return results, errors
-
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
-        futures = [(label, pool.submit(fn)) for label, fn in jobs]
-        for label, future in futures:
-            try:
-                result = future.result()
-            except Exception as exc:  # noqa: BLE001 - one bad query must not abort
-                errors.append({"query": label, "error": str(exc)})
-                continue
-            if result.get("error"):
-                errors.append(
-                    {
-                        "query": label,
-                        "error_code": result.get("error_code", ""),
-                        "error": result["error"],
-                    }
-                )
-                continue
-            results.append(result)
-    return results, errors
-
-
-def sweep_savings_plans(
-    clients: Clients,
-    sp_types: list[str],
-    terms: list[str],
-    payments: list[str],
-    lookback: str,
-    account_scope: str,
-) -> tuple[list[dict], list[dict]]:
-    """Query every (type × term × payment) SP permutation. Returns (recs, errors)."""
-    jobs = [
-        (
-            f"SP {SP_TYPE_LABELS.get(sp_type, sp_type)} {term} {payment}",
-            lambda s=sp_type, t=term, p=payment: get_sp_recommendation(
-                clients, s, t, p, lookback, account_scope
-            ),
-        )
-        for sp_type in sp_types
-        for term in terms
-        for payment in payments
-    ]
-    return run_jobs(jobs)
-
-
-def sweep_reservations(
-    clients: Clients,
-    services: list[str],
-    terms: list[str],
-    payments: list[str],
-    lookback: str,
-    account_scope: str,
-) -> tuple[list[dict], list[dict]]:
-    """Query every (service × term × payment) RI permutation. Returns (recs, errors)."""
-    jobs = [
-        (
-            f"RI {RI_SERVICE_LABELS.get(service, service)} {term} {payment}",
-            lambda s=service, t=term, p=payment: get_ri_recommendation(
-                clients, s, t, p, lookback, account_scope
-            ),
-        )
-        for service in services
-        for term in terms
-        for payment in payments
-    ]
-    return run_jobs(jobs)
-
-
-def collect_posture(
-    clients: Clients,
-    posture_days: int = DEFAULT_POSTURE_DAYS,
-    spend_days: int = DEFAULT_SPEND_DAYS,
-) -> dict:
-    """Fetch existing coverage/utilization, COH enrollment, and eligible spend.
-
-    Every key is always present; a failed query lands as `{"error": ...}` in its
-    own slot so the caller can report partial posture instead of nothing.
-    """
-    from concurrent.futures import ThreadPoolExecutor
-
-    jobs: dict[str, Callable[[], dict]] = {
-        "sp_coverage": lambda: get_sp_coverage(clients, posture_days),
-        "sp_utilization": lambda: get_sp_utilization(clients, posture_days),
-        "ri_coverage": lambda: get_ri_coverage(clients, posture_days),
-        "ri_utilization": lambda: get_ri_utilization(clients, posture_days),
-        "coh_enrollment": lambda: get_coh_enrollment(clients),
-        "eligible_spend": lambda: get_eligible_spend(clients, spend_days),
-    }
-    collected: dict[str, dict] = {}
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
-        submitted = {key: pool.submit(fn) for key, fn in jobs.items()}
-        for key, future in submitted.items():
-            try:
-                collected[key] = future.result()
-            except Exception as exc:  # noqa: BLE001
-                collected[key] = {"error": str(exc)}
-    return collected
-
-
 def resolve_regions(tokens: list[str] | None, default_region: str = "") -> list[str]:
     """Validate and de-duplicate a caller-supplied region list.
 
     Reservations are regional, so a sweep needs an explicit list; Savings Plans
-    are account-level and are fetched once regardless. Defaults to the single
-    region the host itself runs in, because widening the sweep multiplies API
-    calls and a caller who wants org-wide coverage should say so.
+    are account-level and are fetched once regardless. `default_region` is used
+    only when the caller passes one — the full analysis passes none, so
+    omitting `regions` there really does skip the inventory.
     """
     values = [t.strip().lower() for t in (tokens or []) if t and t.strip()]
     if not values and default_region:
@@ -297,25 +211,201 @@ def resolve_regions(tokens: list[str] | None, default_region: str = "") -> list[
     return list(dict.fromkeys(values))
 
 
-def collect_expiry(
+# ---------------------------------------------------------------------------
+# Parallel collection
+# ---------------------------------------------------------------------------
+
+
+def run_jobs(
+    jobs: list[tuple[str, Callable[[], dict]]],
+    deadline: float | None = None,
+) -> tuple[list[dict], list[dict]]:
+    """Run labelled callables in parallel, tolerating per-query failure.
+
+    One throttled or unauthorized permutation must not lose the other 40, so
+    failures are collected as warnings and the report is reported as a lower
+    bound rather than aborted.
+
+    `deadline` is a `time.monotonic()` value. Jobs unfinished by then are
+    reported as `TimeBudgetExceeded` and left behind rather than waited for —
+    the pool is shut down without waiting, so the caller returns on time.
+    """
+    # Imported lazily so that importing this module costs nothing on hosts that
+    # only want the pure helpers (serialize_finding, envelope).
+    from concurrent.futures import ThreadPoolExecutor
+    from concurrent.futures import TimeoutError as FutureTimeout
+
+    results: list[dict] = []
+    errors: list[dict] = []
+    if not jobs:
+        return results, errors
+
+    pool = ThreadPoolExecutor(max_workers=MAX_WORKERS)
+    try:
+        futures = [(label, pool.submit(fn)) for label, fn in jobs]
+        for label, future in futures:
+            timeout = None if deadline is None else max(0.0, deadline - time.monotonic())
+            try:
+                result = future.result(timeout=timeout)
+            except FutureTimeout:
+                future.cancel()
+                errors.append(
+                    {
+                        "query": label,
+                        "error_code": TIME_BUDGET_ERROR,
+                        "error": "Not finished within the analysis time budget; "
+                        "excluded from the totals.",
+                    }
+                )
+                continue
+            except Exception as exc:  # noqa: BLE001 - one bad query must not abort
+                errors.append({"query": label, "error": str(exc)})
+                continue
+            if result.get("error"):
+                errors.append(
+                    {
+                        "query": label,
+                        "error_code": result.get("error_code", ""),
+                        "error": result["error"],
+                    }
+                )
+                continue
+            results.append(result)
+    finally:
+        pool.shutdown(wait=deadline is None, cancel_futures=True)
+    return results, errors
+
+
+def sweep_savings_plans(
+    clients: Clients,
+    sp_types: list[str],
+    terms: list[str],
+    payments: list[str],
+    lookback: str,
+    account_scope: str,
+    deadline: float | None = None,
+) -> tuple[list[dict], list[dict]]:
+    """Query every (type × term × payment) SP permutation. Returns (recs, errors)."""
+    jobs = [
+        (
+            f"SP {SP_TYPE_LABELS.get(sp_type, sp_type)} {term} {payment}",
+            lambda s=sp_type, t=term, p=payment: get_sp_recommendation(
+                clients, s, t, p, lookback, account_scope
+            ),
+        )
+        for sp_type in sp_types
+        for term in terms
+        for payment in payments
+    ]
+    return run_jobs(jobs, deadline)
+
+
+def sweep_reservations(
+    clients: Clients,
+    services: list[str],
+    terms: list[str],
+    payments: list[str],
+    lookback: str,
+    account_scope: str,
+    deadline: float | None = None,
+) -> tuple[list[dict], list[dict]]:
+    """Query every (service × term × payment) RI permutation. Returns (recs, errors)."""
+    jobs = [
+        (
+            f"RI {RI_SERVICE_LABELS.get(service, service)} {term} {payment}",
+            lambda s=service, t=term, p=payment: get_ri_recommendation(
+                clients, s, t, p, lookback, account_scope
+            ),
+        )
+        for service in services
+        for term in terms
+        for payment in payments
+    ]
+    return run_jobs(jobs, deadline)
+
+
+def _gather(jobs: dict[str, Callable[[], dict]]) -> dict[str, dict]:
+    """Run keyed callables in parallel; a raised exception lands as an error."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    collected: dict[str, dict] = {}
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+        submitted = {key: pool.submit(fn) for key, fn in jobs.items()}
+        for key, future in submitted.items():
+            try:
+                collected[key] = future.result()
+            except Exception as exc:  # noqa: BLE001
+                collected[key] = {"error": str(exc)}
+    return collected
+
+
+def collect_posture(
+    clients: Clients,
+    posture_days: int = DEFAULT_POSTURE_DAYS,
+    spend_days: int = DEFAULT_SPEND_DAYS,
+    ri_services: list[str] | None = None,
+    *,
+    include_sp: bool = True,
+    include_coh: bool = True,
+) -> dict:
+    """Fetch existing coverage/utilization, COH state, and eligible spend.
+
+    Reservation coverage and utilization are queried once per service in
+    `ri_services`: Cost Explorer defaults an unfiltered query to EC2, so one
+    call cannot speak for RDS. Each is a billed request, so callers pass only
+    the services that matter to them.
+
+    Every key is always present; a failed query lands as `{"error": ...}` in its
+    own slot so the caller can report partial posture instead of nothing.
+    """
+    services = list(dict.fromkeys(ri_services or []))
+    jobs: dict[str, Callable[[], dict]] = {
+        "eligible_spend": lambda: get_eligible_spend(clients, spend_days),
+    }
+    if include_sp:
+        jobs["sp_coverage"] = lambda: get_sp_coverage(clients, posture_days)
+        jobs["sp_utilization"] = lambda: get_sp_utilization(clients, posture_days)
+    if include_coh:
+        jobs["coh_enrollment"] = lambda: get_coh_enrollment(clients)
+        jobs["coh_preferences"] = lambda: get_coh_preferences(clients)
+    for service in services:
+        jobs[f"ri_coverage:{service}"] = lambda s=service: get_ri_coverage(clients, posture_days, s)
+        jobs[f"ri_utilization:{service}"] = lambda s=service: get_ri_utilization(clients, posture_days, s)
+
+    collected = _gather(jobs)
+    return {
+        "sp_coverage": collected.get("sp_coverage", {}),
+        "sp_utilization": collected.get("sp_utilization", {}),
+        "ri_coverage": {s: collected[f"ri_coverage:{s}"] for s in services},
+        "ri_utilization": {s: collected[f"ri_utilization:{s}"] for s in services},
+        "coh_enrollment": collected.get("coh_enrollment", {}),
+        "coh_preferences": collected.get("coh_preferences", {}),
+        "eligible_spend": collected["eligible_spend"],
+    }
+
+
+def posture_from(collected: dict) -> dict:
+    return assess_existing_posture(
+        collected["sp_coverage"],
+        collected["sp_utilization"],
+        collected["ri_coverage"],
+        collected["ri_utilization"],
+    )
+
+
+def collect_inventory(
     clients: Clients,
     regions: list[str],
-    services: list[str] | None = None,
-    horizon_days: int = DEFAULT_EXPIRY_HORIZON_DAYS,
-    *,
-    sp_utilization_pct: float | None = None,
-    ri_utilization_pct: float | None = None,
-    as_of: date | None = None,
-) -> tuple[dict[str, Any], list[dict]]:
-    """Inventory every commitment that carries a date, and judge its renewal.
+    families: list[str] | None = None,
+) -> tuple[list[dict], list[dict]]:
+    """Inventory every commitment that carries a date. Returns (items, errors).
 
     One job per (family, region) plus one un-multiplied Savings Plans job — the
     SP API is account-level, so sweeping it per region would return the same
     plans N times and quietly inflate every total.
     """
-    families = [s.strip().lower() for s in (services or list(INVENTORY_KEYS)) if s.strip()]
+    families = [s.strip().lower() for s in (families or list(INVENTORY_KEYS)) if s.strip()]
     validate_choices(families, INVENTORY_KEYS, "reservation family")
-
     jobs: list[tuple[str, Callable[[], dict]]] = [
         (
             f"{family} reservations ({region})",
@@ -325,19 +415,70 @@ def collect_expiry(
         for family in families
     ]
     jobs.append(("savings plan inventory", lambda: get_savings_plan_inventory(clients)))
-
     results, errors = run_jobs(jobs)
-    items = [item for result in results for item in result.get("items", [])]
+    return [item for result in results for item in result.get("items", [])], errors
+
+
+def inventory_ce_services(items: list[dict]) -> list[str]:
+    """Cost Explorer services whose reservations appear in an inventory."""
+    keys = {i.get("service") for i in items if i.get("family") == "reservation"}
+    return [INVENTORY_SPECS[k].ce_service for k in INVENTORY_KEYS if k in keys]
+
+
+def expiry_from(
+    items: list[dict],
+    regions: list[str],
+    posture: dict,
+    horizon_days: int,
+    as_of: date | None = None,
+) -> dict[str, Any]:
+    """Judge renewals against per-service utilization from `posture`."""
+    by_ce_service = posture.get("ri_utilization_by_service", {})
+    by_family = {
+        key: by_ce_service.get(spec.ce_service)
+        for key, spec in INVENTORY_SPECS.items()
+        if spec.ce_service in by_ce_service
+    }
     expiry = analyze_expiry(
         items,
         as_of or datetime.now(timezone.utc).date(),
         horizon_days,
-        sp_utilization_pct=sp_utilization_pct,
-        ri_utilization_pct=ri_utilization_pct,
+        sp_utilization_pct=posture.get("sp_utilization_pct"),
+        ri_utilization_by_service=by_family,
     )
     expiry["regions"] = list(regions)
     expiry["blind_spots"] = list(INVENTORY_BLIND_SPOTS)
-    return expiry, errors
+    return expiry
+
+
+def collect_expiry(
+    clients: Clients,
+    regions: list[str],
+    services: list[str] | None = None,
+    horizon_days: int = DEFAULT_EXPIRY_HORIZON_DAYS,
+    *,
+    posture_days: int = DEFAULT_POSTURE_DAYS,
+    as_of: date | None = None,
+) -> tuple[dict[str, Any], dict, list[dict]]:
+    """Inventory, then measure utilization for only what was found.
+
+    Returns (expiry, posture, errors). Utilization is queried per service for
+    the reservation families the inventory actually returned — an account
+    with no ElastiCache reservations pays nothing to learn ElastiCache's
+    utilization.
+    """
+    items, errors = collect_inventory(clients, regions, services)
+    has_sp = any(i.get("family") == "savings-plan" for i in items)
+    collected = collect_posture(
+        clients,
+        posture_days,
+        DEFAULT_SPEND_DAYS,
+        inventory_ce_services(items),
+        include_sp=has_sp,
+        include_coh=False,
+    )
+    posture = posture_from(collected)
+    return expiry_from(items, regions, posture, horizon_days, as_of), posture, errors
 
 
 def fetch_coh(clients: Clients, coh_enrollment: dict) -> dict:
@@ -369,81 +510,6 @@ def findings_from(sp_recs: list[dict], ri_recs: list[dict]) -> list[Finding]:
     return findings
 
 
-def serialize_line_item(item: LineItem) -> dict:
-    """Flatten one purchasable line of a recommendation.
-
-    A consumer that only reads the finding-level total cannot act on it: a
-    reservation applies to usage matching its exact specification, so `spec` and
-    `region` are what a purchase is actually placed against.
-    """
-    return {
-        "spec": item.spec,
-        "region": item.region,
-        "commitment_unit": item.unit,
-        "aws_recommended_commitment": round(item.recommended, 4),
-        "achievable_commitment": round(item.achievable, 4),
-        "minimum_observed_units": round(item.floor, 4),
-        "average_observed_units": round(item.average, 4),
-        "estimated_monthly_savings": round(item.monthly_savings, 2),
-        "upfront_cost": round(item.upfront_cost, 2),
-        "monthly_on_demand_cost": round(item.monthly_on_demand, 2),
-        "estimated_utilization_percentage": (
-            round(item.utilization_pct, 2) if item.utilization_pct is not None else None
-        ),
-        "size_flexible": item.size_flex_eligible,
-        "current_generation": item.current_generation,
-        "account_id": item.account_id,
-    }
-
-
-def serialize_finding(f: Finding) -> dict:
-    """Flatten a Finding into a flat recommendation dict.
-
-    Key names mirror what an AWS Cost Optimization Hub style recommendation
-    list looks like, so a host that already renders those needs no translation
-    layer.
-    """
-    return {
-        "commitment_family": f.family,
-        "commitment_type": f.label,
-        "term": f.term,
-        "payment_option": f.payment,
-        "aws_recommended_commitment": round(f.api_hourly_commitment, 4),
-        "achievable_commitment": round(f.safe_hourly_commitment, 4),
-        "commitment_unit": "USD/hour" if f.family == "savings-plan" else "units",
-        "estimated_monthly_savings": round(f.safe_monthly_savings, 2),
-        "aws_best_case_monthly_savings": round(f.api_monthly_savings, 2),
-        "estimated_savings_percentage": round(f.savings_percentage, 2),
-        "upfront_cost": round(f.upfront_cost, 2),
-        "break_even_months": (
-            round(f.break_even_months, 1) if f.break_even_months else None
-        ),
-        "waste_exposure_monthly": round(f.waste_exposure_monthly, 2),
-        "confidence": f.confidence,
-        "spend_profile": f.volatility,
-        "implementation_effort": "Medium",
-        "rationale": f.rationale,
-        "line_items": [serialize_line_item(i) for i in f.line_items],
-    }
-
-
-def envelope(findings: list[Finding], reconciliation: dict | None = None) -> dict:
-    """Build the JSON response shape: recommendations plus roll-up totals."""
-    payload = {
-        "recommendations": [serialize_finding(f) for f in findings],
-        "count": len(findings),
-        "total_estimated_monthly_savings": round(
-            sum(f.safe_monthly_savings for f in findings), 2
-        ),
-        "aws_best_case_monthly_savings": round(
-            sum(f.api_monthly_savings for f in findings), 2
-        ),
-    }
-    if reconciliation is not None:
-        payload["reconciliation"] = reconciliation
-    return payload
-
-
 def build_meta(
     clients: Clients,
     lookback: str,
@@ -460,9 +526,126 @@ def build_meta(
     }
 
 
+def counting(clients: Clients) -> tuple[Clients, CountingClient]:
+    """Route Cost Explorer through a request counter. Returns (clients, counter)."""
+    counter = CountingClient(clients.ce)
+    return replace(clients, ce=counter), counter
+
+
+def cost_of(counter: CountingClient) -> dict[str, Any]:
+    return {
+        "queries_run": counter.count,
+        "estimated_api_cost_usd": round(counter.count * CE_PRICE_PER_REQUEST, 2),
+    }
+
+
 # ---------------------------------------------------------------------------
-# Full pipeline
+# Entrypoints
 # ---------------------------------------------------------------------------
+
+
+def size_commitments(
+    clients: Clients,
+    family: str,
+    choices: list[str],
+    terms: list[str],
+    payments: list[str],
+    lookback: str,
+    account_scope: str,
+    *,
+    time_budget_seconds: float = DEFAULT_TIME_BUDGET_SECONDS,
+) -> dict[str, Any]:
+    """Size one family on its own (`sp` → types, `ri` → services).
+
+    No posture gate and no reconciliation — the caller asked for sizing only.
+    Alternatives are still marked within the family, so two SP types covering
+    the same compute spend are not summed.
+    """
+    clients, counter = counting(clients)
+    deadline = time.monotonic() + time_budget_seconds
+    if family == "sp":
+        recs, errors = sweep_savings_plans(
+            clients, choices, terms, payments, lookback, account_scope, deadline
+        )
+        findings = findings_from(recs, [])
+    else:
+        recs, errors = sweep_reservations(
+            clients, choices, terms, payments, lookback, account_scope, deadline
+        )
+        findings = findings_from([], recs)
+    if not recs and errors:
+        return {**diagnose_failure(errors), "collection_warnings": errors, **cost_of(counter)}
+    planned, pools = plan_purchases(select_best_findings(findings))
+    return {
+        **envelope(planned, pools=pools),
+        "collection_warnings": errors,
+        **cost_of(counter),
+    }
+
+
+def posture_snapshot(
+    clients: Clients,
+    posture_days: int = DEFAULT_POSTURE_DAYS,
+    spend_days: int = DEFAULT_SPEND_DAYS,
+    ri_services: list[str] | None = None,
+) -> dict[str, Any]:
+    """Health of existing commitments, without sizing anything new."""
+    clients, counter = counting(clients)
+    collected = collect_posture(
+        clients, posture_days, spend_days, ri_services or list(RI_SERVICES)
+    )
+    posture = posture_from(collected)
+    spend = collected["eligible_spend"]
+    periods = spend.get("periods", [])
+    top = (
+        dict(sorted(periods[-1]["by_service"].items(), key=lambda kv: -kv[1])[:10])
+        if periods
+        else {}
+    )
+    return {
+        "posture": posture,
+        "blockers": posture["blockers"],
+        "safe_to_buy_more": safe_to_buy_more(posture),
+        "unmeasured": posture["unmeasured"],
+        "cost_optimization_hub": collected["coh_enrollment"],
+        "spend_periods": [
+            {"start": p["start"], "end": p["end"], "total": p["total"]} for p in periods
+        ],
+        "spend_error": spend.get("error"),
+        "top_services_latest_period": top,
+        "notes": posture.get("notes", []),
+        **cost_of(counter),
+    }
+
+
+def expiry_snapshot(
+    clients: Clients,
+    regions: list[str],
+    services: list[str] | None = None,
+    horizon_days: int = DEFAULT_EXPIRY_HORIZON_DAYS,
+    posture_days: int = DEFAULT_POSTURE_DAYS,
+) -> dict[str, Any]:
+    """What expires, and the per-service utilization each verdict rests on."""
+    clients, counter = counting(clients)
+    expiry, posture, errors = collect_expiry(
+        clients, regions, services, horizon_days, posture_days=posture_days
+    )
+    return {
+        **expiry,
+        "renewal_actions": expiry["actions"],
+        "utilization_unmeasured": posture["unmeasured"],
+        "collection_warnings": errors,
+        **cost_of(counter),
+    }
+
+
+def _ri_services_of(findings: list[Finding]) -> list[str]:
+    by_label = {label: service for service, label in RI_SERVICE_LABELS.items()}
+    return [
+        by_label[f.label]
+        for f in findings
+        if f.family == "reserved-instance" and not f.do_not_buy and f.label in by_label
+    ]
 
 
 def collect_all(
@@ -481,17 +664,20 @@ def collect_all(
     inventory_services: list[str] | None = None,
     expiry_horizon_days: int = DEFAULT_EXPIRY_HORIZON_DAYS,
     profile: str | None = None,
+    time_budget_seconds: float = DEFAULT_TIME_BUDGET_SECONDS,
 ) -> dict[str, Any]:
     """Run the whole pipeline and return the payload `report.render` expects.
 
-    Sweeps recommendations, fetches existing posture, reconciles against Cost
-    Optimization Hub, and keeps the best finding per (family, term, payment).
+    Sweeps recommendations, inventories existing commitments (when `regions`
+    is given), measures posture for the services that matter, reconciles
+    against Cost Optimization Hub, and plans one purchase per usage pool.
     Every parameter is validated here, so a host can pass user input straight
     through and catch `ValueError`.
 
-    The returned dict carries `meta`, `findings`, `posture`, `reconciliation`,
-    `eligible_spend`, `expiry`, `errors`, `sweep_errors` — plus `raw` for a
-    caller that wants the unanalyzed responses.
+    The returned dict carries `meta`, `findings` (planned, with roles),
+    `pools`, `posture`, `reconciliation`, `eligible_spend`, `expiry`,
+    `errors`, `fatal` (set when every recommendation query failed — render
+    nothing, report the error), `queries_run`, plus `raw`.
 
     `regions` is opt-in: expiry inventory needs regional Describe* permissions
     beyond the Cost Explorer set, so passing nothing leaves `expiry` as None
@@ -509,73 +695,70 @@ def collect_all(
     if regions:
         regions = resolve_regions(regions)
 
+    clients, counter = counting(clients)
+    deadline = time.monotonic() + time_budget_seconds
     sp_recs: list[dict] = []
     ri_recs: list[dict] = []
     errors: list[dict] = []
 
     if "sp" in families:
-        recs, errs = sweep_savings_plans(
-            clients,
-            resolve_sp_types(sp_types or ["all"]),
-            terms,
-            payments,
-            lookback,
-            account_scope,
+        sp_recs, errs = sweep_savings_plans(
+            clients, resolve_sp_types(sp_types or ["all"]), terms, payments,
+            lookback, account_scope, deadline,
         )
-        sp_recs, errors = recs, errors + errs
-
+        errors += errs
     if "ri" in families:
-        recs, errs = sweep_reservations(
-            clients,
-            resolve_ri_services(ri_services or ["all"]),
-            terms,
-            payments,
-            lookback,
-            account_scope,
+        ri_recs, errs = sweep_reservations(
+            clients, resolve_ri_services(ri_services or ["all"]), terms, payments,
+            lookback, account_scope, deadline,
         )
-        ri_recs, errors = recs, errors + errs
-
-    posture_data = collect_posture(clients, posture_days, spend_days)
-    coh = fetch_coh(clients, posture_data["coh_enrollment"])
-
-    best = select_best_findings(findings_from(sp_recs, ri_recs))
-    posture = assess_existing_posture(
-        posture_data["sp_coverage"],
-        posture_data["sp_utilization"],
-        posture_data["ri_coverage"],
-        posture_data["ri_utilization"],
-    )
-    reconciliation = reconcile_with_coh(best, coh)
-
-    # Reuses the utilization already measured above rather than re-querying:
-    # Cost Explorer has no per-commitment utilization API, so the account-level
-    # figure is the only one there is, and it is what drives the renewal call.
-    # Kept separate from `errors` because a caller counting queries is counting
-    # BILLABLE ones — Cost Explorer charges $0.01 per recommendation request,
-    # while the inventory Describe* calls are free. Folding expiry failures into
-    # that count would overstate the bill.
+        errors += errs
     sweep_errors = list(errors)
 
-    expiry = None
-    if regions:
-        expiry, expiry_errors = collect_expiry(
-            clients,
-            regions,
-            inventory_services,
-            expiry_horizon_days,
-            sp_utilization_pct=posture.get("sp_utilization_pct"),
-            ri_utilization_pct=posture.get("ri_utilization_pct"),
-        )
-        errors = errors + expiry_errors
+    if not (sp_recs or ri_recs) and sweep_errors:
+        return {
+            "meta": build_meta(clients, lookback, account_scope, profile),
+            "fatal": diagnose_failure(sweep_errors),
+            "errors": sweep_errors,
+            "sweep_errors": sweep_errors,
+            **cost_of(counter),
+        }
 
+    all_findings = findings_from(sp_recs, ri_recs)
+    planned, pools = plan_purchases(select_best_findings(all_findings))
+
+    items: list[dict] = []
+    if regions:
+        items, inventory_errors = collect_inventory(clients, regions, inventory_services)
+        errors += inventory_errors
+
+    posture_services = list(
+        dict.fromkeys(_ri_services_of(planned) + inventory_ce_services(items))
+    )
+    collected = collect_posture(clients, posture_days, spend_days, posture_services)
+    posture = posture_from(collected)
+    coh = fetch_coh(clients, collected["coh_enrollment"])
+    reconciliation = reconcile_with_coh(
+        all_findings,
+        coh,
+        collected["coh_preferences"],
+        ce_account_id=clients.account_id,
+        coh_account_id=clients.coh_account_id or clients.account_id,
+    )
+    expiry = (
+        expiry_from(items, regions, posture, expiry_horizon_days) if regions else None
+    )
     return {
         "meta": build_meta(clients, lookback, account_scope, profile),
-        "findings": best,
+        "findings": planned,
+        "pools": pools,
         "posture": posture,
+        "safe_to_buy_more": safe_to_buy_more(posture),
         "reconciliation": reconciliation,
-        "eligible_spend": posture_data["eligible_spend"],
+        "eligible_spend": collected["eligible_spend"],
         "expiry": expiry,
         "errors": errors,
         "sweep_errors": sweep_errors,
-        "raw": {"sp_recs": sp_recs, "ri_recs": ri_recs, "coh": coh, **posture_data},
+        **cost_of(counter),
+        "raw": {"sp_recs": sp_recs, "ri_recs": ri_recs, "coh": coh, **collected},
     }

@@ -23,13 +23,14 @@ from datetime import date, datetime, timezone
 
 import pytest
 
-from commitments import api, collect
+from commitments import api, collect, inventory
 from commitments.analyze import (
     SPEC_UNAVAILABLE,
-    analyze_expiry,
     analyze_ri_recommendation,
     analyze_sp_recommendation,
 )
+from commitments.collect import LINE_ITEM_LIMIT
+from commitments.expiry import analyze_expiry
 from commitments.report import render
 
 ONE_YEAR_SECONDS = 31536000
@@ -233,6 +234,9 @@ class StubDescribe:
     def _respond(self, **kwargs):
         return self.response
 
+    def can_paginate(self, name):
+        return False
+
     describe_reserved_instances = _respond
     describe_reserved_db_instances = _respond
     describe_reserved_cache_nodes = _respond
@@ -268,7 +272,7 @@ def rds_reservation(**overrides) -> dict:
 @pytest.mark.unit
 class TestReservationAttributes:
     def test_rds_inventory_reports_multi_az_and_engine(self):
-        result = api.get_reservation_inventory(
+        result = inventory.get_reservation_inventory(
             clients_returning(rds_reservation()), "rds", "ap-northeast-1"
         )
         [item] = result["items"]
@@ -278,7 +282,7 @@ class TestReservationAttributes:
 
     def test_multi_az_false_is_single_az_not_missing(self):
         """A bool has to be tested against None; False is meaningful here."""
-        result = api.get_reservation_inventory(
+        result = inventory.get_reservation_inventory(
             clients_returning(rds_reservation(MultiAZ=False)), "rds", "us-east-1"
         )
         [item] = result["items"]
@@ -288,7 +292,7 @@ class TestReservationAttributes:
     def test_absent_multi_az_is_omitted_rather_than_guessed(self):
         payload = rds_reservation()
         del payload["ReservedDBInstances"][0]["MultiAZ"]
-        result = api.get_reservation_inventory(
+        result = inventory.get_reservation_inventory(
             clients_returning(payload), "rds", "us-east-1"
         )
         [item] = result["items"]
@@ -296,7 +300,7 @@ class TestReservationAttributes:
 
     def test_ec2_zonal_scope_reports_the_availability_zone(self):
         """A zonal reservation only covers one AZ, so a renewal must match it."""
-        result = api.get_reservation_inventory(
+        result = inventory.get_reservation_inventory(
             clients_returning(
                 {
                     "ReservedInstances": [
@@ -355,7 +359,7 @@ class TestReservationAttributes:
                 }
 
         stub = StubSP()
-        result = api.get_savings_plan_inventory(
+        result = inventory.get_savings_plan_inventory(
             api.Clients(
                 ce=stub,
                 coh=stub,
@@ -596,6 +600,8 @@ class TestSpLineItems:
         assert f.line_items[0].spec == "any instance family"
 
     def test_dollar_commitments_are_not_rounded_to_whole_units(self):
+        # 30% effective discount: SP cost 6.5×730, covering 6.5/0.7 of on-demand.
+        sp_cost = 6.5 * 730
         f = analyze_sp_recommendation(
             self.sp_rec(
                 [
@@ -604,12 +610,18 @@ class TestSpLineItems:
                         "CurrentMinimumHourlyOnDemandSpend": "4.0",
                         "CurrentAverageHourlyOnDemandSpend": "8.0",
                         "EstimatedMonthlySavingsAmount": "700.0",
+                        "EstimatedSPCost": str(sp_cost),
+                        "EstimatedSavingsAmount": str(sp_cost / 0.7 - sp_cost),
+                        "EstimatedAverageUtilization": "100",
                     }
                 ]
             )
         )
         [item] = f.line_items
-        assert item.achievable != int(item.achievable) or item.achievable == 6.5
+        # Floor $4 → $2.80 of commitment, average $8 → $5.60: moderate, so the
+        # midpoint of 2.80 and 6.50 — a dollar figure, not a whole unit.
+        assert item.floor == pytest.approx(2.8)
+        assert item.achievable == pytest.approx(4.65)
 
 
 # ---------------------------------------------------------------- report surface
@@ -662,8 +674,8 @@ class TestReportShowsTheSpec:
         md = render(payload([analyze_ri_recommendation(ri_rec([detail]))]))
         assert "Line items — what to buy" not in md
 
-    def test_rounding_shortfall_is_disclosed_rather_than_padded(self):
-        """Per-line whole-unit rounding can undershoot the family total."""
+    def test_family_total_is_the_sum_of_its_lines(self):
+        """Lines are sized independently, so there is no rounding shortfall."""
         f = analyze_ri_recommendation(
             ri_rec(
                 [
@@ -678,17 +690,29 @@ class TestReportShowsTheSpec:
                 ]
             )
         )
-        allocated = sum(i.achievable for i in f.line_items)
+        assert f.safe_hourly_commitment == sum(i.achievable for i in f.line_items)
+        assert f.safe_monthly_savings == pytest.approx(
+            sum(i.monthly_savings for i in f.line_items)
+        )
         md = render(payload([f]))
-        if allocated < f.safe_hourly_commitment:
-            assert "unallocated against the" in md
-        assert "carries no" in md and "unused-commitment risk" in md
+        assert "unallocated" not in md
+        assert "sized against that" in md
+
+    def test_line_items_table_is_capped_and_the_remainder_disclosed(self):
+        details = [
+            rds_detail(f"db.r6g.{n}xlarge", "Multi-AZ", "2", str(100.0 + n))
+            for n in range(LINE_ITEM_LIMIT + 5)
+        ]
+        f = analyze_ri_recommendation(ri_rec(details))
+        md = render(payload([f]))
+        assert "5 smaller line item(s) not shown" in md
+        assert "included in the totals above" in md
 
     def test_expiry_table_shows_what_a_renewal_has_to_match(self):
-        expiry, _ = None, None
-        inventory = [
+        rows = [
             {
-                "family": "reserved-instance",
+                "family": "reservation",
+                "service": "rds",
                 "label": "RDS Reserved Instance",
                 "commitment_id": "rds-1",
                 "instance_type": "db.r6g.large",
@@ -704,7 +728,9 @@ class TestReportShowsTheSpec:
                 "payment_option": "All Upfront",
             }
         ]
-        expiry = analyze_expiry(inventory, date(2026, 9, 4), 90, ri_utilization_pct=95.0)
+        expiry = analyze_expiry(
+            rows, date(2026, 9, 4), 90, ri_utilization_by_service={"rds": 95.0}
+        )
         md = render(payload([], expiry=expiry))
         assert "| Spec |" in md
         assert "db.r6g.large · Multi-AZ · postgresql" in md
@@ -760,7 +786,7 @@ class TestEnvelopeCarriesLineItems:
         assert first["region"] == "ap-northeast-1"
         assert first["commitment_unit"] == "units"
         assert first["aws_recommended_commitment"] == 4.0
-        assert first["minimum_observed_units"] == 4.0
+        assert first["minimum_observed"] == 4.0
         assert first["estimated_monthly_savings"] == 600.0
         assert first["size_flexible"] is True
         assert first["current_generation"] is True
@@ -772,7 +798,7 @@ class TestEnvelopeCarriesLineItems:
         [rec] = collect.envelope([analyze_ri_recommendation(ri_rec([detail]))])[
             "recommendations"
         ]
-        assert rec["line_items"][0]["estimated_utilization_percentage"] is None
+        assert rec["line_items"][0]["aws_estimated_utilization_percentage"] is None
 
     def test_savings_plan_lines_are_serialized_in_dollars_per_hour(self):
         f = analyze_sp_recommendation(

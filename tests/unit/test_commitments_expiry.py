@@ -21,7 +21,7 @@ from datetime import date, datetime, timedelta, timezone
 import pytest
 from botocore.exceptions import ClientError
 
-from commitments import analyze, api, collect, report
+from commitments import api, collect, expiry, inventory, report
 
 ONE_YEAR_SECONDS = 31536000
 THREE_YEAR_SECONDS = 94608000
@@ -47,6 +47,9 @@ class StubDescribe:
             raise self.error
         return self.response
 
+    def can_paginate(self, name):
+        return False
+
     describe_reserved_instances = _respond
     describe_reserved_db_instances = _respond
     describe_reserved_cache_nodes = _respond
@@ -68,9 +71,54 @@ class StubSavingsPlans:
         return self.pages[len(self.calls) - 1]
 
 
-def clients(factory=None) -> api.Clients:
+class StubCostExplorer:
+    """Every Cost Explorer read the pipeline makes, answering "nothing here".
+
+    Records each call so a test can count billed requests.
+    """
+
+    def __init__(self):
+        self.calls: list[tuple[str, dict]] = []
+
+    def _record(self, name, kwargs):
+        self.calls.append((name, kwargs))
+
+    def get_savings_plans_purchase_recommendation(self, **kwargs):
+        self._record("sp_rec", kwargs)
+        return {"SavingsPlansPurchaseRecommendation": {}}
+
+    def get_reservation_purchase_recommendation(self, **kwargs):
+        self._record("ri_rec", kwargs)
+        return {"Recommendations": []}
+
+    def get_savings_plans_coverage(self, **kwargs):
+        self._record("sp_coverage", kwargs)
+        return {"SavingsPlansCoverages": []}
+
+    def get_savings_plans_utilization(self, **kwargs):
+        self._record("sp_utilization", kwargs)
+        raise client_error("DataUnavailableException", "")
+
+    def get_reservation_coverage(self, **kwargs):
+        self._record("ri_coverage", kwargs)
+        return {"Total": {}, "CoveragesByTime": []}
+
+    def get_reservation_utilization(self, **kwargs):
+        self._record("ri_utilization", kwargs)
+        service = kwargs["Filter"]["Dimensions"]["Values"][0]
+        pct = self.utilization.get(service) if hasattr(self, "utilization") else None
+        if pct is None:
+            raise client_error("DataUnavailableException", "")
+        return {"Total": {"UtilizationPercentage": str(pct), "PurchasedHours": "720"}}
+
+    def get_cost_and_usage(self, **kwargs):
+        self._record("cost_and_usage", kwargs)
+        return {"ResultsByTime": []}
+
+
+def clients(factory=None, ce=None) -> api.Clients:
     return api.Clients(
-        ce=StubDescribe(),
+        ce=ce or StubCostExplorer(),
         coh=StubDescribe(),
         account_id="111122223333",
         profile=None,
@@ -97,27 +145,27 @@ class TestDateCoercion:
         ],
     )
     def test_every_shape_an_sdk_or_cli_returns_normalizes(self, value):
-        assert api._iso_day(api._as_datetime(value)) == "2026-10-01"
+        assert inventory._iso_day(inventory._as_datetime(value)) == "2026-10-01"
 
     @pytest.mark.parametrize("value", [None, "", "not-a-date", 12345])
     def test_unparseable_returns_none_rather_than_raising(self, value):
         """One malformed row must not lose the rest of the inventory."""
-        assert api._as_datetime(value) is None
+        assert inventory._as_datetime(value) is None
 
     def test_naive_datetime_is_read_as_utc(self):
-        naive = api._as_datetime(datetime(2026, 10, 1))
+        naive = inventory._as_datetime(datetime(2026, 10, 1))
         assert naive.tzinfo is timezone.utc
 
     def test_term_months_labels_both_real_terms(self):
         start = datetime(2026, 1, 1, tzinfo=timezone.utc)
-        assert api._term_months(start, start + timedelta(seconds=ONE_YEAR_SECONDS)) == 12
+        assert inventory._term_months(start, start + timedelta(seconds=ONE_YEAR_SECONDS)) == 12
         assert (
-            api._term_months(start, start + timedelta(seconds=THREE_YEAR_SECONDS)) == 36
+            inventory._term_months(start, start + timedelta(seconds=THREE_YEAR_SECONDS)) == 36
         )
 
     def test_term_months_is_none_when_either_end_is_unknown(self):
-        assert api._term_months(None, datetime.now(timezone.utc)) is None
-        assert api._term_months(datetime.now(timezone.utc), None) is None
+        assert inventory._term_months(None, datetime.now(timezone.utc)) is None
+        assert inventory._term_months(datetime.now(timezone.utc), None) is None
 
 
 # ------------------------------------------------------- reservation inventory
@@ -143,7 +191,7 @@ class TestReservationInventory:
                 ]
             }
         )
-        result = api.get_reservation_inventory(
+        result = inventory.get_reservation_inventory(
             clients(lambda svc, region: stub), "ec2", "ap-northeast-1"
         )
         [item] = result["items"]
@@ -241,7 +289,7 @@ class TestReservationInventory:
     def test_end_date_is_derived_from_start_plus_duration(self, service, response):
         """Only EC2 returns End; the other five must be computed or they are blank."""
         stub = StubDescribe(response)
-        result = api.get_reservation_inventory(
+        result = inventory.get_reservation_inventory(
             clients(lambda svc, region: stub), service, "us-east-1"
         )
         [item] = result["items"]
@@ -254,10 +302,10 @@ class TestReservationInventory:
 
     def test_every_spec_maps_to_a_real_boto3_method_name(self):
         """A method typo only shows up at call time, which is too late."""
-        for spec in api.RESERVATION_INVENTORY:
+        for spec in inventory.RESERVATION_INVENTORY:
             assert spec.method.startswith("describe_")
             assert spec.response_key
-            assert spec.key in api.INVENTORY_KEYS
+            assert spec.key in inventory.INVENTORY_KEYS
 
     def test_retired_reservations_are_excluded(self):
         """A retired reservation is history, not something to renew."""
@@ -275,14 +323,14 @@ class TestReservationInventory:
                 ]
             }
         )
-        result = api.get_reservation_inventory(
+        result = inventory.get_reservation_inventory(
             clients(lambda svc, region: stub), "ec2", "us-east-1"
         )
         assert result["items"] == []
 
     def test_client_error_is_reported_with_the_failed_query_identified(self):
         stub = StubDescribe(error=client_error("UnauthorizedOperation"))
-        result = api.get_reservation_inventory(
+        result = inventory.get_reservation_inventory(
             clients(lambda svc, region: stub), "ec2", "eu-west-1"
         )
         assert result["error_code"] == "UnauthorizedOperation"
@@ -291,19 +339,19 @@ class TestReservationInventory:
 
     def test_missing_client_factory_degrades_to_an_explained_error(self):
         """A host that granted only ce:Get* must get a warning, not a crash."""
-        result = api.get_reservation_inventory(clients(None), "ec2", "us-east-1")
+        result = inventory.get_reservation_inventory(clients(None), "ec2", "us-east-1")
         assert "error" in result
         assert "Describe" in result["error"]
 
     def test_unknown_family_is_a_programming_error_not_a_silent_skip(self):
         with pytest.raises(ValueError, match="Unknown reservation family"):
-            api.get_reservation_inventory(clients(), "dynamodb", "us-east-1")
+            inventory.get_reservation_inventory(clients(), "dynamodb", "us-east-1")
 
     def test_dynamodb_is_not_claimed_as_covered(self):
         """There is no describe-reserved-capacity API; pretending otherwise
         would report "nothing expiring" for a reservation that does."""
-        assert "dynamodb" not in api.INVENTORY_KEYS
-        assert any("DynamoDB" in s for s in api.INVENTORY_BLIND_SPOTS)
+        assert "dynamodb" not in inventory.INVENTORY_KEYS
+        assert any("DynamoDB" in s for s in inventory.INVENTORY_BLIND_SPOTS)
 
 
 # ------------------------------------------------------ savings plan inventory
@@ -331,7 +379,7 @@ class TestSavingsPlanInventory:
                 }
             ]
         )
-        result = api.get_savings_plan_inventory(clients(lambda svc, region: sp))
+        result = inventory.get_savings_plan_inventory(clients(lambda svc, region: sp))
         [item] = result["items"]
         assert item["unit"] == "USD/hour"
         assert item["quantity"] == 5.50
@@ -341,10 +389,11 @@ class TestSavingsPlanInventory:
         # An empty region on a Compute SP means account-wide, not "unknown".
         assert item["region"] == "global"
 
-    def test_only_active_states_are_requested(self):
+    def test_active_and_queued_states_are_requested(self):
+        """Queued plans are how a renewal is scheduled; they must be seen."""
         sp = StubSavingsPlans()
-        api.get_savings_plan_inventory(clients(lambda svc, region: sp))
-        assert sp.calls[0]["states"] == list(api.ACTIVE_SP_STATES)
+        inventory.get_savings_plan_inventory(clients(lambda svc, region: sp))
+        assert sp.calls[0]["states"] == list(inventory.INVENTORY_SP_STATES)
 
     def test_pagination_is_followed(self):
         """Stopping at page one silently under-reports the expiring total."""
@@ -365,17 +414,17 @@ class TestSavingsPlanInventory:
                 },
             ]
         )
-        result = api.get_savings_plan_inventory(clients(lambda svc, region: sp))
+        result = inventory.get_savings_plan_inventory(clients(lambda svc, region: sp))
         assert [i["commitment_id"] for i in result["items"]] == ["sp-1", "sp-2"]
         assert sp.calls[1]["nextToken"] == "more"
 
     def test_client_error_is_reported_not_raised(self):
         sp = StubSavingsPlans(error=client_error("AccessDeniedException"))
-        result = api.get_savings_plan_inventory(clients(lambda svc, region: sp))
+        result = inventory.get_savings_plan_inventory(clients(lambda svc, region: sp))
         assert result["error_code"] == "AccessDeniedException"
 
     def test_missing_client_factory_names_the_permission(self):
-        result = api.get_savings_plan_inventory(clients(None))
+        result = inventory.get_savings_plan_inventory(clients(None))
         assert "DescribeSavingsPlans" in result["error"]
 
 
@@ -417,14 +466,14 @@ class TestExpiryBands:
     )
     def test_days_remaining_maps_to_the_documented_band(self, days_out, urgency):
         end = (AS_OF + timedelta(days=days_out)).isoformat()
-        result = analyze.analyze_expiry([sp_item(end)], AS_OF, 90)
+        result = expiry.analyze_expiry([sp_item(end)], AS_OF, 90)
         [entry] = result["expiring"]
         assert entry["urgency"] == urgency
         assert entry["days_remaining"] == days_out
 
     def test_beyond_the_horizon_is_not_reported(self):
         end = (AS_OF + timedelta(days=120)).isoformat()
-        result = analyze.analyze_expiry([sp_item(end)], AS_OF, 90)
+        result = expiry.analyze_expiry([sp_item(end)], AS_OF, 90)
         assert result["expiring"] == []
         # Still counted as inventoried, so the report can say how many exist.
         assert result["total_active"] == 1
@@ -433,14 +482,14 @@ class TestExpiryBands:
         """A lapsed commitment is a different, more urgent conversation than a
         renewal — the spend it covered is already back at on-demand rates."""
         end = (AS_OF - timedelta(days=5)).isoformat()
-        result = analyze.analyze_expiry([sp_item(end)], AS_OF, 90)
+        result = expiry.analyze_expiry([sp_item(end)], AS_OF, 90)
         assert result["expiring"] == []
         [entry] = result["expired"]
         assert entry["urgency"] == "expired"
         assert "5 days ago" in entry["rationale"]
 
     def test_undated_commitment_is_declared_not_dropped(self):
-        result = analyze.analyze_expiry([sp_item("")], AS_OF, 90)
+        result = expiry.analyze_expiry([sp_item("")], AS_OF, 90)
         assert result["expiring"] == []
         assert len(result["undated"]) == 1
 
@@ -449,7 +498,7 @@ class TestExpiryBands:
             sp_item((AS_OF + timedelta(days=80)).isoformat(), commitment_id="late"),
             sp_item((AS_OF + timedelta(days=10)).isoformat(), commitment_id="soon"),
         ]
-        result = analyze.analyze_expiry(items, AS_OF, 90)
+        result = expiry.analyze_expiry(items, AS_OF, 90)
         assert [e["commitment_id"] for e in result["expiring"]] == ["soon", "late"]
 
 
@@ -458,17 +507,17 @@ class TestRenewalVerdict:
     @pytest.mark.parametrize(
         ("utilization", "action"),
         [
-            (99.5, analyze.RENEW),
-            (95.0, analyze.RENEW),
-            (94.9, analyze.RENEW_SMALLER),
-            (50.0, analyze.RENEW_SMALLER),
-            (49.9, analyze.LET_LAPSE),
-            (0.0, analyze.LET_LAPSE),
+            (99.5, expiry.RENEW),
+            (95.0, expiry.RENEW),
+            (94.9, expiry.RENEW_SMALLER),
+            (50.0, expiry.RENEW_SMALLER),
+            (49.9, expiry.LET_LAPSE),
+            (0.0, expiry.LET_LAPSE),
         ],
     )
     def test_utilization_drives_the_verdict(self, utilization, action):
         end = (AS_OF + timedelta(days=20)).isoformat()
-        result = analyze.analyze_expiry(
+        result = expiry.analyze_expiry(
             [sp_item(end)], AS_OF, 90, sp_utilization_pct=utilization
         )
         assert result["expiring"][0]["action"] == action
@@ -477,35 +526,35 @@ class TestRenewalVerdict:
         """The utilization figure is what makes the call defensible; without it
         the honest answer is "review", not a default to renew."""
         end = (AS_OF + timedelta(days=20)).isoformat()
-        result = analyze.analyze_expiry([sp_item(end)], AS_OF, 90)
+        result = expiry.analyze_expiry([sp_item(end)], AS_OF, 90)
         entry = result["expiring"][0]
-        assert entry["action"] == analyze.REVIEW
+        assert entry["action"] == expiry.REVIEW
         assert "could not be measured" in entry["rationale"]
 
     def test_each_family_uses_its_own_utilization_figure(self):
         """SP utilization must not decide a reservation's renewal."""
         end = (AS_OF + timedelta(days=20)).isoformat()
-        result = analyze.analyze_expiry(
+        result = expiry.analyze_expiry(
             [sp_item(end), ri_item(end)],
             AS_OF,
             90,
             sp_utilization_pct=99.0,
-            ri_utilization_pct=20.0,
+            ri_utilization_by_service={"ec2": 20.0},
         )
         by_family = {e["family"]: e for e in result["expiring"]}
-        assert by_family["savings-plan"]["action"] == analyze.RENEW
-        assert by_family["reservation"]["action"] == analyze.LET_LAPSE
+        assert by_family["savings-plan"]["action"] == expiry.RENEW
+        assert by_family["reservation"]["action"] == expiry.LET_LAPSE
 
     def test_rationale_quotes_the_figure_it_relied_on(self):
         end = (AS_OF + timedelta(days=20)).isoformat()
-        result = analyze.analyze_expiry(
+        result = expiry.analyze_expiry(
             [sp_item(end)], AS_OF, 90, sp_utilization_pct=72.5
         )
         assert "72.5%" in result["expiring"][0]["rationale"]
 
     def test_renew_smaller_names_expiry_as_a_free_resize_point(self):
         end = (AS_OF + timedelta(days=20)).isoformat()
-        result = analyze.analyze_expiry(
+        result = expiry.analyze_expiry(
             [sp_item(end)], AS_OF, 90, sp_utilization_pct=70.0
         )
         assert "zero-cost resize" in result["expiring"][0]["rationale"]
@@ -515,17 +564,17 @@ class TestRenewalVerdict:
 class TestExpiryRollup:
     def test_savings_plan_hourly_commitment_converts_to_monthly_money(self):
         end = (AS_OF + timedelta(days=20)).isoformat()
-        result = analyze.analyze_expiry([sp_item(end, quantity=5.0)], AS_OF, 90)
+        result = expiry.analyze_expiry([sp_item(end, quantity=5.0)], AS_OF, 90)
         assert result["hourly_commitment_expiring"] == 5.0
         assert result["monthly_committed_spend_expiring"] == pytest.approx(
-            5.0 * analyze.HOURS_PER_MONTH
+            5.0 * api.HOURS_PER_MONTH
         )
 
     def test_reservation_units_are_never_converted_to_money(self):
         """Turning unit counts into dollars needs pricing this module does not
         query — inventing a rate would be a fabricated figure."""
         end = (AS_OF + timedelta(days=20)).isoformat()
-        result = analyze.analyze_expiry([ri_item(end, quantity=7.0)], AS_OF, 90)
+        result = expiry.analyze_expiry([ri_item(end, quantity=7.0)], AS_OF, 90)
         assert result["reserved_units_expiring"] == 7.0
         assert result["hourly_commitment_expiring"] == 0.0
         assert result["monthly_committed_spend_expiring"] == 0.0
@@ -536,14 +585,14 @@ class TestExpiryRollup:
             sp_item((AS_OF + timedelta(days=45)).isoformat(), commitment_id="b"),
             sp_item((AS_OF + timedelta(days=200)).isoformat(), commitment_id="far"),
         ]
-        result = analyze.analyze_expiry(items, AS_OF, 90, sp_utilization_pct=99.0)
+        result = expiry.analyze_expiry(items, AS_OF, 90, sp_utilization_pct=99.0)
         assert result["counts"] == {"urgent": 1, "soon": 1, "upcoming": 0}
-        assert result["actions"][analyze.RENEW] == 2
+        assert result["actions"][expiry.RENEW] == 2
         assert result["total_active"] == 3
 
     def test_as_of_is_injected_so_the_function_stays_pure(self):
         end = (AS_OF + timedelta(days=5)).isoformat()
-        assert analyze.analyze_expiry([sp_item(end)], AS_OF, 90)["as_of"] == (
+        assert expiry.analyze_expiry([sp_item(end)], AS_OF, 90)["as_of"] == (
             "2026-09-04"
         )
 
@@ -603,12 +652,12 @@ class TestCollectExpiry:
                 )
             return StubDescribe()
 
-        expiry, errors = collect.collect_expiry(
+        result, _, errors = collect.collect_expiry(
             clients(factory), ["us-east-1", "eu-west-1", "ap-northeast-1"],
             ["ec2"], 90, as_of=AS_OF,
         )
         assert sp_calls["n"] == 1
-        assert len(expiry["expiring"]) == 1
+        assert len(result["expiring"]) == 1
         assert errors == []
 
     def test_reservations_are_swept_per_region(self):
@@ -647,10 +696,10 @@ class TestCollectExpiry:
                 }
             )
 
-        expiry, errors = collect.collect_expiry(
+        result, _, errors = collect.collect_expiry(
             clients(factory), ["us-east-1"], ["ec2", "rds"], 90, as_of=AS_OF
         )
-        assert [e["commitment_id"] for e in expiry["expiring"]] == ["ri-ok"]
+        assert [e["commitment_id"] for e in result["expiring"]] == ["ri-ok"]
         assert len(errors) == 1
         assert "rds" in errors[0]["query"]
 
@@ -659,12 +708,38 @@ class TestCollectExpiry:
             collect.collect_expiry(clients(), ["us-east-1"], ["dynamodb"])
 
     def test_regions_and_blind_spots_are_carried_into_the_result(self):
-        expiry, _ = collect.collect_expiry(
+        result, _, _ = collect.collect_expiry(
             clients(lambda s, r: StubDescribe()), ["us-east-1"], ["ec2"], 90,
             as_of=AS_OF,
         )
-        assert expiry["regions"] == ["us-east-1"]
-        assert expiry["blind_spots"] == list(api.INVENTORY_BLIND_SPOTS)
+        assert result["regions"] == ["us-east-1"]
+        assert result["blind_spots"] == list(inventory.INVENTORY_BLIND_SPOTS)
+
+    def test_utilization_is_queried_only_for_services_the_inventory_found(self):
+        """An account with no RDS reservations pays nothing for RDS utilization,
+        and an EC2 renewal is judged on EC2's figure — not an unfiltered one."""
+        ce = StubCostExplorer()
+        ce.utilization = {"Amazon Elastic Compute Cloud - Compute": 40.0}
+
+        def factory(service, region):
+            if service == "savingsplans":
+                return StubSavingsPlans()
+            if service == "ec2":
+                return StubDescribe({"ReservedInstances": [{
+                    "ReservedInstancesId": "ri-1", "InstanceCount": 1,
+                    "InstanceType": "m5.large",
+                    "Start": datetime(2025, 10, 1, tzinfo=timezone.utc),
+                    "End": datetime(2026, 9, 20, tzinfo=timezone.utc),
+                    "State": "active"}]})
+            return StubDescribe()
+
+        result, _, _ = collect.collect_expiry(
+            clients(factory, ce), ["us-east-1"], ["ec2", "rds"], 90, as_of=AS_OF
+        )
+        filtered = [k["Filter"]["Dimensions"]["Values"] for n, k in ce.calls if n == "ri_utilization"]
+        assert filtered == [["Amazon Elastic Compute Cloud - Compute"]]
+        assert result["expiring"][0]["utilization_pct"] == 40.0
+        assert result["expiring"][0]["action"] == expiry.LET_LAPSE
 
 
 @pytest.mark.unit
@@ -678,17 +753,24 @@ class TestCollectAllIntegration:
             called["n"] += 1
             return StubDescribe()
 
-        payload = collect.collect_all(clients(factory), families=["sp"])
+        payload = collect.collect_all(
+            clients(factory), families=["sp"], sp_types=["COMPUTE_SP"]
+        )
         assert payload["expiry"] is None
         assert called["n"] == 0
 
-    def test_expiry_errors_are_kept_out_of_the_billable_query_count(self):
-        """queries_run exists to track Cost Explorer's $0.01-per-request
-        billing; free Describe* failures must not inflate it."""
+    def test_queries_run_counts_cost_explorer_requests_only(self):
+        """queries_run tracks Cost Explorer's $0.01-per-request billing. Every
+        CE request counts — coverage and utilization included — while the
+        free Describe* inventory calls do not."""
+        ce = StubCostExplorer()
         payload = collect.collect_all(
-            clients(None), families=["sp"], regions=["us-east-1"]
+            clients(None, ce), families=["sp"], sp_types=["COMPUTE_SP"],
+            terms=["ONE_YEAR"], payments=["NO_UPFRONT"], regions=["us-east-1"],
         )
         assert payload["expiry"] is not None
+        assert payload["queries_run"] == len(ce.calls)
+        assert payload["estimated_api_cost_usd"] == pytest.approx(len(ce.calls) * 0.01)
         assert len(payload["errors"]) > len(payload["sweep_errors"])
 
     def test_invalid_region_is_rejected_by_collect_all_too(self):
@@ -709,7 +791,7 @@ def payload_with_expiry(expiry) -> dict:
             "account_scope": "PAYER",
         },
         "findings": [],
-        "posture": {"blockers": [], "notes": []},
+        "posture": {"blockers": [], "notes": [], "unmeasured": []},
         "reconciliation": {"status": "unavailable", "reason": "not enrolled"},
         "eligible_spend": {"periods": []},
         "expiry": expiry,
@@ -720,7 +802,7 @@ def payload_with_expiry(expiry) -> dict:
 @pytest.mark.unit
 class TestExpiryReporting:
     def _expiry(self, **overrides):
-        base = analyze.analyze_expiry(
+        base = expiry.analyze_expiry(
             [
                 sp_item((AS_OF + timedelta(days=12)).isoformat(), quantity=5.5),
                 ri_item((AS_OF + timedelta(days=70)).isoformat(), quantity=4.0),
@@ -728,10 +810,10 @@ class TestExpiryReporting:
             AS_OF,
             90,
             sp_utilization_pct=99.0,
-            ri_utilization_pct=40.0,
+            ri_utilization_by_service={"ec2": 40.0},
         )
         base["regions"] = ["ap-northeast-1"]
-        base["blind_spots"] = list(api.INVENTORY_BLIND_SPOTS)
+        base["blind_spots"] = list(inventory.INVENTORY_BLIND_SPOTS)
         base.update(overrides)
         return base
 
@@ -754,9 +836,10 @@ class TestExpiryReporting:
         md = report.render(payload_with_expiry(self._expiry()))
         assert "needs per-instance pricing" in md
 
-    def test_account_level_utilization_caveat_is_stated(self):
+    def test_service_level_utilization_caveat_is_stated(self):
         md = report.render(payload_with_expiry(self._expiry()))
-        assert "not\nper-commitment" in md or "not per-commitment" in md
+        assert "service-level figure" in md
+        assert "No API reports utilization for an individual" in md
 
     def test_dynamodb_blind_spot_is_disclosed(self):
         md = report.render(payload_with_expiry(self._expiry()))
@@ -764,18 +847,18 @@ class TestExpiryReporting:
         assert "DynamoDB" in md
 
     def test_nothing_expiring_says_so_rather_than_printing_an_empty_table(self):
-        expiry = self._expiry(expiring=[], counts={"urgent": 0, "soon": 0, "upcoming": 0})
-        md = report.render(payload_with_expiry(expiry))
+        result = self._expiry(expiring=[], counts={"urgent": 0, "soon": 0, "upcoming": 0})
+        md = report.render(payload_with_expiry(result))
         assert "No commitment expires within 90 days" in md
         assert "| Ends | Days |" not in md
 
     def test_expired_but_active_gets_its_own_subsection(self):
-        expiry = analyze.analyze_expiry(
+        result = expiry.analyze_expiry(
             [sp_item((AS_OF - timedelta(days=3)).isoformat())], AS_OF, 90,
             sp_utilization_pct=99.0,
         )
-        expiry["regions"] = ["us-east-1"]
-        md = report.render(payload_with_expiry(expiry))
+        result["regions"] = ["us-east-1"]
+        md = report.render(payload_with_expiry(result))
         assert "Already ended but still listed as active" in md
 
     def test_payload_without_expiry_still_renders(self):
@@ -789,3 +872,137 @@ class TestExpiryReporting:
         payload = payload_with_expiry(None)
         del payload["expiry"]
         assert "## Bottom line" in report.render(payload)
+
+
+# ----------------------------------------------------------- queued renewals
+
+
+def queued(item: dict, start: str, commitment_id: str = "q-1", **overrides) -> dict:
+    return {**item, "commitment_id": commitment_id, "state": "queued", "start": start,
+            "end": "2029-01-01", **overrides}
+
+
+@pytest.mark.unit
+class TestQueuedRenewals:
+    def test_an_already_queued_renewal_is_not_told_to_renew(self):
+        """Renewing again would double-commit the same usage for a full term."""
+        end = (AS_OF + timedelta(days=20)).isoformat()
+        current = {**ri_item(end), "instance_type": "m5.large", "spec": "m5.large", "state": "active"}
+        result = expiry.analyze_expiry(
+            [current, queued(current, end)], AS_OF, 90,
+            ri_utilization_by_service={"ec2": 99.0},
+        )
+        [entry] = result["expiring"]
+        assert entry["action"] == expiry.RENEWAL_QUEUED
+        assert "Do not buy it again" in entry["rationale"]
+        assert result["actions"][expiry.RENEWAL_QUEUED] == 1
+        assert [q["commitment_id"] for q in result["queued"]] == ["q-1"]
+        # A queued renewal keeps the discount, so it is not exposure.
+        assert result["reserved_units_expiring"] == 0
+        assert result["total_active"] == 1
+
+    def test_a_queued_purchase_of_a_different_spec_does_not_count(self):
+        end = (AS_OF + timedelta(days=20)).isoformat()
+        current = {**ri_item(end), "instance_type": "db.r6g.large",
+                   "spec": "db.r6g.large · Multi-AZ", "state": "active"}
+        other = queued(current, end, spec="db.r6g.large · Single-AZ")
+        result = expiry.analyze_expiry([current, other], AS_OF, 90,
+                                       ri_utilization_by_service={"ec2": 99.0})
+        assert result["expiring"][0]["action"] == expiry.RENEW
+
+    def test_a_partial_queued_renewal_says_how_much_it_covers(self):
+        end = (AS_OF + timedelta(days=20)).isoformat()
+        current = {**ri_item(end, quantity=4.0), "state": "active"}
+        result = expiry.analyze_expiry([current, queued(current, end, quantity=1.0)], AS_OF, 90)
+        assert "covers 1 of the 4 expiring" in result["expiring"][0]["rationale"]
+
+    def test_queued_and_redshift_pending_states_are_inventoried(self):
+        rows = {"ReservedNodes": [
+            {"ReservedNodeId": "rs-1", "NodeCount": 2, "NodeType": "ra3.xlplus",
+             "StartTime": datetime(2025, 10, 1, tzinfo=timezone.utc),
+             "Duration": ONE_YEAR_SECONDS, "State": "pending-payment"},
+        ]}
+        result = inventory.get_reservation_inventory(
+            clients(lambda s, r: StubDescribe(rows)), "redshift", "us-east-1"
+        )
+        assert [i["commitment_id"] for i in result["items"]] == ["rs-1"]
+
+        ec2 = {"ReservedInstances": [
+            {"ReservedInstancesId": "ri-q", "InstanceCount": 1, "InstanceType": "m5.large",
+             "Start": datetime(2026, 10, 1, tzinfo=timezone.utc),
+             "End": datetime(2027, 10, 1, tzinfo=timezone.utc), "State": "queued"},
+        ]}
+        result = inventory.get_reservation_inventory(
+            clients(lambda s, r: StubDescribe(ec2)), "ec2", "us-east-1"
+        )
+        assert result["items"][0]["state"] == "queued"
+
+
+# ------------------------------------------------------- inventory pagination
+
+
+class PagedDescribe:
+    """A Describe* API that pages on `Marker` (paginator) or `NextToken`."""
+
+    def __init__(self, pages: list[dict], paginated: bool):
+        self.pages = pages
+        self.paginated = paginated
+        self.calls: list[dict] = []
+
+    def can_paginate(self, name):
+        return self.paginated
+
+    def get_paginator(self, name):
+        stub = self
+
+        class Paginator:
+            def paginate(self):
+                return iter(stub.pages)
+
+        return Paginator()
+
+    def describe_reserved_instances(self, **kwargs):
+        self.calls.append(kwargs)
+        index = int(kwargs.get("NextToken", 0))
+        page = dict(self.pages[index])
+        if index + 1 < len(self.pages):
+            page["NextToken"] = str(index + 1)
+        return page
+
+    describe_reserved_db_instances = describe_reserved_instances
+
+
+def rds_row(n: int, state: str = "active") -> dict:
+    return {"ReservedDBInstanceId": f"rds-{n}", "DBInstanceCount": 1,
+            "DBInstanceClass": "db.r6g.large",
+            "StartTime": datetime(2025, 10, 1, tzinfo=timezone.utc),
+            "Duration": ONE_YEAR_SECONDS, "State": state}
+
+
+@pytest.mark.unit
+class TestInventoryPagination:
+    def test_paginator_pages_are_all_read(self):
+        """Retired rows fill page one; the live reservation is on page two."""
+        pages = [
+            {"ReservedDBInstances": [rds_row(n, "retired") for n in range(100)]},
+            {"ReservedDBInstances": [rds_row(999)]},
+        ]
+        stub = PagedDescribe(pages, paginated=True)
+        result = inventory.get_reservation_inventory(clients(lambda s, r: stub), "rds", "us-east-1")
+        assert [i["commitment_id"] for i in result["items"]] == ["rds-999"]
+
+    def test_next_token_is_followed_where_botocore_has_no_paginator(self):
+        pages = [
+            {"ReservedInstances": [{"ReservedInstanceId": "os-1", "InstanceCount": 1,
+                                    "InstanceType": "r6g.large.search", "State": "active",
+                                    "StartTime": datetime(2025, 10, 1, tzinfo=timezone.utc),
+                                    "Duration": ONE_YEAR_SECONDS}]},
+            {"ReservedInstances": [{"ReservedInstanceId": "os-2", "InstanceCount": 1,
+                                    "InstanceType": "r6g.large.search", "State": "active",
+                                    "StartTime": datetime(2025, 10, 1, tzinfo=timezone.utc),
+                                    "Duration": ONE_YEAR_SECONDS}]},
+        ]
+        stub = PagedDescribe(pages, paginated=False)
+        result = inventory.get_reservation_inventory(clients(lambda s, r: stub), "opensearch", "us-east-1")
+        assert [i["commitment_id"] for i in result["items"]] == ["os-1", "os-2"]
+        assert stub.calls == [{}, {"NextToken": "1"}]

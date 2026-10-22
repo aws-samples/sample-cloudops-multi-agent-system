@@ -231,10 +231,49 @@ class StubCOH:
 @pytest.mark.unit
 def test_coh_enrollment_active():
     coh = StubCOH(
-        enrollment={"items": [{"status": "Active", "accountId": "1"}], "includeMemberAccounts": True}
+        enrollment={"items": [{"status": "Active", "accountId": "111122223333"}],
+                    "includeMemberAccounts": True}
     )
     result = api.get_coh_enrollment(clients(coh=coh))
     assert result["enrolled"] is True
+
+
+@pytest.mark.unit
+def test_coh_enrollment_reads_the_callers_row_not_the_first_member():
+    """With organization info on, items[0] can be any member account."""
+    coh = StubCOH(enrollment={"items": [
+        {"status": "Inactive", "accountId": "999999999999"},
+        {"status": "Active", "accountId": "111122223333"},
+    ]})
+    result = api.get_coh_enrollment(clients(coh=coh))
+    assert result["enrolled"] is True
+    assert result["account_id"] == "111122223333"
+
+
+@pytest.mark.unit
+def test_coh_returns_one_option_per_resource():
+    """includeAllRecommendations=True returns every alternative, which sum."""
+    coh = StubCOH(items=[])
+    api.get_coh_commitment_recommendations(clients(coh=coh))
+    assert coh.paginate_kwargs["includeAllRecommendations"] is False
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("response", "expected"),
+    [
+        ({"preferredCommitment": {"term": "OneYear", "paymentOption": "NoUpfront"}},
+         ("ONE_YEAR", "NO_UPFRONT", False)),
+        ({}, ("THREE_YEARS", "ALL_UPFRONT", True)),
+    ],
+)
+def test_coh_preferences_map_to_cost_explorer_enums(response, expected):
+    class PrefCOH:
+        def get_preferences(self):
+            return response
+
+    result = api.get_coh_preferences(clients(coh=PrefCOH()))
+    assert (result["term"], result["payment"], result["assumed_default"]) == expected
 
 
 @pytest.mark.unit

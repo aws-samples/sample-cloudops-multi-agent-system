@@ -41,35 +41,43 @@ Do **not** use this skill for rightsizing, idle-resource, or Graviton-migration 
 
 **Every call in steps 1–5 needs `--region us-east-1`.** Cost Explorer purchase recommendations and Cost Optimization Hub are us-east-1-only regardless of where the resources live. The one exception is the reservation inventory in step 6: reservations are regional and must be queried in the region they were bought in. Add `--profile <name>` to every command if the user named a profile.
 
-**Cost:** Cost Explorer bills **$0.01 per recommendation request**. Sweep narrow by default; widen only when asked. The step 3 posture calls and the step 6 `Describe*` calls are free — never quote them in a cost estimate.
+**Cost:** Cost Explorer bills **$0.01 per request** — every `aws ce` call in steps 1–4, posture and spend included, and every page of a paginated one. Sweep narrow by default; widen only when asked. Cost Optimization Hub (step 5) and the step 6 `Describe*` calls are free. Count your `aws ce` calls and state the cost in the report.
 
 **Production caution:** use the least-privileged read-only profile available. Commitment purchases are non-cancellable financial obligations — this report is input to a decision, never authorization for one.
 
 ## Query it
 
-Enums, verified against the CLI: `--savings-plans-type` is `COMPUTE_SP` | `EC2_INSTANCE_SP` | `SAGEMAKER_SP` | `DATABASE_SP`; `--term-in-years` is `ONE_YEAR` | `THREE_YEARS`; `--payment-option` is `NO_UPFRONT` | `PARTIAL_UPFRONT` | `ALL_UPFRONT`; `--lookback-period-in-days` is `SEVEN_DAYS` | `THIRTY_DAYS` | `SIXTY_DAYS`; `--account-scope` is `PAYER` (whole org) | `LINKED` (this account).
+Enums, verified against the CLI: `--savings-plans-type` is `COMPUTE_SP` | `EC2_INSTANCE_SP` | `SAGEMAKER_SP` | `DATABASE_SP`; `--term-in-years` is `ONE_YEAR` | `THREE_YEARS`; `--payment-option` is `NO_UPFRONT` | `PARTIAL_UPFRONT` | `ALL_UPFRONT`; `--lookback-period-in-days` is `SEVEN_DAYS` | `THIRTY_DAYS` | `SIXTY_DAYS`; `--account-scope` is `PAYER` (sized against the whole organization's usage) | `LINKED` (each member account sized individually — one detail line per account).
 
 ### 1. Savings Plans sizing
 
-One call per (type, term, payment). `--query` trims the response to the eight fields the method needs — send it, or you will pull tens of KB of instance detail into context.
+One call per (type, term, payment). `--query` trims the response to the fields the method needs — send it, or you will pull tens of KB of instance detail into context. This API is **not** auto-paginated by the CLI: if `next` comes back non-null, repeat the call with `--next-page-token <next>` and append the details (each page is another billed request). Compare `count` with the number of details you collected; a shortfall understates upfront and every floor.
 
 ```bash
 aws ce get-savings-plans-purchase-recommendation --region us-east-1 \
   --savings-plans-type COMPUTE_SP --term-in-years ONE_YEAR \
   --payment-option NO_UPFRONT --lookback-period-in-days THIRTY_DAYS \
   --account-scope PAYER \
-  --query 'SavingsPlansPurchaseRecommendation.{
+  --query '{next: NextPageToken, rec: SavingsPlansPurchaseRecommendation.{
       commit_hr: SavingsPlansPurchaseRecommendationSummary.HourlyCommitmentToPurchase,
       savings_mo: SavingsPlansPurchaseRecommendationSummary.EstimatedMonthlySavingsAmount,
       savings_pct: SavingsPlansPurchaseRecommendationSummary.EstimatedSavingsPercentage,
-      ondemand_mo: SavingsPlansPurchaseRecommendationSummary.CurrentOnDemandSpend,
+      ondemand_lookback: SavingsPlansPurchaseRecommendationSummary.CurrentOnDemandSpend,
+      count: SavingsPlansPurchaseRecommendationSummary.TotalRecommendationCount,
+      currency: SavingsPlansPurchaseRecommendationSummary.CurrencyCode,
       detail: SavingsPlansPurchaseRecommendationDetails[].{
-          floor_hr: CurrentMinimumHourlyOnDemandSpend,
-          avg_hr: CurrentAverageHourlyOnDemandSpend,
+          floor_od_hr: CurrentMinimumHourlyOnDemandSpend,
+          avg_od_hr: CurrentAverageHourlyOnDemandSpend,
+          sp_cost: EstimatedSPCost, sp_savings: EstimatedSavingsAmount,
           upfront: UpfrontCost, est_util: EstimatedAverageUtilization,
           commit_hr: HourlyCommitmentToPurchase,
-          spec: SavingsPlansDetails}}'
+          savings_mo: EstimatedMonthlySavingsAmount,
+          account: AccountId, spec: SavingsPlansDetails}}}'
 ```
+
+`floor_od_hr` and `avg_od_hr` are in **on-demand** dollars; `commit_hr` is in
+**Savings Plan** dollars. `sp_cost` and `sp_savings` are what converts one into
+the other — `reference/method.md` step 1. Do not compare them unconverted.
 
 `SavingsPlansDetails` carries `InstanceFamily` and `Region` for an
 `EC2_INSTANCE_SP` — the two things that plan is pinned to, and therefore the two
@@ -90,7 +98,7 @@ for term in ONE_YEAR THREE_YEARS; do for pay in NO_UPFRONT ALL_UPFRONT; do
 done; done
 ```
 
-**Default scope: `COMPUTE_SP` across both terms × `NO_UPFRONT`/`ALL_UPFRONT` — 4 calls, $0.04.** Compute SPs are the flexible instrument that fits most accounts. Add `EC2_INSTANCE_SP` when the fleet is stable and single-family, `SAGEMAKER_SP`/`DATABASE_SP` only when that spend exists. Add `PARTIAL_UPFRONT` only on request — it rarely wins and doubles the sweep.
+**Default scope: `COMPUTE_SP` across both terms × `NO_UPFRONT`/`ALL_UPFRONT` — 4 recommendation calls plus the step 3 posture calls, ~$0.08.** Compute SPs are the flexible instrument that fits most accounts. Add `EC2_INSTANCE_SP` when the fleet is stable and single-family, `SAGEMAKER_SP`/`DATABASE_SP` only when that spend exists. Add `PARTIAL_UPFRONT` only on request — it rarely wins and doubles the sweep.
 
 ### 2. Reserved Instance sizing
 
@@ -142,11 +150,11 @@ binding (the discount follows any size in the family), and
 `CurrentGeneration: false` means a three-year commitment locks the account out of
 the cheaper current generation for the whole term.
 
-For **EC2 only**, add `--service-specification OfferingClass=STANDARD`; RDS, Redshift and the rest reject it. For **DynamoDB**, the unit fields are named `RecommendedNumberOfCapacityUnitsToPurchase` / `MinimumNumberOfCapacityUnitsUsedPerHour` / `AverageNumberOfCapacityUnitsUsedPerHour` instead. Query only services the account actually uses — check step 4 first.
+For **EC2 only**, add `--service-specification OfferingClass=STANDARD`; RDS, Redshift and the rest reject it. For **DynamoDB**, the unit fields are named `RecommendedNumberOfCapacityUnitsToPurchase` / `MinimumNumberOfCapacityUnitsUsedPerHour` / `AverageNumberOfCapacityUnitsUsedPerHour` instead. Query only services the account actually uses — check step 4 first. The CLI auto-paginates this API, so every detail line is returned.
 
 ### 3. Existing commitment posture — run this before quoting any savings
 
-Four calls, not billed as recommendations. Substitute real dates (30 days back → today):
+Billed at $0.01 each. Substitute real dates (30 days back → today). The two **reservation** calls take a `SERVICE` filter and must be run **once per service you are sizing or renewing** — without the filter Cost Explorer reports EC2 only, and an RDS decision would be judged on EC2's figure:
 
 ```bash
 aws ce get-savings-plans-coverage --region us-east-1 \
@@ -157,16 +165,19 @@ aws ce get-savings-plans-utilization --region us-east-1 \
   --time-period Start=2026-08-04,End=2026-09-03 --granularity MONTHLY \
   --query 'Total.Utilization.[UtilizationPercentage,UnusedCommitment]' --output text
 
+SVC="Amazon Relational Database Service"   # repeat per service
 aws ce get-reservation-coverage --region us-east-1 \
   --time-period Start=2026-08-04,End=2026-09-03 --granularity MONTHLY \
+  --filter "{\"Dimensions\":{\"Key\":\"SERVICE\",\"Values\":[\"$SVC\"]}}" \
   --query 'Total.CoverageHours.[CoverageHoursPercentage,OnDemandHours]' --output text
 
 aws ce get-reservation-utilization --region us-east-1 \
   --time-period Start=2026-08-04,End=2026-09-03 --granularity MONTHLY \
-  --query 'Total.[UtilizationPercentage,UnusedHours,RealizedSavings]' --output text
+  --filter "{\"Dimensions\":{\"Key\":\"SERVICE\",\"Values\":[\"$SVC\"]}}" \
+  --query 'Total.[UtilizationPercentage,PurchasedHours,UnusedHours,RealizedSavings]' --output text
 ```
 
-All-zero results mean **no commitment exists**, not 0% utilization on a broken one. Say which it is.
+All-zero results mean **no commitment exists**, not 0% utilization on a broken one. Say which it is. `DataUnavailableException` means the same — nothing held. Any *other* error (AccessDenied, a window older than Cost Explorer retains) means posture could **not** be measured: say so, and do not treat the gate as passed.
 
 ### 4. Eligible spend — what is even commitable
 
@@ -185,15 +196,27 @@ Run this first when the user has no specific target: an account whose bill is se
 ### 5. Reconciliation (optional second opinion)
 
 ```bash
+ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
 aws cost-optimization-hub list-enrollment-statuses --region us-east-1 \
-  --query 'items[0].status' --output text
+  --include-organization-info \
+  --query "items[?accountId=='$ACCOUNT'].status | [0]" --output text
+
+aws cost-optimization-hub get-preferences --region us-east-1 \
+  --query 'preferredCommitment.[term,paymentOption]' --output text
 
 aws cost-optimization-hub list-recommendations --region us-east-1 \
+  --no-include-all-recommendations \
   --filter '{"actionTypes":["PurchaseSavingsPlans","PurchaseReservedInstances"]}' \
-  --query 'items[].[currentResourceType,estimatedMonthlySavings]' --output text
+  --query 'items[].[recommendedResourceType,estimatedMonthlySavings]' --output text
 ```
 
-`NOT_ENROLLED` or an empty list is fine — report that reconciliation was unavailable.
+Read your own account's enrollment row — with organization info on, `items[0]`
+can be any member. COH prices every commitment at the **one** preferred term and
+payment `get-preferences` returns (3-year All Upfront by default), so compare it
+only against your step 1–2 findings at that same permutation, one option per
+usage pool on both sides, and leave Database Savings Plans out (COH has no such
+type) — `reference/method.md`, *Reconciliation*. `NOT_ENROLLED` or an empty list
+is fine — report that reconciliation was unavailable.
 
 ### 6. Expiry inventory — what is already committed, and when it lapses
 
@@ -205,13 +228,15 @@ Savings Plans — one call, `end` comes back directly:
 
 ```bash
 aws savingsplans describe-savings-plans --region us-east-1 \
-  --states active payment-pending \
+  --states active payment-pending queued \
   --query 'savingsPlans[].[savingsPlanId,savingsPlanType,commitment,end,state,paymentOption,ec2InstanceFamily,region]' \
   --output text
 ```
 
 `ec2InstanceFamily` and `region` are populated only for an `EC2Instance` plan;
-blank on a `Compute` plan is correct.
+blank on a `Compute` plan is correct. A **`queued`** plan is a renewal already
+scheduled — match it against what is expiring before recommending a renewal,
+so the same commitment is never bought twice.
 
 Reservations — one call per (service, region). Only EC2 returns an end date; the rest return `StartTime` plus `Duration` in **seconds**, so derive `end = StartTime + Duration` yourself (31536000s = 1 year, 94608000s = 3 years):
 
@@ -219,7 +244,7 @@ Reservations — one call per (service, region). Only EC2 returns an end date; t
 REGION=ap-northeast-1
 
 aws ec2 describe-reserved-instances --region $REGION \
-  --query 'ReservedInstances[?State==`active`].[ReservedInstancesId,InstanceType,InstanceCount,End,OfferingType,Scope,AvailabilityZone,ProductDescription,OfferingClass,InstanceTenancy]' \
+  --query 'ReservedInstances[?State==`active` || State==`queued`].[ReservedInstancesId,State,InstanceType,InstanceCount,End,OfferingType,Scope,AvailabilityZone,ProductDescription,OfferingClass,InstanceTenancy]' \
   --output text
 
 aws rds describe-reserved-db-instances --region $REGION \
@@ -231,7 +256,7 @@ aws elasticache describe-reserved-cache-nodes --region $REGION \
   --output text
 
 aws redshift describe-reserved-nodes --region $REGION \
-  --query 'ReservedNodes[?State==`active`].[ReservedNodeId,NodeType,NodeCount,StartTime,Duration,ReservedNodeOfferingType]' \
+  --query 'ReservedNodes[?State==`active` || State==`pending-payment`].[ReservedNodeId,NodeType,NodeCount,StartTime,Duration,ReservedNodeOfferingType]' \
   --output text
 
 aws opensearch describe-reserved-instances --region $REGION \
@@ -243,7 +268,7 @@ aws memorydb describe-reserved-nodes --region $REGION \
   --output text
 ```
 
-The id, count and type fields are named differently in every one of these — copy them as written rather than reusing EC2's. A typo yields rows with blank ids and no expiry rather than an error.
+The id, count and type fields are named differently in every one of these — copy them as written rather than reusing EC2's. A typo yields rows with blank ids and no expiry rather than an error. Two state spellings differ: EC2 adds `queued` (a scheduled renewal), and Redshift writes `pending-payment` where the others write `payment-pending`. The CLI pages through RDS, ElastiCache, Redshift and MemoryDB automatically; for OpenSearch, repeat with `--next-token` while one is returned — retired rows fill pages too, so a live reservation can sit on page two.
 
 The trailing fields are what a **renewal has to match**, and they are the whole
 point of listing them: an RDS reservation covers one deployment option and one
@@ -254,17 +279,17 @@ Multi-AZ, `false` is Single-AZ, and an absent field means AWS did not report it 
 do not read absence as Single-AZ. OpenSearch and MemoryDB reservations expose no
 engine or product field at all, so their spec is the node type alone.
 
-**DynamoDB reserved capacity cannot be inventoried at all** — no describe API exists for it, in any SDK. If the account uses it, say so explicitly rather than reporting "nothing expiring".
+**DynamoDB reserved capacity cannot be inventoried at all** — no describe API exists for it, in any SDK. If the account uses it, say so explicitly rather than reporting "nothing expiring". **Neither can another account's purchases:** these calls list only the calling account's own commitments, while PAYER-scope posture includes every member's. Say so when the account is a payer.
 
-Then read the renewal rules in [`reference/method.md`](reference/method.md) to turn each expiring commitment into renew / renew-smaller / let-lapse. Utilization is published only account-wide, never per commitment, so every verdict is directional — state that once, in the section, and do not imply otherwise per row.
+Then read the renewal rules in [`reference/method.md`](reference/method.md) to turn each expiring commitment into renew / renew-smaller / let-lapse. Utilization is published per service (Savings Plans, and each reservation service via the step 3 filter), never per commitment, so every verdict is directional — state that once, in the section, and do not imply otherwise per row.
 
 ## Then risk-adjust
 
-Read [`reference/method.md`](reference/method.md) and apply it. **It is required, not optional** — the AWS numbers are unadjusted best case, and emitting them as achievable is the exact error this skill exists to prevent. It gives you the volatility bands, the commitment formula, break-even and waste-exposure arithmetic, the posture gate, and the reconciliation thresholds.
+Read [`reference/method.md`](reference/method.md) and apply it. **It is required, not optional** — the AWS numbers are unadjusted best case, and emitting them as achievable is the exact error this skill exists to prevent. It gives you the per-line sizing, the Savings Plan floor conversion, cash break-even and waste-exposure arithmetic, the posture gate, the usage pools that decide which findings are alternatives, and the reconciliation rules.
 
 Then format per [`reference/output-template.md`](reference/output-template.md).
 
-Show your arithmetic for each finding — the trough÷average ratio, the band it lands in, and the resulting commitment. A reviewer must be able to recheck a figure without re-querying AWS.
+Show your arithmetic for each finding — for a Savings Plan the conversion ratio `r` first, then the trough÷average ratio, the band it lands in, and the resulting commitment. A reviewer must be able to recheck a figure without re-querying AWS.
 
 ## Delegate
 
@@ -276,12 +301,13 @@ Interpret what they return; if it carries an error (no credentials, `AccessDenie
 
 ## Constraints — do not violate
 
-- **Read-only.** Only `ce:Get*`, `cost-optimization-hub:List*`, the `Describe*` reads in step 6, and `sts:GetCallerIdentity`. Never `CreateSavingsPlan`, `PurchaseReservedInstances*`, `StartCommitmentPurchaseAnalysis`, `ModifyReservedInstances`, `DeleteQueuedSavingsPlan`, `ReturnSavingsPlan`, or any other mutating or billable API. This skill *sizes* and *reports on* commitments; it never buys, renews, modifies or cancels one.
+- **Read-only.** Only `ce:Get*`, `cost-optimization-hub:List*` and `GetPreferences`, the `Describe*` reads in step 6, and `sts:GetCallerIdentity`. Never `CreateSavingsPlan`, `PurchaseReservedInstances*`, `StartCommitmentPurchaseAnalysis`, `ModifyReservedInstances`, `DeleteQueuedSavingsPlan`, `ReturnSavingsPlan`, or any other mutating or billable API. This skill *sizes* and *reports on* commitments; it never buys, renews, modifies or cancels one.
 - **Never present the AWS best case as achievable.** Quote the risk-adjusted figure as the recommendation and the AWS figure as the ceiling, in that order.
+- **Never add alternatives together.** A Compute SP, an EC2 Instance SP and EC2 RIs discount the same usage; so do a Database SP and the database RIs. Recommend one option per usage pool and list the rest as alternatives (`reference/method.md`).
 - **Never fabricate figures.** Every number traces to a command above or to arithmetic you show. A query you did not run is not a number you have.
 - **Lead with blockers.** Under-utilized existing commitments come before the savings figure, always. A commitment expiring inside 30 days outranks any new purchase — it is a deadline, not an option.
 - **Never recommend a reservation without its specification.** Instance type, and the deployment option for RDS/Aurora (Multi-AZ vs Single-AZ) plus the Availability Zone for a zonal EC2 reservation, decide whether the discount applies at all. A unit count with no spec is not a recommendation anyone can act on — and never present a total that spans several specifications as a single purchase.
-- **Never imply per-commitment utilization.** AWS publishes it account-wide only. Quoting one commitment as "98% utilized" when that is the account figure is a fabricated attribution.
+- **Never imply per-commitment utilization.** AWS publishes it per service only. Quoting one commitment as "98% utilized" when that is the account figure is a fabricated attribution.
 - **Do not average Cost Explorer and Cost Optimization Hub when they disagree materially.** Identify the cause. A blended number is defensible to nobody.
 - **Region is pinned** to us-east-1 for every Cost Explorer, Cost Optimization Hub and Savings Plans command. Only the step 6 reservation inventory varies by region, and it must name the regions swept.
 - **No credential exfiltration.** Never emit access keys, session tokens, or SSO refresh tokens. Account ID and profile name are fine.
@@ -296,9 +322,10 @@ Interpret what they return; if it carries an error (no credentials, `AccessDenie
 | `DataUnavailableException`, blank message | Cost Explorer returns it with an empty `Message` when the account holds no commitment of that kind. Report "no existing commitment of this type", not a blank error. |
 | `ValidationException` on `--service` | The name is not one of the 8 above. Do not guess — copy the API's own "Supported value(s)" list from the error. |
 | COH not enrolled | Continue. State that figures rest on Cost Explorer alone. |
-| Throttling / `AccessDenied` on some queries | Continue with what succeeded. List every failed query and present totals explicitly as a lower bound. |
-| A `$0` / no-recommendation result | A real result. Check eligible spend (step 4) and say why there is nothing to commit against. |
-| Posture queries all fail | Say posture could not be measured and that recommendations are unvalidated against existing commitments. |
+| Throttling / `AccessDenied` on some queries | Continue with what succeeded. List every failed query and present totals explicitly as a lower bound. Retry throttled calls (`LimitExceededException`) with backoff before giving up. |
+| **Every** recommendation query fails | Stop and report the error and its likely cause. Produce no report — this is **not** a "no opportunity" result. |
+| A `$0` / no-recommendation result | A real result **only if no query failed**. Check eligible spend (step 4) and say why there is nothing to commit against. With failed queries, say the result is incomplete. |
+| Posture queries fail (other than `DataUnavailableException`) | Say posture could not be measured and that recommendations are unvalidated against existing commitments. Do not treat the gate as passed. |
 | Member account, `PAYER` scope | The figure is org-aggregated and not purchasable by that account. Re-run with `--account-scope LINKED`. |
 | Expiry inventory returns nothing | Distinguish "no commitment exists" from "wrong region" — reservations only appear in the region they were bought in. Name the regions you swept before concluding nothing expires. |
 | `AccessDenied` on a `Describe*` | Report the expiry section as partial, naming the families you could not read. Do not report the surviving families as the complete picture. |
@@ -312,7 +339,9 @@ Interpret what they return; if it carries an error (no credentials, `AccessDenie
 - **`OfferingClass` is EC2-only.** Sending it elsewhere is a `ValidationException`.
 - **`PAYER` aggregates the organization.** A member account cannot purchase a payer-scoped recommendation.
 - **Don't drop `--query`.** A bare recommendation response runs to tens of KB of per-instance detail.
-- **Don't re-query for a number you already have.** Each recommendation request costs $0.01; note results as you go.
+- **Don't re-query for a number you already have.** Every Cost Explorer request costs $0.01 — posture and spend calls too, and each page; note results as you go.
+- **Don't compare an on-demand floor to a Savings Plan commitment.** Convert it first (`reference/method.md` step 1).
+- **Don't divide upfront by net savings.** Break-even is upfront ÷ (net savings + upfront ÷ term months).
 - **Only EC2 reservations return an end date.** Everywhere else it is `StartTime` + `Duration` seconds. Reporting a blank expiry because you looked for `End` is how a lapsing commitment gets missed.
 - **`RecommendationSummary` is a sum, not a purchase.** One RDS recommendation routinely spans `db.r6g.large Multi-AZ` and `db.t4g.medium Single-AZ`. Reporting only the total hides which to buy, and the two are not interchangeable.
 - **OpenSearch has no `InstanceType` in its recommendation detail** — `ESInstanceDetails` splits it across `InstanceClass` and `InstanceSize`. Looking for `InstanceType` there returns nothing and reads as "no spec available".

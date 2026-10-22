@@ -6,94 +6,106 @@ parts a purchase decision actually needs —
 
   * whether spend is stable enough for the recommendation to hold (volatility)
   * a floor-based commitment the workload sustains even on its quietest hour
-  * break-even and waste exposure if usage drops
-  * reconciliation against Cost Optimization Hub's independent pipeline
+  * cash break-even and waste exposure if usage drops
+
+`pools` decides which findings are alternatives for the same usage, and
+`posture` checks existing commitments and reconciles against Cost Optimization
+Hub.
+
+Sizing is done per line item — one purchasable specification, or one account
+under LINKED scope — because each line is a separate purchase with its own
+floor. A family total is the sum of its lines, never a ratio applied across
+them.
 
 Everything is a pure function over collected data; nothing calls AWS.
 """
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
-from datetime import date
 from typing import Any
 
-from .api import HOURS_PER_MONTH, SP_TYPE_LABELS, describe_recommendation_spec
+from .api import (
+    HOURS_PER_MONTH,
+    LOOKBACK_HOURS,
+    RI_SERVICE_LABELS,
+    SP_TYPE_LABELS,
+    describe_recommendation_spec,
+)
+from .pools import RI_POOLS, ROLE_RECOMMENDED, SP_POOLS, ri_option
 
-# Volatility bands for the ratio of trough to average hourly on-demand spend.
-# A workload whose quietest hour is close to its average is safe to commit near
-# the API recommendation; a spiky one is not.
+# Volatility bands for the ratio of trough to average hourly usage. A workload
+# whose quietest hour is close to its average is safe to commit near the API
+# recommendation; a spiky one is not.
 STABLE_FLOOR_RATIO = 0.80
 MODERATE_FLOOR_RATIO = 0.50
-
-# Utilization below this on an existing commitment means money is already being
-# wasted, and is a reason to hold off buying more.
-UTILIZATION_WARN_PCT = 95.0
-
-# Coverage above this means there is little on-demand left to convert; further
-# purchase risks over-committing.
-COVERAGE_SATURATED_PCT = 90.0
 
 CONFIDENCE_HIGH = "High"
 CONFIDENCE_MEDIUM = "Medium"
 CONFIDENCE_LOW = "Low"
+_CONFIDENCE_SCORE = {CONFIDENCE_HIGH: 2, CONFIDENCE_MEDIUM: 1, CONFIDENCE_LOW: 0}
 
 # Commitment terms in months, for checking whether an upfront payment can even
 # pay back before the commitment expires.
 TERM_MONTHS = {"ONE_YEAR": 12, "THREE_YEARS": 36}
 
-# Expiry urgency bands, in days remaining. 30 days is roughly the shortest
-# notice on which a renewal can clear finance approval, so it is the point at
-# which a lapse becomes a scheduling problem rather than a planning one.
-EXPIRY_URGENT_DAYS = 30
-EXPIRY_SOON_DAYS = 60
-EXPIRY_HORIZON_DAYS = 90
+UNIT_SP = "USD/hour"
+UNIT_RI = "units"
 
-# Renewal verdicts. Deliberately less conservative than the initial-purchase
-# bands above: a lapsing commitment has zero switching cost, so expiry is the
-# one free resize point in a commitment's life. Renewing at the same size is
-# the risk; renewing smaller is not.
-RENEW = "renew"
-RENEW_SMALLER = "renew-smaller"
-LET_LAPSE = "let-lapse"
-REVIEW = "review"
+SPEC_UNAVAILABLE = "(specification not returned)"
 
-# Utilization below this means the commitment is more waste than saving, so
-# re-buying it at the same size compounds a mistake rather than protecting a
-# discount.
-RENEW_LAPSE_PCT = 50.0
-
-
-@dataclass
+@dataclass(frozen=True)
 class LineItem:
     """One purchasable line of a recommendation: what to buy, and how much.
 
     A Finding aggregates every line item AWS returned for a service so the
     savings can be ranked against other services, but the aggregate is not
     purchasable — "4 RDS reservations" is not an order. Each line item carries
-    its own specification (`db.r6g.xlarge · Multi-AZ · Aurora PostgreSQL`) and
-    its own measured floor, which is what someone takes to the console.
+    its own specification (`db.r6g.xlarge · Multi-AZ · Aurora PostgreSQL`), its
+    own measured floor and its own achievable size, which is what someone takes
+    to the console.
+
+    `floor` and `average` are in the line's commitment unit: reservation units,
+    or — for a Savings Plan — Savings Plan dollars per hour, already converted
+    from the on-demand dollars AWS reports (`floor_on_demand`). `None` means
+    AWS did not return the figure, which is not the same as a floor of zero.
     """
 
     spec: str
     unit: str
     recommended: float
-    floor: float
-    average: float
+    floor: float | None
+    average: float | None
     achievable: float
+    aws_monthly_savings: float
     monthly_savings: float
+    aws_upfront_cost: float
     upfront_cost: float
+    confidence: str
+    volatility: str
+    break_even_months: float | None = None
+    do_not_buy: bool = False
+    waste_exposure_monthly: float = 0.0
+    aws_waste_exposure_monthly: float = 0.0
     utilization_pct: float | None = None
     monthly_on_demand: float = 0.0
+    floor_on_demand: float | None = None
     size_flex_eligible: bool = False
     current_generation: bool = True
     region: str = ""
     account_id: str = ""
 
 
-@dataclass
+@dataclass(frozen=True)
 class Finding:
-    """One actionable commitment opportunity, risk-adjusted."""
+    """One commitment opportunity, risk-adjusted.
+
+    `api_*` fields are the AWS best case. `safe_*`, `upfront_cost` and
+    `waste_exposure_monthly` are at the achievable size this report
+    recommends; `aws_upfront_cost` and `aws_waste_exposure_monthly` are the
+    same measures at the AWS size, kept so the two can be compared.
+    """
 
     family: str
     label: str
@@ -113,6 +125,18 @@ class Finding:
     source: str = "cost-explorer"
     detail_count: int = 0
     line_items: list[LineItem] = field(default_factory=list)
+    aws_upfront_cost: float = 0.0
+    aws_waste_exposure_monthly: float = 0.0
+    do_not_buy: bool = False
+    pool: str = ""
+    option: str = ""
+    role: str = ROLE_RECOMMENDED
+    currency: str = "USD"
+
+
+# ---------------------------------------------------------------------------
+# Numeric helpers
+# ---------------------------------------------------------------------------
 
 
 def _f(value: Any, default: float = 0.0) -> float:
@@ -129,12 +153,35 @@ def _f(value: Any, default: float = 0.0) -> float:
         return default
 
 
-def classify_volatility(floor: float, average: float) -> tuple[str, float]:
+def _opt(value: Any) -> float | None:
+    """Like `_f`, but keeps "not returned" distinct from a measured zero.
+
+    A blank trough is an unknown trough. Reading it as 0 would classify the
+    workload as spiky and clamp the commitment to nothing — a confident answer
+    built on missing data.
+    """
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _currency(summary: dict[str, Any], details: list[dict[str, Any]]) -> str:
+    code = summary.get("CurrencyCode") or next(
+        (d.get("CurrencyCode") for d in details if d.get("CurrencyCode")), ""
+    )
+    return str(code or "USD")
+
+
+def classify_volatility(floor: float | None, average: float | None) -> tuple[str, float]:
     """Rate spend stability from the trough-to-average ratio.
 
-    Returns (label, ratio). A ratio near 1.0 means a flat workload.
+    Returns (label, ratio). A ratio near 1.0 means a flat workload. An
+    unmeasured floor or average is "unknown", not spiky.
     """
-    if average <= 0:
+    if floor is None or average is None or average <= 0:
         return "unknown", 0.0
     ratio = floor / average
     if ratio >= STABLE_FLOOR_RATIO:
@@ -145,10 +192,10 @@ def classify_volatility(floor: float, average: float) -> tuple[str, float]:
 
 
 def _safe_commitment(
-    api_hourly: float,
-    floor_hourly: float,
-    avg_hourly: float,
-    unit: str = "$/hr",
+    api: float,
+    floor: float | None,
+    average: float | None,
+    unit: str = UNIT_SP,
 ) -> tuple[float, str, str, list[str]]:
     """Derive a commitment level the workload sustains, plus confidence.
 
@@ -156,14 +203,15 @@ def _safe_commitment(
     above the trough, which produces unused-commitment waste in quiet hours.
     For spiky workloads this clamps the commitment to the measured floor.
 
-    `unit` selects both the wording and the granularity: Savings Plans commit in
-    dollars per hour, reservations in whole instance or capacity units. Rounding
-    happens here rather than in the caller so the figure quoted in the notes is
-    the same one the report tabulates.
+    `floor` and `average` must already be in the commitment's own unit —
+    reservation units, or Savings Plan dollars (see `_sp_absorption_ratio`).
+
+    When the floor was not measured the AWS figure is kept, at Low confidence:
+    there is no evidence to trim it with, and inventing a trim is no better
+    than inventing a floor.
     """
-    volatility, ratio = classify_volatility(floor_hourly, avg_hourly)
-    notes: list[str] = []
-    whole_units = unit != "$/hr"
+    volatility, ratio = classify_volatility(floor, average)
+    whole_units = unit != UNIT_SP
 
     def quantize(value: float) -> float:
         # Reservations are sold in whole units; round down so the commitment
@@ -173,150 +221,335 @@ def _safe_commitment(
     def fmt(value: float) -> str:
         return f"{value:,.0f} unit(s)" if whole_units else f"${value:,.4f}/hr"
 
-    if api_hourly <= 0:
+    if api <= 0:
         return 0.0, CONFIDENCE_LOW, volatility, ["API recommended no commitment."]
 
+    if volatility == "unknown":
+        return (
+            quantize(api),
+            CONFIDENCE_LOW,
+            volatility,
+            [
+                "AWS did not return the hourly usage floor, so it could not be "
+                "measured — the AWS figure is kept but unvalidated."
+            ],
+        )
+
     if volatility == "stable":
-        safe = quantize(api_hourly)
-        confidence = CONFIDENCE_HIGH
-        notes.append(
+        safe = quantize(api)
+        return safe, CONFIDENCE_HIGH, volatility, [
             f"Trough hour is {ratio:.0%} of average — flat workload, "
             "API recommendation is safe to take as-is."
-        )
-    elif volatility == "moderate":
+        ]
+
+    if volatility == "moderate":
         # Commit to the floor plus half the gap to the API figure: captures
         # most of the savings while staying clear of the trough.
-        safe = quantize(
-            min(api_hourly, floor_hourly + (api_hourly - floor_hourly) * 0.5)
-        )
-        confidence = CONFIDENCE_MEDIUM
-        notes.append(
+        safe = quantize(min(api, floor + (api - floor) * 0.5))
+        return safe, CONFIDENCE_MEDIUM, volatility, [
             f"Trough hour is {ratio:.0%} of average — moderately variable. "
             f"Commitment trimmed to {fmt(safe)} (midpoint of floor and API "
             "recommendation) to limit unused-commitment risk."
-        )
-    else:
-        # Never commit above what the quietest hour consumes.
-        safe = quantize(min(api_hourly, floor_hourly))
-        confidence = CONFIDENCE_LOW
-        notes.append(
-            f"Trough hour is only {ratio:.0%} of average — spiky workload. "
-            f"Commitment clamped to the measured floor ({fmt(safe)}); "
-            "committing to the API figure would strand spend in quiet hours."
-        )
+        ]
 
-    if volatility == "unknown":
-        notes.append(
-            "No hourly on-demand spend data returned, so the floor could not be "
-            "measured — treat the API figure as unvalidated."
-        )
-        confidence = CONFIDENCE_LOW
-
-    return max(safe, 0.0), confidence, volatility, notes
+    # Never commit above what the quietest hour consumes.
+    safe = quantize(min(api, floor))
+    return max(safe, 0.0), CONFIDENCE_LOW, volatility, [
+        f"Trough hour is only {ratio:.0%} of average — spiky workload. "
+        f"Commitment clamped to the measured floor ({fmt(safe)}); "
+        "committing to the API figure would strand spend in quiet hours."
+    ]
 
 
-def _check_break_even_against_term(
-    break_even: float | None, term: str, notes: list[str], confidence: str
-) -> str:
-    """Flag an upfront purchase that cannot pay back within its own term.
+def _cash_break_even(upfront: float, net_monthly: float, term_months: int) -> float | None:
+    """Months until an upfront payment is recovered in cash.
 
-    A commitment is non-cancellable and expires at the end of the term, so a
-    break-even beyond the term means the purchase loses money outright — the
-    single most expensive mistake this report exists to prevent. Returns the
-    confidence to use, downgraded to Low when the purchase cannot pay back.
+    `net_monthly` is AWS's `EstimatedMonthlySavingsAmount`, which is savings
+    NET of the amortized upfront. The cash actually saved each month is that
+    plus the amortized upfront (the recurring fee is lower by exactly that
+    much), so dividing the upfront by the net figure alone overstates
+    break-even by a factor of 1/d and fails every All-Upfront plan with a
+    discount below 50%.
+
+        cash_monthly = net_monthly + upfront / term_months
+        break_even   = upfront / cash_monthly
+
+    Returns None with no upfront (nothing to recover) and `inf` when the
+    purchase never pays back.
     """
-    term_months = TERM_MONTHS.get(term)
-    if break_even is None or term_months is None or break_even <= term_months:
-        return confidence
-    notes.insert(
-        0,
-        f"**Do not buy.** Break-even is {break_even:.1f} months but the term "
-        f"ends at {term_months}. At the achievable commitment level this "
-        "purchase never pays back — take the no-upfront option, a shorter "
-        "term, or nothing.",
-    )
+    if upfront <= 0:
+        return None
+    cash_monthly = net_monthly + upfront / term_months
+    if cash_monthly <= 0:
+        return math.inf
+    return upfront / cash_monthly
+
+
+def _blend_confidence(lines: list[LineItem]) -> str:
+    """Family confidence, weighted by how much AWS savings each line carries.
+
+    The weakest line would let one small spiky line drag a large stable
+    portfolio to Low; a plain majority would hide a large spiky one. Weighting
+    by savings keeps the label about the money.
+    """
+    viable = [line for line in lines if not line.do_not_buy and line.aws_monthly_savings > 0]
+    if not viable:
+        return CONFIDENCE_LOW
+    weight = sum(line.aws_monthly_savings for line in viable)
+    score = sum(_CONFIDENCE_SCORE[line.confidence] * line.aws_monthly_savings for line in viable) / weight
+    if score >= 1.5:
+        return CONFIDENCE_HIGH
+    if score >= 0.5:
+        return CONFIDENCE_MEDIUM
     return CONFIDENCE_LOW
 
 
-SPEC_UNAVAILABLE = "(specification not returned)"
+def _weighted_break_even(lines: list[LineItem]) -> float | None:
+    """Upfront-weighted break-even across lines.
 
-
-def _ri_line_items(details: list[dict[str, Any]], scale: float) -> list[LineItem]:
-    """Break an RI recommendation into the individual purchases it implies.
-
-    `scale` is the family-level risk adjustment, applied per line and rounded
-    **down** because reservations are sold whole. Rounding down can leave the
-    line items summing slightly below the family total; the report says so
-    rather than quietly padding a line.
+    An unweighted mean lets a $50 line with a 2-month break-even pull a
+    $50,000 line's 11 months down to 6.5.
     """
-    items: list[LineItem] = []
-    for d in details:
-        # The instance fields come back empty for capacity-unit services
-        # (DynamoDB), which report the same three measures under different
-        # names. `or` picks up the fallback because a genuine 0 needs it too.
-        recommended = _f(d.get("RecommendedNumberOfInstancesToPurchase")) or _f(
-            d.get("RecommendedNumberOfCapacityUnitsToPurchase")
-        )
-        floor = _f(d.get("MinimumNumberOfInstancesUsedPerHour")) or _f(
-            d.get("MinimumNumberOfCapacityUnitsUsedPerHour")
-        )
-        average = _f(d.get("AverageNumberOfInstancesUsedPerHour")) or _f(
-            d.get("AverageNumberOfCapacityUnitsUsedPerHour")
-        )
-        spec = describe_recommendation_spec(d)
-        utilization = _f(d.get("AverageUtilization"), -1.0)
-        items.append(
-            LineItem(
-                spec=spec.get("label") or SPEC_UNAVAILABLE,
-                unit="units",
-                recommended=recommended,
-                floor=floor,
-                average=average,
-                achievable=float(int(recommended * scale)),
-                monthly_savings=_f(d.get("EstimatedMonthlySavingsAmount")),
-                upfront_cost=_f(d.get("UpfrontCost")),
-                utilization_pct=utilization if utilization >= 0 else None,
-                monthly_on_demand=_f(d.get("EstimatedMonthlyOnDemandCost")),
-                size_flex_eligible=bool(spec.get("size_flex_eligible")),
-                current_generation=bool(spec.get("current_generation", True)),
-                region=spec.get("region", ""),
-                account_id=str(d.get("AccountId") or ""),
-            )
-        )
-    return sorted(items, key=lambda i: -i.monthly_savings)
+    weighted = [
+        (line.break_even_months, line.aws_upfront_cost)
+        for line in lines
+        if line.break_even_months is not None
+        and math.isfinite(line.break_even_months)
+        and line.aws_upfront_cost > 0
+    ]
+    total = sum(w for _, w in weighted)
+    if total <= 0:
+        return None
+    return sum(be * w for be, w in weighted) / total
 
 
-def _sp_line_items(details: list[dict[str, Any]], scale: float) -> list[LineItem]:
-    """Break a Savings Plan recommendation into its per-family commitments.
+def _allocate(values: list[float | None], total: float, weights: list[float]) -> list[float]:
+    """Fill per-line figures AWS left blank by allocating the summary total.
 
-    Only an EC2 Instance Savings Plan is scoped to a family and region, so for a
-    Compute plan these fields come back empty — which is the plan being flexible
-    by design, not data going missing.
+    Used only when every line is blank (`None`) and the summary is not — so a
+    summary figure is never lost, never double-counted on top of real line
+    data, and a genuinely negative line (a purchase that loses money) is never
+    mistaken for a missing one.
     """
-    items: list[LineItem] = []
-    for d in details:
+    if any(v is not None for v in values) or total <= 0:
+        return [v or 0.0 for v in values]
+    weight = sum(weights)
+    if weight <= 0:
+        return [total / len(values)] * len(values) if values else []
+    return [total * w / weight for w in weights]
+
+
+# ---------------------------------------------------------------------------
+# Line sizing
+# ---------------------------------------------------------------------------
+
+
+def _size_line(
+    *,
+    spec: str,
+    unit: str,
+    recommended: float,
+    floor: float | None,
+    average: float | None,
+    aws_savings: float,
+    aws_upfront: float,
+    term: str,
+    unit_monthly_cost: float,
+    aws_break_even: float | None = None,
+    **extra: Any,
+) -> tuple[LineItem, list[str]]:
+    """Size one purchasable line and price its risk.
+
+    `unit_monthly_cost` is what one unit of commitment costs per month — 730
+    for a Savings Plan dollar-per-hour, (amortized upfront + recurring) per
+    reservation — so waste is priced in the same unit the floor is measured in.
+
+    `aws_break_even` is AWS's own per-line figure (RIs). When absent or zero
+    the cash break-even is computed instead (always, for Savings Plans). Either way it is independent of
+    the line's size, and a line that cannot pay back within its term is zeroed
+    rather than recommended.
+    """
+    achievable, confidence, volatility, notes = _safe_commitment(
+        recommended, floor, average, unit
+    )
+    term_months = TERM_MONTHS.get(term, 12)
+    if aws_break_even is not None and aws_break_even > 0 and aws_upfront > 0:
+        break_even = aws_break_even
+    else:
+        break_even = _cash_break_even(aws_upfront, aws_savings, term_months)
+    do_not_buy = break_even is not None and break_even > term_months
+    if do_not_buy:
+        achievable, confidence = 0.0, CONFIDENCE_LOW
+
+    scale = achievable / recommended if recommended > 0 else 0.0
+    waste = aws_waste = 0.0
+    if floor is not None:
+        waste = max(0.0, achievable - floor) * unit_monthly_cost
+        aws_waste = max(0.0, recommended - floor) * unit_monthly_cost
+
+    line = LineItem(
+        spec=spec,
+        unit=unit,
+        recommended=recommended,
+        floor=floor,
+        average=average,
+        achievable=achievable,
+        aws_monthly_savings=aws_savings,
+        monthly_savings=aws_savings * scale,
+        aws_upfront_cost=aws_upfront,
+        upfront_cost=aws_upfront * scale,
+        confidence=confidence,
+        volatility=volatility,
+        break_even_months=break_even,
+        do_not_buy=do_not_buy,
+        waste_exposure_monthly=waste,
+        aws_waste_exposure_monthly=aws_waste,
+        **extra,
+    )
+    return line, notes
+
+
+def _line_notes(lines: list[LineItem], notes_by_line: list[list[str]], unit: str) -> list[str]:
+    """Explain the sizing in as few bullets as the line count allows.
+
+    One line gets its own trim/clamp sentence. Many lines get a tally, because
+    a hundred near-identical sentences bury the decision.
+    """
+    if len(lines) == 1:
+        return list(notes_by_line[0])
+    bands: dict[str, int] = {}
+    for line in lines:
+        bands[line.volatility] = bands.get(line.volatility, 0) + 1
+    order = ("stable", "moderate", "spiky", "unknown")
+    tally = ", ".join(f"{bands[b]} {b}" for b in order if bands.get(b))
+    recommended = sum(line.recommended for line in lines)
+    achievable = sum(line.achievable for line in lines)
+    fmt = (lambda v: f"${v:,.4f}/hr") if unit == UNIT_SP else (lambda v: f"{v:,.0f} unit(s)")
+    return [
+        f"Sized line by line against each line's own floor ({tally}): AWS "
+        f"recommends {fmt(recommended)} in total and the per-line floors "
+        f"support {fmt(achievable)}."
+    ]
+
+
+def _do_not_buy_note(lines: list[LineItem], term: str) -> list[str]:
+    rejected = [line for line in lines if line.do_not_buy]
+    if not rejected:
+        return []
+    term_months = TERM_MONTHS.get(term, 12)
+    if len(rejected) == len(lines):
+        worst = max(rejected, key=lambda line: line.break_even_months or 0)
+        months = worst.break_even_months
+        shown = "never" if months is None or not math.isfinite(months) else f"in {months:.1f} months"
+        return [
+            f"**Do not buy.** The upfront payment pays back {shown}, but the "
+            f"term ends at {term_months} months — this purchase loses money. "
+            "Take the no-upfront option, a shorter term, or nothing."
+        ]
+    return [
+        f"{len(rejected)} line item(s) cannot pay back within the "
+        f"{term_months}-month term and are excluded from the achievable "
+        "figures (achievable 0)."
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Savings Plans
+# ---------------------------------------------------------------------------
+
+
+def _sp_absorption_ratio(detail: dict[str, Any]) -> float | None:
+    """Savings Plan dollars absorbed per on-demand dollar, for one detail.
+
+    `HourlyCommitmentToPurchase` is priced at Savings Plan rates while
+    `CurrentMinimumHourlyOnDemandSpend` is in on-demand dollars. A commitment of
+    $c/hr is only fully used once on-demand usage reaches c / (1 − d), so the
+    floor has to be converted before it can cap the commitment:
+
+        r = EstimatedSPCost × (util / 100) ÷ (EstimatedSPCost + EstimatedSavingsAmount)
+
+    which is (1 − effective discount): the denominator is the on-demand cost of
+    the usage the plan covers, and the numerator the commitment actually used.
+    """
+    sp_cost = _opt(detail.get("EstimatedSPCost"))
+    savings = _opt(detail.get("EstimatedSavingsAmount"))
+    util = _opt(detail.get("EstimatedAverageUtilization"))
+    if sp_cost is None or savings is None or util is None:
+        return None
+    covered = sp_cost + savings
+    if sp_cost <= 0 or covered <= 0 or util <= 0:
+        return None
+    ratio = sp_cost * (util / 100.0) / covered
+    return ratio if 0 < ratio <= 1 else None
+
+
+def _sp_lines(rec: dict[str, Any]) -> tuple[list[LineItem], list[list[str]], float | None]:
+    """Size every Savings Plan detail. Returns (lines, notes, blended ratio)."""
+    summary = rec.get("summary") or {}
+    details = rec.get("details") or []
+    term = rec["term"]
+    if not details:
+        details = [
+            {
+                "HourlyCommitmentToPurchase": summary.get("HourlyCommitmentToPurchase"),
+                "EstimatedMonthlySavingsAmount": summary.get("EstimatedMonthlySavingsAmount"),
+            }
+        ]
+
+    ratios = [_sp_absorption_ratio(d) for d in details]
+    weights = [_f(d.get("EstimatedSPCost")) for d in details]
+    known = [(r, w) for r, w in zip(ratios, weights) if r is not None]
+    fallback = (
+        sum(r * w for r, w in known) / sum(w for _, w in known)
+        if known and sum(w for _, w in known) > 0
+        else (known[0][0] if known else None)
+    )
+
+    commitments = _allocate(
+        [_opt(d.get("HourlyCommitmentToPurchase")) for d in details],
+        _f(summary.get("HourlyCommitmentToPurchase")),
+        [1.0] * len(details),
+    )
+    savings = _allocate(
+        [_opt(d.get("EstimatedMonthlySavingsAmount")) for d in details],
+        _f(summary.get("EstimatedMonthlySavingsAmount")),
+        commitments,
+    )
+    lookback_hours = LOOKBACK_HOURS.get(rec.get("lookback", ""), HOURS_PER_MONTH)
+
+    lines: list[LineItem] = []
+    notes: list[list[str]] = []
+    for d, ratio, hourly, saving in zip(details, ratios, commitments, savings):
+        ratio = ratio if ratio is not None else fallback
+        floor_od = _opt(d.get("CurrentMinimumHourlyOnDemandSpend"))
+        avg_od = _opt(d.get("CurrentAverageHourlyOnDemandSpend"))
+        if avg_od is None and len(details) == 1:
+            # The summary's on-demand total covers the whole lookback, so it
+            # converts to an hourly rate over the lookback's own hours.
+            total = _opt(summary.get("CurrentOnDemandSpend"))
+            avg_od = total / lookback_hours if total else None
+        convert = (lambda v: v * ratio if v is not None and ratio is not None else None)
         sp = d.get("SavingsPlansDetails") or {}
-        region = str(sp.get("Region") or "")
-        family = str(sp.get("InstanceFamily") or "")
-        hourly = _f(d.get("HourlyCommitmentToPurchase"))
-        utilization = _f(d.get("EstimatedAverageUtilization"), -1.0)
-        items.append(
-            LineItem(
-                spec=family or "any instance family",
-                unit="USD/hour",
-                recommended=hourly,
-                floor=_f(d.get("CurrentMinimumHourlyOnDemandSpend")),
-                average=_f(d.get("CurrentAverageHourlyOnDemandSpend")),
-                achievable=hourly * scale,
-                monthly_savings=_f(d.get("EstimatedMonthlySavingsAmount")),
-                upfront_cost=_f(d.get("UpfrontCost")),
-                utilization_pct=utilization if utilization >= 0 else None,
-                monthly_on_demand=_f(d.get("EstimatedOnDemandCost")),
-                region=region,
-                account_id=str(d.get("AccountId") or ""),
-            )
+        utilization = _opt(d.get("EstimatedAverageUtilization"))
+        line, line_notes = _size_line(
+            spec=str(sp.get("InstanceFamily") or "") or "any instance family",
+            unit=UNIT_SP,
+            recommended=hourly,
+            floor=convert(floor_od),
+            average=convert(avg_od),
+            aws_savings=saving,
+            aws_upfront=_f(d.get("UpfrontCost")),
+            term=term,
+            unit_monthly_cost=HOURS_PER_MONTH,
+            utilization_pct=utilization,
+            monthly_on_demand=_f(d.get("EstimatedOnDemandCost")),
+            floor_on_demand=floor_od,
+            region=str(sp.get("Region") or ""),
+            account_id=str(d.get("AccountId") or ""),
         )
-    return sorted(items, key=lambda i: -i.monthly_savings)
+        lines.append(line)
+        notes.append(line_notes)
+    return lines, notes, fallback
 
 
 def analyze_sp_recommendation(rec: dict[str, Any]) -> Finding | None:
@@ -324,493 +557,225 @@ def analyze_sp_recommendation(rec: dict[str, Any]) -> Finding | None:
     if rec.get("error"):
         return None
     summary = rec.get("summary") or {}
-    details = rec.get("details") or []
-
     api_hourly = _f(summary.get("HourlyCommitmentToPurchase"))
     api_monthly = _f(summary.get("EstimatedMonthlySavingsAmount"))
     if api_hourly <= 0 and api_monthly <= 0:
         return None
 
-    # Aggregate the per-detail hourly spend envelope. The summary omits it, so
-    # the floor has to come from the details.
-    floor = sum(_f(d.get("CurrentMinimumHourlyOnDemandSpend")) for d in details)
-    average = sum(_f(d.get("CurrentAverageHourlyOnDemandSpend")) for d in details)
-    if average <= 0:
-        average = _f(summary.get("CurrentOnDemandSpend")) / HOURS_PER_MONTH
+    lines, notes_by_line, ratio = _sp_lines(rec)
+    term = rec["term"]
+    notes = _do_not_buy_note(lines, term)
+    notes += _line_notes(lines, notes_by_line, UNIT_SP)
 
-    safe_hourly, confidence, volatility, notes = _safe_commitment(
-        api_hourly, floor, average
-    )
-
-    # Savings scale with the commitment, since the discount rate is fixed per
-    # plan. Scaling down the commitment scales down the savings proportionally.
-    scale = (safe_hourly / api_hourly) if api_hourly > 0 else 0.0
-    safe_monthly = api_monthly * scale
-
-    # Waste exposure: what an unused commitment costs per month if usage falls
-    # to the trough while committed at the recommended level.
-    waste = max(0.0, (api_hourly - floor)) * HOURS_PER_MONTH if floor > 0 else 0.0
-
-    upfront = sum(_f(d.get("UpfrontCost")) for d in details)
-    if upfront > 0 and safe_monthly > 0:
-        break_even = upfront / safe_monthly
+    floor_od = [line.floor_on_demand for line in lines]
+    if ratio is not None and all(v is not None for v in floor_od):
+        floor_sp = sum(line.floor for line in lines if line.floor is not None)
         notes.append(
-            f"${upfront:,.2f} upfront pays back in {break_even:.1f} months at the "
-            "adjusted savings rate."
+            f"The quietest hour's ${sum(floor_od):,.4f}/hr of on-demand spend "
+            f"absorbs only ${floor_sp:,.4f}/hr of Savings Plan commitment at "
+            f"this plan's effective rate (~{1 - ratio:.0%} discount). The floor "
+            "is compared in commitment dollars — comparing on-demand dollars "
+            "against a Savings Plan commitment overstates what the trough "
+            "can use."
         )
-    else:
-        break_even = None
-
-    confidence = _check_break_even_against_term(
-        break_even, rec["term"], notes, confidence
-    )
-
-    est_util = [_f(d.get("EstimatedAverageUtilization")) for d in details]
-    est_util = [u for u in est_util if u > 0]
-    if est_util:
-        mean_util = sum(est_util) / len(est_util)
+    elif ratio is None and any(v is not None for v in floor_od):
         notes.append(
-            f"AWS projects {mean_util:.1f}% average utilization on the "
-            "recommended commitment."
+            "AWS returned no Savings Plan cost for this recommendation, so the "
+            "on-demand floor could not be converted to commitment dollars and "
+            "was not used to size it."
         )
 
+    upfront = sum(line.upfront_cost for line in lines)
+    break_even = _weighted_break_even(lines)
+    if upfront > 0 and break_even is not None:
+        notes.append(
+            f"${upfront:,.2f} upfront at the achievable size is recovered in "
+            f"cash after {break_even:.1f} months."
+        )
+    utils = [line.utilization_pct for line in lines if line.utilization_pct]
+    if utils:
+        notes.append(
+            f"AWS projects {sum(utils) / len(utils):.1f}% average utilization "
+            "on its own recommended commitment."
+        )
+    if rec.get("detail_count_warning"):
+        notes.append(rec["detail_count_warning"])
+
+    floors = [line.floor for line in lines]
+    averages = [line.average for line in lines]
+    volatility, _ = classify_volatility(
+        sum(floors) if all(v is not None for v in floors) else None,
+        sum(averages) if all(v is not None for v in averages) else None,
+    )
+    do_not_buy = all(line.do_not_buy for line in lines)
     return Finding(
         family="savings-plan",
         label=SP_TYPE_LABELS.get(rec["sp_type"], rec["sp_type"]),
-        term=rec["term"],
+        term=term,
         payment=rec["payment"],
         api_hourly_commitment=api_hourly,
-        safe_hourly_commitment=safe_hourly,
+        safe_hourly_commitment=sum(line.achievable for line in lines),
         api_monthly_savings=api_monthly,
-        safe_monthly_savings=safe_monthly,
+        safe_monthly_savings=sum(line.monthly_savings for line in lines),
         savings_percentage=_f(summary.get("EstimatedSavingsPercentage")),
         upfront_cost=upfront,
-        confidence=confidence,
+        aws_upfront_cost=sum(line.aws_upfront_cost for line in lines),
+        confidence=_blend_confidence(lines),
         volatility=volatility,
         rationale=notes,
         break_even_months=break_even,
-        waste_exposure_monthly=waste,
-        detail_count=len(details),
-        line_items=_sp_line_items(details, scale),
+        waste_exposure_monthly=sum(line.waste_exposure_monthly for line in lines),
+        aws_waste_exposure_monthly=sum(line.aws_waste_exposure_monthly for line in lines),
+        detail_count=len(rec.get("details") or []),
+        line_items=sorted(lines, key=lambda line: -line.monthly_savings),
+        do_not_buy=do_not_buy,
+        pool=SP_POOLS.get(rec["sp_type"], rec["sp_type"]),
+        option=SP_TYPE_LABELS.get(rec["sp_type"], rec["sp_type"]),
+        currency=_currency(summary, rec.get("details") or []),
     )
+
+
+# ---------------------------------------------------------------------------
+# Reserved Instances
+# ---------------------------------------------------------------------------
+
+
+def _ri_measure(d: dict[str, Any], instances: str, capacity: str) -> float | None:
+    """Read an instance-count field, falling back to its capacity-unit twin.
+
+    DynamoDB reports the same three measures in capacity units. `None` only
+    when neither was returned, so a genuine 0 instance count stays 0.
+    """
+    value = _opt(d.get(instances))
+    if value is None or (value == 0 and _opt(d.get(capacity))):
+        alt = _opt(d.get(capacity))
+        return alt if alt is not None else value
+    return value
 
 
 def analyze_ri_recommendation(rec: dict[str, Any]) -> Finding | None:
     """Convert one RI recommendation permutation into a risk-adjusted Finding.
 
-    RIs commit to instance counts rather than dollars per hour, so the floor is
-    measured in instances: MinimumNumberOfInstancesUsedPerHour is the count the
-    workload never drops below.
+    RIs commit to instance counts rather than dollars per hour, so each line's
+    floor is measured in instances: `MinimumNumberOfInstancesUsedPerHour` is
+    the count that line never drops below. Each line is sized against its own
+    floor — a family-wide ratio would let a flat m5.large fleet subsidize a
+    spiky r6g.4xlarge one.
     """
     if rec.get("error"):
         return None
     summary = rec.get("summary") or {}
     details = rec.get("details") or []
-
     api_monthly = _f(summary.get("TotalEstimatedMonthlySavingsAmount"))
     if api_monthly <= 0 and not details:
         return None
 
-    recommended_units = sum(
-        _f(d.get("RecommendedNumberOfInstancesToPurchase")) for d in details
-    )
-    floor_units = sum(
-        _f(d.get("MinimumNumberOfInstancesUsedPerHour")) for d in details
-    )
-    avg_units = sum(
-        _f(d.get("AverageNumberOfInstancesUsedPerHour")) for d in details
-    )
-
-    # DynamoDB and other capacity-unit services report capacity units instead
-    # of instance counts.
-    if recommended_units <= 0:
-        recommended_units = sum(
-            _f(d.get("RecommendedNumberOfCapacityUnitsToPurchase")) for d in details
+    term = rec["term"]
+    term_months = TERM_MONTHS.get(term, 12)
+    recommended = [
+        _ri_measure(
+            d, "RecommendedNumberOfInstancesToPurchase", "RecommendedNumberOfCapacityUnitsToPurchase"
         )
-        floor_units = sum(
-            _f(d.get("MinimumNumberOfCapacityUnitsUsedPerHour")) for d in details
-        )
-        avg_units = sum(
-            _f(d.get("AverageNumberOfCapacityUnitsUsedPerHour")) for d in details
-        )
-
-    safe_units, confidence, volatility, notes = _safe_commitment(
-        recommended_units, floor_units, avg_units, unit="units"
+        or 0.0
+        for d in details
+    ]
+    savings = _allocate(
+        [_opt(d.get("EstimatedMonthlySavingsAmount")) for d in details],
+        api_monthly,
+        recommended,
     )
 
-    scale = (safe_units / recommended_units) if recommended_units > 0 else 0.0
-    safe_monthly = api_monthly * scale
-
-    upfront = sum(_f(d.get("UpfrontCost")) for d in details)
-    monthly_recurring = sum(
-        _f(d.get("RecurringStandardMonthlyCost")) for d in details
-    )
-
-    # AWS computes break-even per detail; average it rather than recomputing,
-    # so the figure ties out to the console.
-    be = [_f(d.get("EstimatedBreakEvenInMonths")) for d in details]
-    be = [b for b in be if b > 0]
-    break_even = (sum(be) / len(be)) if be else None
-
-    line_items = _ri_line_items(details, scale)
-    if recommended_units > 0:
-        notes.insert(
-            0,
-            f"API recommends {recommended_units:.0f} unit(s); workload floor is "
-            f"{floor_units:.0f}, so {safe_units:.0f} is defensible.",
+    lines: list[LineItem] = []
+    notes_by_line: list[list[str]] = []
+    for d, units, saving in zip(details, recommended, savings):
+        upfront = _f(d.get("UpfrontCost"))
+        recurring = _f(d.get("RecurringStandardMonthlyCost"))
+        # Amortized upfront plus recurring, per unit: what one idle reservation
+        # costs a month. Recurring alone is $0 for every All-Upfront RI, which
+        # would price All-Upfront waste at nothing.
+        unit_cost = (upfront / term_months + recurring) / units if units > 0 else 0.0
+        spec = describe_recommendation_spec(d)
+        line, line_notes = _size_line(
+            spec=spec.get("label") or SPEC_UNAVAILABLE,
+            unit=UNIT_RI,
+            recommended=units,
+            floor=_ri_measure(
+                d, "MinimumNumberOfInstancesUsedPerHour", "MinimumNumberOfCapacityUnitsUsedPerHour"
+            ),
+            average=_ri_measure(
+                d, "AverageNumberOfInstancesUsedPerHour", "AverageNumberOfCapacityUnitsUsedPerHour"
+            ),
+            aws_savings=saving,
+            aws_upfront=upfront,
+            term=term,
+            unit_monthly_cost=unit_cost,
+            aws_break_even=_f(d.get("EstimatedBreakEvenInMonths")),
+            utilization_pct=_opt(d.get("AverageUtilization")),
+            monthly_on_demand=_f(d.get("EstimatedMonthlyOnDemandCost")),
+            size_flex_eligible=bool(spec.get("size_flex_eligible")),
+            current_generation=bool(spec.get("current_generation", True)),
+            region=spec.get("region", ""),
+            account_id=str(d.get("AccountId") or ""),
         )
-    # A single-line recommendation needs no allocation guidance; a multi-line one
-    # does, because the aggregate above spans several instance specifications and
-    # a reservation can only be bought against one of them.
-    if len(line_items) > 1:
+        lines.append(line)
+        notes_by_line.append(line_notes)
+
+    notes = _do_not_buy_note(lines, term)
+    if lines:
+        notes += _line_notes(lines, notes_by_line, UNIT_RI)
+    real_lines = [line for line in lines if line.recommended > 0]
+    if len(real_lines) > 1:
         notes.append(
-            f"This total spans {len(line_items)} distinct instance "
+            f"This total spans {len(real_lines)} distinct instance "
             "specifications — see the line items for what to buy against each. "
             "Reservations only apply to usage matching their exact "
             "specification, so the aggregate is a budget, not an order."
         )
-    confidence = _check_break_even_against_term(
-        break_even, rec["term"], notes, confidence
-    )
-    waste = max(0.0, recommended_units - floor_units)
-    waste_cost = (
-        (monthly_recurring / recommended_units * waste)
-        if recommended_units > 0
-        else 0.0
-    )
-
-    util = [_f(d.get("AverageUtilization")) for d in details]
-    util = [u for u in util if u > 0]
-    if util:
+    utils = [line.utilization_pct for line in lines if line.utilization_pct]
+    if utils:
         notes.append(
-            f"Observed average utilization across recommended families: "
-            f"{sum(util) / len(util):.1f}%."
+            f"AWS projects {sum(utils) / len(utils):.1f}% average utilization "
+            "across its recommended line items, at its own sizing."
         )
 
+    # Family volatility is descriptive only (confidence comes from the lines).
+    # Normalized units make different sizes in a family addable; raw instance
+    # counts do not — 4 × large and 4 × 4xlarge are not "8 of something".
+    norm_floor = [_opt(d.get("MinimumNormalizedUnitsUsedPerHour")) for d in details]
+    norm_avg = [_opt(d.get("AverageNormalizedUnitsUsedPerHour")) for d in details]
+    if details and all(v is not None for v in norm_floor + norm_avg):
+        volatility, _ = classify_volatility(sum(norm_floor), sum(norm_avg))
+    else:
+        floors = [line.floor for line in lines]
+        averages = [line.average for line in lines]
+        volatility, _ = classify_volatility(
+            sum(floors) if lines and all(v is not None for v in floors) else None,
+            sum(averages) if lines and all(v is not None for v in averages) else None,
+        )
+
+    service = rec.get("service", "")
     return Finding(
         family="reserved-instance",
-        label=rec.get("label", rec.get("service", "")),
-        term=rec["term"],
+        label=rec.get("label") or RI_SERVICE_LABELS.get(service, service),
+        term=term,
         payment=rec["payment"],
-        api_hourly_commitment=recommended_units,
-        safe_hourly_commitment=safe_units,
-        api_monthly_savings=api_monthly,
-        safe_monthly_savings=safe_monthly,
+        api_hourly_commitment=sum(recommended),
+        safe_hourly_commitment=sum(line.achievable for line in lines),
+        api_monthly_savings=api_monthly if api_monthly > 0 else sum(savings),
+        safe_monthly_savings=sum(line.monthly_savings for line in lines),
         savings_percentage=_f(summary.get("TotalEstimatedMonthlySavingsPercentage")),
-        upfront_cost=upfront,
-        confidence=confidence,
+        upfront_cost=sum(line.upfront_cost for line in lines),
+        aws_upfront_cost=sum(line.aws_upfront_cost for line in lines),
+        confidence=_blend_confidence(lines),
         volatility=volatility,
         rationale=notes,
-        break_even_months=break_even,
-        waste_exposure_monthly=waste_cost,
+        break_even_months=_weighted_break_even(lines),
+        waste_exposure_monthly=sum(line.waste_exposure_monthly for line in lines),
+        aws_waste_exposure_monthly=sum(line.aws_waste_exposure_monthly for line in lines),
         detail_count=len(details),
-        line_items=line_items,
+        line_items=sorted(lines, key=lambda line: -line.monthly_savings),
+        do_not_buy=bool(lines) and all(line.do_not_buy for line in lines),
+        pool=RI_POOLS.get(service, service),
+        option=ri_option(service),
+        currency=_currency(summary, details),
     )
-
-
-def assess_existing_posture(
-    sp_coverage: dict[str, Any],
-    sp_utilization: dict[str, Any],
-    ri_coverage: dict[str, Any],
-    ri_utilization: dict[str, Any],
-) -> dict[str, Any]:
-    """Summarize whether existing commitments are healthy enough to add more.
-
-    Buying on top of an under-utilized commitment compounds waste, so this
-    produces explicit blockers the report surfaces before any recommendation.
-    """
-    posture: dict[str, Any] = {"blockers": [], "notes": []}
-
-    # --- Savings Plans coverage -------------------------------------------
-    periods = sp_coverage.get("periods") or []
-    if periods:
-        latest = periods[-1].get("Coverage", {})
-        pct = _f(latest.get("CoveragePercentage"))
-        posture["sp_coverage_pct"] = pct
-        posture["sp_on_demand_cost"] = _f(latest.get("OnDemandCost"))
-        if pct >= COVERAGE_SATURATED_PCT:
-            posture["blockers"].append(
-                f"Savings Plans coverage is already {pct:.1f}% — little "
-                "on-demand spend left to convert. Verify headroom before buying."
-            )
-    elif sp_coverage.get("error"):
-        posture["notes"].append(f"SP coverage unavailable: {sp_coverage['error']}")
-
-    # --- Savings Plans utilization ----------------------------------------
-    sp_total = sp_utilization.get("total") or {}
-    if sp_total:
-        util = sp_total.get("Utilization", {})
-        pct = _f(util.get("UtilizationPercentage"))
-        posture["sp_utilization_pct"] = pct
-        posture["sp_unused_commitment"] = _f(util.get("UnusedCommitment"))
-        if pct and pct < UTILIZATION_WARN_PCT:
-            posture["blockers"].append(
-                f"Existing Savings Plans are only {pct:.1f}% utilized "
-                f"(${_f(util.get('UnusedCommitment')):,.2f} unused). Fix this "
-                "before adding commitment."
-            )
-    elif sp_utilization.get("error"):
-        posture["notes"].append(
-            f"SP utilization unavailable: {sp_utilization['error']}"
-        )
-
-    # --- Reservations ------------------------------------------------------
-    ri_total = ri_coverage.get("total") or {}
-    if ri_total:
-        hours = ri_total.get("CoverageHours", {})
-        pct = _f(hours.get("CoverageHoursPercentage"))
-        posture["ri_coverage_pct"] = pct
-        posture["ri_on_demand_hours"] = _f(hours.get("OnDemandHours"))
-    elif ri_coverage.get("error"):
-        posture["notes"].append(f"RI coverage unavailable: {ri_coverage['error']}")
-
-    ri_util_total = ri_utilization.get("total") or {}
-    if ri_util_total:
-        pct = _f(ri_util_total.get("UtilizationPercentage"))
-        posture["ri_utilization_pct"] = pct
-        posture["ri_unused_hours"] = _f(ri_util_total.get("UnusedHours"))
-        posture["ri_realized_savings"] = _f(ri_util_total.get("RealizedSavings"))
-        if pct and pct < UTILIZATION_WARN_PCT:
-            posture["blockers"].append(
-                f"Existing reservations are only {pct:.1f}% utilized "
-                f"({_f(ri_util_total.get('UnusedHours')):,.0f} unused hours). "
-                "Reconcile before buying more."
-            )
-    elif ri_utilization.get("error"):
-        posture["notes"].append(
-            f"RI utilization unavailable: {ri_utilization['error']}"
-        )
-
-    return posture
-
-
-def reconcile_with_coh(
-    findings: list[Finding], coh: dict[str, Any]
-) -> dict[str, Any]:
-    """Compare Cost Explorer totals against Cost Optimization Hub's.
-
-    The two run independent pipelines over the same billing data, so a material
-    gap means one of them is looking at a different lookback or scope. Surfacing
-    the delta is what makes the report defensible rather than just plausible.
-    """
-    if coh.get("error"):
-        return {"status": "unavailable", "reason": coh["error"]}
-
-    coh_recs = coh.get("recommendations", [])
-    coh_total = round(sum(r["estimated_monthly_savings"] for r in coh_recs), 2)
-    # Compare against the API's own figures, not the risk-adjusted ones — COH
-    # publishes an unadjusted best case too, so that is the like-for-like axis.
-    ce_total = round(sum(f.api_monthly_savings for f in findings), 2)
-
-    delta = round(ce_total - coh_total, 2)
-    larger = max(abs(ce_total), abs(coh_total))
-    delta_pct = (abs(delta) / larger * 100) if larger > 0 else 0.0
-
-    if coh_total == 0 and ce_total == 0:
-        status = "agree-zero"
-    elif delta_pct <= 10:
-        status = "reconciled"
-    elif delta_pct <= 30:
-        status = "minor-variance"
-    else:
-        status = "material-variance"
-
-    by_type: dict[str, float] = {}
-    for r in coh_recs:
-        key = r["recommended_resource_type"] or r["current_resource_type"]
-        by_type[key] = round(
-            by_type.get(key, 0.0) + r["estimated_monthly_savings"], 2
-        )
-
-    return {
-        "status": status,
-        "ce_monthly_savings": ce_total,
-        "coh_monthly_savings": coh_total,
-        "delta": delta,
-        "delta_pct": round(delta_pct, 1),
-        "coh_count": len(coh_recs),
-        "coh_by_resource_type": dict(
-            sorted(by_type.items(), key=lambda kv: -kv[1])
-        ),
-    }
-
-
-def select_best_findings(findings: list[Finding]) -> list[Finding]:
-    """Pick the strongest permutation per commitment family.
-
-    Every (term, payment) combination is fetched, but a report that lists all of
-    them buries the decision. Rank by risk-adjusted savings, breaking ties
-    toward the shorter term and less upfront cash — the lower-risk purchase.
-    """
-    TERM_RANK = {"ONE_YEAR": 0, "THREE_YEARS": 1}
-    PAYMENT_RANK = {"NO_UPFRONT": 0, "PARTIAL_UPFRONT": 1, "ALL_UPFRONT": 2}
-
-    best: dict[str, Finding] = {}
-    for f in findings:
-        key = f"{f.family}:{f.label}"
-        current = best.get(key)
-        if current is None:
-            best[key] = f
-            continue
-        if (
-            -f.safe_monthly_savings,
-            TERM_RANK.get(f.term, 9),
-            PAYMENT_RANK.get(f.payment, 9),
-        ) < (
-            -current.safe_monthly_savings,
-            TERM_RANK.get(current.term, 9),
-            PAYMENT_RANK.get(current.payment, 9),
-        ):
-            best[key] = f
-
-    return sorted(best.values(), key=lambda f: -f.safe_monthly_savings)
-
-
-# ---------------------------------------------------------------------------
-# Expiry and renewal
-# ---------------------------------------------------------------------------
-
-
-def _urgency(days_remaining: int) -> str:
-    if days_remaining <= EXPIRY_URGENT_DAYS:
-        return "urgent"
-    if days_remaining <= EXPIRY_SOON_DAYS:
-        return "soon"
-    return "upcoming"
-
-
-def _renewal_verdict(
-    item: dict[str, Any], utilization_pct: float | None
-) -> tuple[str, str]:
-    """Decide what to do with one lapsing commitment, and say why.
-
-    Utilization is the whole basis of the call: a commitment running at 99% is
-    load-bearing and lapsing it raises the bill, while one running at 30% is
-    already waste that renewal would lock in for another term. When
-    utilization could not be measured the honest answer is "review", not a
-    guess — the figure is what makes this decision defensible.
-    """
-    label = item.get("label") or item.get("service") or "commitment"
-    if utilization_pct is None:
-        return (
-            REVIEW,
-            f"Utilization for {label} could not be measured, so renewal size "
-            "cannot be justified from data. Check the console before the term "
-            "ends.",
-        )
-    if utilization_pct >= UTILIZATION_WARN_PCT:
-        return (
-            RENEW,
-            f"{label} is running at {utilization_pct:.1f}% utilization — fully "
-            "consumed. Letting it lapse moves this usage back to on-demand "
-            "rates.",
-        )
-    if utilization_pct >= RENEW_LAPSE_PCT:
-        return (
-            RENEW_SMALLER,
-            f"{label} is at {utilization_pct:.1f}% utilization, so part of the "
-            "commitment is unused. Expiry is a zero-cost resize point: re-buy "
-            "at roughly the utilized share, not the current size.",
-        )
-    return (
-        LET_LAPSE,
-        f"{label} is only at {utilization_pct:.1f}% utilization — more waste "
-        "than saving. Let it lapse and re-buy only what fresh sizing supports.",
-    )
-
-
-def analyze_expiry(
-    items: list[dict[str, Any]],
-    as_of: date,
-    horizon_days: int = EXPIRY_HORIZON_DAYS,
-    sp_utilization_pct: float | None = None,
-    ri_utilization_pct: float | None = None,
-) -> dict[str, Any]:
-    """Sort a commitment inventory into what expires when, and what to do.
-
-    `as_of` is a parameter rather than `date.today()` so this stays a pure
-    function that a test can pin to a fixed day.
-
-    Utilization arrives per family from `assess_existing_posture` because Cost
-    Explorer only reports it in aggregate — there is no per-commitment
-    utilization API, so every Savings Plan in the account shares the account's
-    SP utilization figure. That is a real limitation of the data and is stated
-    in the report rather than papered over.
-
-    Anything already past its end date but still listed as active is reported
-    separately: the commitment is gone and the spend it covered is already back
-    at on-demand rates, which is a different (and more urgent) conversation
-    than a renewal.
-    """
-    expiring: list[dict[str, Any]] = []
-    expired: list[dict[str, Any]] = []
-    undated: list[dict[str, Any]] = []
-
-    for item in items:
-        end_raw = item.get("end") or ""
-        try:
-            end = date.fromisoformat(end_raw)
-        except ValueError:
-            undated.append(dict(item))
-            continue
-
-        days_remaining = (end - as_of).days
-        utilization = (
-            sp_utilization_pct
-            if item.get("family") == "savings-plan"
-            else ri_utilization_pct
-        )
-        action, rationale = _renewal_verdict(item, utilization)
-        entry = {
-            **item,
-            "days_remaining": days_remaining,
-            "utilization_pct": utilization,
-            "action": action,
-            "rationale": rationale,
-        }
-        if days_remaining < 0:
-            entry["urgency"] = "expired"
-            entry["rationale"] = (
-                f"Already ended {abs(days_remaining)} days ago on {end_raw} but "
-                "still listed as active. Confirm whether the covered usage is "
-                "now billing at on-demand rates."
-            )
-            expired.append(entry)
-        elif days_remaining <= horizon_days:
-            entry["urgency"] = _urgency(days_remaining)
-            expiring.append(entry)
-
-    expiring.sort(key=lambda e: (e["days_remaining"], e.get("label", "")))
-    expired.sort(key=lambda e: e["days_remaining"])
-
-    counts = {band: 0 for band in ("urgent", "soon", "upcoming")}
-    actions = {verdict: 0 for verdict in (RENEW, RENEW_SMALLER, LET_LAPSE, REVIEW)}
-    hourly_commitment = 0.0
-    reserved_units = 0.0
-    for entry in expiring:
-        counts[entry["urgency"]] = counts.get(entry["urgency"], 0) + 1
-        actions[entry["action"]] = actions.get(entry["action"], 0) + 1
-        if entry.get("family") == "savings-plan":
-            hourly_commitment += entry.get("quantity", 0.0)
-        else:
-            reserved_units += entry.get("quantity", 0.0)
-
-    return {
-        "as_of": as_of.isoformat(),
-        "horizon_days": horizon_days,
-        "total_active": len(items),
-        "expiring": expiring,
-        "expired": expired,
-        "undated": undated,
-        "counts": counts,
-        "actions": actions,
-        # Savings Plan commitment is USD/hour, so it converts to money. RI
-        # quantities are unit counts and deliberately are NOT converted —
-        # turning units into dollars needs pricing data this module does not
-        # have, and inventing a rate would be a fabricated figure.
-        "hourly_commitment_expiring": round(hourly_commitment, 4),
-        "monthly_committed_spend_expiring": round(
-            hourly_commitment * HOURS_PER_MONTH, 2
-        ),
-        "reserved_units_expiring": round(reserved_units, 2),
-    }

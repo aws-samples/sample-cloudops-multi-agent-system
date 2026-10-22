@@ -28,8 +28,6 @@ difference. The same API response also carries the **minimum** and
 quietest hour instead — and to quantify what the AWS figure would have
 wasted.
 
-Representative prompts:
-
 It also answers the other half of the commitment question — **what is already
 committed, when it lapses, and what to renew.** A commitment that expires
 unnoticed returns its covered spend to on-demand rates silently, and expiry is
@@ -51,12 +49,15 @@ Pipeline:
 "What Savings Plans should we buy?"
   → supervisor → finops-agent → cost-operations-agent
     → commitments___generate_commitment_analysis()          (one call)
-        ├─ sweep      16 SP + 32 RI recommendation permutations (6 threads)
-        ├─ posture    SP/RI coverage + utilization, COH enrollment, spend
-        ├─ expiry     active commitment inventory per region (opt-in, free)
-        ├─ risk-adjust every recommendation down to its measured floor
-        ├─ reconcile  CE total vs Cost Optimization Hub total
-        └─ render     complete markdown report
+        ├─ sweep      16 SP + 32 RI recommendation permutations, every page
+        │             (6 threads, 150 s budget)
+        ├─ risk-adjust each line down to its own measured floor
+        ├─ pools      one purchase per usage pool; the rest are alternatives
+        ├─ expiry     active + queued inventory per region (opt-in, free)
+        ├─ posture    SP + per-service RI coverage/utilization, COH, spend
+        ├─ reconcile  like-for-like against Cost Optimization Hub
+        └─ render     complete markdown report (or error + hint if every
+                      recommendation query failed)
     → emit report_markdown verbatim
 ```
 
@@ -81,12 +82,12 @@ interchangeable.
 | | Skill | MCP tool |
 |---|---|---|
 | Path | `skills/discounted-commitments/` | `src/lambda/mcp/commitments/` |
-| Form | 3 markdown files, 838 lines, **zero code** | 5 Python modules, 3,510 lines |
+| Form | 3 markdown files, 985 lines, **zero code** | handler + 9 Python modules, 4,992 lines |
 | Dependency | AWS CLI v2 + read-only credentials | Lambda runtime, boto3, `shared.cross_account` |
 | Who executes | The host agent, via Bash | The Lambda, called through the gateway |
 | Arithmetic by | The agent, following `reference/method.md` | `commitments/analyze.py` |
 | Portable | Yes — copy the directory anywhere | No — platform-coupled |
-| Tests | None (no code to test) | 331 tests, `tests/unit/test_commitments_*.py` |
+| Tests | None (no code to test) | 409 tests, `tests/unit/test_commitments_*.py` |
 
 The skill is the portable expression: it must run in any coding agent
 with a shell, with nothing installed, so it drives the AWS CLI and states
@@ -157,6 +158,7 @@ ce:GetReservationUtilization
 ce:GetCostAndUsage
 cost-optimization-hub:ListEnrollmentStatuses
 cost-optimization-hub:ListRecommendations
+cost-optimization-hub:GetPreferences
 savingsplans:DescribeSavingsPlans
 ec2:DescribeReservedInstances
 rds:DescribeReservedDBInstances
@@ -170,13 +172,20 @@ sts:GetCallerIdentity
 This is exactly the `iam_actions` list on the `commitments` entry in
 [`src/lambda/mcp/tools.json`](../../src/lambda/mcp/tools.json) — the two
 paths are permission-identical, which is what makes a skill run a valid
-rehearsal for the deployed tool.
+rehearsal for the deployed tool. `GetPreferences` reads the term and payment
+option Cost Optimization Hub prices at, so the reconciliation compares like with
+like (§6).
 
 The seven `Describe*` actions serve the expiry inventory only. Sizing works
 without them: omit `regions` and the tool makes zero inventory calls and
 returns `expiry: null`. Note that **OpenSearch's IAM prefix is `es:`**, not
 `opensearch:` — the API is `opensearch describe-reserved-instances` but the
 permission is `es:DescribeReservedInstances`.
+
+In a cross-account deployment (cost-operations Mode B) the same list must be
+granted to the **payer-account role**, and that role's trust policy must name
+the commitments tool's role — see
+[`docs/agents/cost-operations.md`](../agents/cost-operations.md#mode-b--cross-account).
 
 ### Region is pinned to us-east-1 — except reservations
 
@@ -197,23 +206,33 @@ them would return the same plans N times and inflate every total by N.
 
 ### Cost
 
-Cost Explorer bills **$0.01 per recommendation request**. Coverage,
-utilization, cost-and-usage, and every commitment-inventory `Describe*` call are
-not billed at that rate. That distinction is enforced in code, not just
-documented: `collect_all` snapshots `sweep_errors` before the expiry inventory
-runs, and `queries_run` is computed from that snapshot — folding a failed free
-`Describe*` into the counter would overstate the bill.
+Cost Explorer bills **$0.01 per API request** — recommendation, coverage,
+utilization and cost-and-usage alike, and **per page**: a LINKED-scope
+recommendation for a 250-account organization is three billed requests. Cost
+Optimization Hub and the inventory `Describe*` calls are free.
 
-| Run | Recommendation requests | Cost |
+The tool counts requests at the client rather than estimating them:
+`collect.counting()` wraps the Cost Explorer client in `api.CountingClient`, and
+every response carries `queries_run` and `estimated_api_cost_usd`.
+
+| Run | Cost Explorer requests | Cost |
 |---|---:|---:|
-| Skill default (`COMPUTE_SP` × 2 terms × 2 payments) | 4 | $0.04 |
-| MCP tool default (4 SP types + 8 RI services, × 2 terms × 2 payments) | 48 | $0.48 |
-| Adding `PARTIAL_UPFRONT` to the tool default | 72 | $0.72 |
+| Skill default (`COMPUTE_SP` × 2 terms × 2 payments, plus 4 posture calls) | 8 | $0.08 |
+| MCP tool default (4 SP types + 8 RI services, × 2 terms × 2 payments) | 48 recommendations + 3 posture/spend + 2 per reservation service measured | ~$0.51–0.67 |
+| Adding `PARTIAL_UPFRONT` to the tool default | 72 + 3 + 2 per service | ~$0.75–0.91 |
+| `get_commitment_posture` default (all 8 reservation services) | 2 SP + 16 RI + 1 spend | $0.19 |
 
-The skill sweeps narrow by default and widens only on request. The tool
-sweeps wide because it parallelizes and returns a full report in one
-call — narrow it with `savings_plan_types` / `ri_services` when cost per
-invocation matters.
+Reservation posture is two requests per service because Cost Explorer only
+reports reservation utilization and coverage for one service per query (§6,
+*Posture gate*). `generate_commitment_analysis` measures only the services
+that produced a finding or appear in the inventory; `get_commitment_posture`
+takes `ri_services` to narrow it.
+
+The skill sweeps narrow by default and widens only on request. The tool sweeps
+wide because it parallelizes and returns a full report in one call — the agent
+prompt tells the agent to narrow it with `savings_plan_types` / `ri_services`
+when the question names specific services. See also
+[`docs/cost-estimate.md`](../cost-estimate.md).
 
 ---
 
@@ -330,12 +349,24 @@ and joined into a display `spec`. Two traps:
 **Two blind spots, both declared rather than hidden:**
 
 - **DynamoDB reserved capacity has no describe API** in any SDK. It is listed
-  in `api.INVENTORY_BLIND_SPOTS` and printed in the report, because silently
+  in `inventory.INVENTORY_BLIND_SPOTS` and printed in the report, because silently
   omitting it would render as "nothing expiring" for a reservation that does.
-- **Utilization is account-level only.** AWS publishes no per-commitment
-  utilization API, so every Savings Plan in the account shares one figure and
-  every reservation shares another. The verdicts are directional and the report
-  says so inline.
+- **Member-account purchases.** `Describe*` lists only the calling account's own
+  commitments, while PAYER-scope coverage and utilization include every
+  member's. Also declared in `INVENTORY_BLIND_SPOTS`.
+
+**Utilization is per service, not per commitment.** AWS publishes no
+per-commitment utilization API, so every Savings Plan shares the account's SP
+figure and every RDS reservation shares the RDS figure (one `SERVICE`-filtered
+query per family the inventory found). The verdicts are directional and the
+report says so inline.
+
+**Pagination and states.** RDS, ElastiCache, Redshift and MemoryDB are read
+through botocore paginators; OpenSearch has none, so its `NextToken` is
+followed by hand; EC2 returns everything at once. Retired rows count toward
+each page's 100, so stopping at page one could drop live, expiring
+reservations. Rows are kept in an active state — note Redshift spells it
+`pending-payment` where the others use `payment-pending` — or `queued`.
 
 ### 5b. The purchasable spec inside a recommendation
 
@@ -404,83 +435,187 @@ Absent values arrive as `""`. Treat `""` and `null` as *no data*, never as
 Full statement in
 [`skills/discounted-commitments/reference/method.md`](../../skills/discounted-commitments/reference/method.md);
 implementation in
-[`commitments/analyze.py`](../../src/lambda/mcp/commitments/commitments/analyze.py).
-Applying it is **required**, not optional — emitting the AWS figure as
-achievable is the exact error the feature exists to prevent.
+[`commitments/analyze.py`](../../src/lambda/mcp/commitments/commitments/analyze.py)
+(sizing), [`pools.py`](../../src/lambda/mcp/commitments/commitments/pools.py)
+(alternatives) and
+[`posture.py`](../../src/lambda/mcp/commitments/commitments/posture.py)
+(posture gate, reconciliation). Applying it is **required**, not optional —
+emitting the AWS figure as achievable is the exact error the feature exists to
+prevent.
 
 Constants: `HOURS_PER_MONTH = 730.0`; `TERM_MONTHS = {ONE_YEAR: 12,
-THREE_YEARS: 36}`.
+THREE_YEARS: 36}`; `LOOKBACK_HOURS` = 168 / 720 / 1440 for 7 / 30 / 60 days.
 
-### Savings Plans
+### Size line by line, never by family ratio
 
-Sum across all `detail[]` entries:
+Every recommendation is sized **per `detail[]` entry** — one purchasable
+specification, or one member account under `LINKED` scope — against that
+line's own floor and average. A family total is the **sum of its lines**. An
+earlier version computed one family-wide ratio over raw instance counts summed
+across sizes; that let a flat `m5.large` fleet subsidize a spiky `r6g.4xlarge`
+one, ignored each line's floor, and needed a rounding-shortfall note because
+the lines could not add up to the total. Per-line sizing removes all three.
 
-```
-floor_hr = Σ CurrentMinimumHourlyOnDemandSpend
-avg_hr   = Σ CurrentAverageHourlyOnDemandSpend      (fallback: ondemand_mo ÷ 730)
-```
-
-Classify on `ratio = floor_hr ÷ avg_hr`:
+The bands, applied to each line's `ratio = floor ÷ average`:
 
 | ratio | Profile | Commitment to report | Confidence |
 |---|---|---|---|
-| ≥ 0.80 | stable | `commit_hr` — take the AWS figure as-is | High |
-| ≥ 0.50 | moderate | `floor_hr + (commit_hr − floor_hr) × 0.5` | Medium |
-| < 0.50 | spiky | `min(commit_hr, floor_hr)` — clamp to the floor | Low |
-| `avg_hr` ≤ 0 | unknown | `commit_hr`, marked explicitly unvalidated | Low |
+| ≥ 0.80 | stable | `commit` — take the AWS figure as-is | High |
+| ≥ 0.50 | moderate | `floor + (commit − floor) × 0.5` | Medium |
+| < 0.50 | spiky | `min(commit, floor)` — clamp to the floor | Low |
+| floor or average **not returned** | unknown | `commit`, marked unvalidated | Low |
 
-Thresholds are `STABLE_FLOOR_RATIO = 0.80` and
-`MODERATE_FLOOR_RATIO = 0.50`. The moderate case also caps at `commit_hr`
-— never report a commitment above what AWS recommended.
+`STABLE_FLOOR_RATIO = 0.80`, `MODERATE_FLOOR_RATIO = 0.50`. Never report a
+commitment above what AWS recommended. Reservations round **down** to whole
+units per line.
 
-Savings scale linearly with commitment size, because the discount rate is
-fixed per plan:
+**Unknown is not zero.** Cost Explorer returns `""` for an absent figure. A
+blank floor read as 0 classifies the workload as spiky and clamps the
+commitment to nothing — a confident answer built on missing data. `analyze._opt`
+keeps "not returned" (`None`) distinct from a measured `0`, which *is* a real
+trough and does clamp.
+
+Savings scale linearly with each line's achievable size
+(`line_savings × achievable ÷ commit`), and upfront at the achievable size
+scales the same way — the report quotes upfront at the size it recommends,
+with the AWS-size figure alongside.
+
+Family confidence is the **savings-weighted** blend of its lines (High = 2,
+Medium = 1, Low = 0; ≥ 1.5 High, ≥ 0.5 Medium). The weakest line would let
+one small spiky line drag a large stable portfolio to Low; a plain majority
+would hide a large spiky one.
+
+### Savings Plans — compare in commitment dollars
+
+`HourlyCommitmentToPurchase` is priced at **Savings Plan** rates;
+`CurrentMinimumHourlyOnDemandSpend` is in **on-demand** dollars. A commitment
+of $c/hr is only fully used once on-demand usage reaches c ÷ (1 − d), so the
+floor must be converted before it can cap anything:
 
 ```
-scale    = safe_commit_hr ÷ commit_hr
-safe_mo  = savings_mo × scale                    ← the recommendation
-waste_mo = max(0, commit_hr − floor_hr) × 730    ← stranded at the AWS figure
-break_even_months = upfront ÷ safe_mo            ← null, not 0, when upfront = 0
+r        = EstimatedSPCost × (EstimatedAverageUtilization ÷ 100)
+           ÷ (EstimatedSPCost + EstimatedSavingsAmount)          ← = 1 − effective discount
+floor_sp = CurrentMinimumHourlyOnDemandSpend × r
+avg_sp   = CurrentAverageHourlyOnDemandSpend × r                 (single detail: fallback
+                                                                  CurrentOnDemandSpend ÷ LOOKBACK_HOURS)
 ```
 
-Break-even uses the **adjusted** `safe_mo`. Paying back against savings
-you will not achieve is the error being guarded against. With no upfront
-cost break-even is `null` — reporting `0` reads as "pays back instantly".
+The denominator is the on-demand cost of the usage the plan covers; the
+numerator is the commitment actually used. A detail missing `EstimatedSPCost`
+borrows the SP-cost-weighted `r` of its siblings; if no detail has one, the
+floor is left unconverted and **unused** — the AWS figure is kept at Low
+confidence, with a note — rather than compared in the wrong unit.
+
+Worked: 3-year plan, 55% off, on-demand floor $4/hr, AWS commitment $3.60/hr.
+In on-demand dollars $3.60 < $4 looks safe. In commitment dollars the trough
+absorbs $4 × 0.45 = **$1.80/hr**, so $1.80/hr — **$1,314/mo** — of the AWS
+commitment sits unused in the quietest hour.
+
+Waste is priced in the same unit:
+
+```
+waste_mo     = max(0, achievable − floor_sp) × 730   ← at the size this report recommends
+aws_waste_mo = max(0, commit    − floor_sp) × 730   ← at the AWS size
+```
+
+### Cash break-even
+
+`EstimatedMonthlySavingsAmount` is savings **net of the amortized upfront**.
+The cash actually saved each month is that plus the amortized upfront (the
+recurring fee is lower by exactly that much):
+
+```
+break_even_months = upfront ÷ (net_monthly_savings + upfront ÷ term_months)
+```
+
+Dividing the upfront by the net figure alone overstates break-even by 1/d and
+fails **every All-Upfront plan with a discount under 50%**: 1-year All Upfront
+at 28% off on $1,000/mo of on-demand is $8,640 upfront and $280/mo net — 30.9
+months by the wrong formula (a false "Do not buy"), **8.6 months** in cash. It
+is scale-invariant, so it is computed per line; with no upfront it is `null`,
+not 0 ("pays back instantly"); a purchase that never pays back is `inf`,
+reported as "never".
 
 ### Reserved Instances
 
-Same shape in whole units instead of dollars per hour, with three
-differences:
+Same per-line sizing in whole units, with three differences:
 
-- **Round down.** Rounding up lands the commitment above the level just
-  judged safe.
-- **Break-even comes from the API** (average the positive
-  `EstimatedBreakEvenInMonths` across `detail[]`), not from your own
-  division, so the figure matches the console.
-- **Waste is a unit count**, so convert:
-  `waste_mo = (Σ monthly ÷ recommended) × (recommended − floor_units)`.
+- **Break-even comes from the API** (`EstimatedBreakEvenInMonths`) so it ties
+  out to the console, falling back to the cash formula when AWS omits it. The
+  family figure is **weighted by upfront** — an unweighted mean lets a $50
+  line's 2 months pull a $50,000 line's 11 months down to 6.5.
+- **Waste is priced per idle reservation** at
+  `(upfront ÷ term_months + RecurringStandardMonthlyCost) ÷ recommended`.
+  Recurring alone is $0 for every All-Upfront RI and priced its waste at
+  nothing.
+- **The family volatility label** uses the `*NormalizedUnits*` fields when
+  present, since raw counts across sizes do not add (4 × large and 4 ×
+  4xlarge are not "8 of something"). It is descriptive only; confidence comes
+  from the lines.
 
-If `recommended` comes out 0, re-read using the capacity-unit field names
-(`RecommendedNumberOfCapacityUnitsToPurchase`, etc.) — that is how
-DynamoDB reports.
+If a line's instance fields are blank, the capacity-unit names
+(`RecommendedNumberOfCapacityUnitsToPurchase`, etc.) are read instead — that
+is how DynamoDB reports. A line whose savings or commitment AWS left blank is
+filled from the summary (pro rata) only when *every* line is blank; a negative
+line is a purchase that loses money, not a missing one.
 
 ### Two guards that override the numbers
 
-- **Break-even beyond the term.** If `break_even_months` exceeds 12 or 36
-  as applicable, the purchase expires before it pays back. Force
-  confidence to **Low** and lead the rationale with **"Do not buy"**.
-  This is the one case where the raw AWS API will endorse a purchase that
-  loses money outright, so it is checked every time.
-- **Posture gate.** Existing utilization below `UTILIZATION_WARN_PCT =
-  95.0`, or coverage above `COVERAGE_SATURATED_PCT = 90.0`, is a blocker,
-  reported *before* any savings figure.
+- **Break-even beyond the term.** A line whose break-even exceeds 12 or 36
+  months is excluded (achievable 0, `do_not_buy`); a finding whose every line
+  fails is `do_not_buy` and leads its rationale with **"Do not buy"**. A
+  do-not-buy finding never wins selection, never counts toward a total, and is
+  shown with the role *Do not buy*.
+- **Posture gate.** Existing utilization below `UTILIZATION_WARN_PCT = 95.0`,
+  or Savings Plans coverage above `COVERAGE_SATURATED_PCT = 90.0`, is a
+  blocker, reported *before* any savings figure. Reservation utilization and
+  coverage are queried **per service with a `SERVICE` filter** — omitted,
+  Cost Explorer defaults the filter to EC2, and every RDS figure would really
+  be EC2's. A measured 0% is a blocker (`is not None`, not truthiness).
+  `DataUnavailableException` means no commitment of that kind is held — a
+  safe answer. Any other failure lands in `unmeasured`, and
+  `safe_to_buy_more` is then `null`: a gate that could not run must not read
+  as a gate that passed.
 
-### Reconciliation
+### One purchase per usage pool
 
-Compare the **unadjusted** Cost Explorer total (Σ `savings_mo`) against
-the COH total (Σ `estimatedMonthlySavings`). Like-for-like: COH also
-publishes a best case, so comparing the adjusted figure would manufacture
-a variance that is really just this method's own adjustment.
+Cost Explorer sizes each Savings Plan type and each RI service independently
+against the **same** on-demand usage, so summing them counts that usage two or
+three times. `pools.py` places every finding in a usage pool and an option
+within it:
+
+| Pool | Options (alternatives to each other) |
+|---|---|
+| `compute` | Compute SP · EC2 Instance SP · EC2 reservations |
+| `database` | Database SP · RDS + ElastiCache + DynamoDB reservations (one option; they cover different usage and add up) |
+| `sagemaker` | SageMaker SP |
+| `redshift`, `memorydb` | reservations |
+| `opensearch` | OpenSearch reservations · Elasticsearch (legacy) reservations |
+
+Database Savings Plans cover Aurora, RDS, DynamoDB and ElastiCache among the
+services here, not MemoryDB, Redshift or OpenSearch. Within each pool the
+option with the most achievable savings gets `role = "recommended"`; the
+others are `"alternative"`. **Only recommended findings are totalled** —
+envelope, report bottom line and High-confidence subset alike — and the report
+labels the rest *Alternative — do not stack*.
+
+### Reconciliation — like for like
+
+Cost Optimization Hub prices every commitment at **one** preferred term and
+payment (3-year All Upfront unless changed), returns every alternative per
+resource when asked to, and has no Database Savings Plan type. A naive
+comparison of the two totals is therefore usually an artifact. `posture.reconcile_with_coh`
+narrows it on three axes:
+
+1. **Term and payment** — read from `GetPreferences`, and only Cost Explorer
+   findings at that permutation are compared (from *all* analyzed
+   permutations, not just the selected ones). No match → `not-comparable`.
+2. **Coverage** — Database SP findings are excluded and named.
+3. **Overlap** — `includeAllRecommendations=False` on the COH side, and one
+   option per usage pool on both sides, at the AWS best case (COH publishes a
+   best case too).
+
+It also notes when COH was read in a different account from Cost Explorer.
 
 ```
 delta_pct = |ce_total − coh_total| ÷ max(|ce_total|, |coh_total|) × 100
@@ -492,20 +627,20 @@ delta_pct = |ce_total − coh_total| ÷ max(|ce_total|, |coh_total|) × 100
 | ≤ 10% | reconciled |
 | ≤ 30% | minor variance |
 | > 30% | material variance |
+| no CE finding at COH's term/payment | not-comparable |
 
-A material variance is **flagged, never averaged away** — a blended
-number is defensible to nobody. Usual causes: differing account scope
-(`PAYER` vs `LINKED`), or COH lagging a recent usage change.
+A material variance is **flagged, never averaged away**.
 
 ### Choosing what to report
 
-Keep **one finding per (family, label)**: highest `safe_mo` wins; break
-ties toward the **shorter term**, then the **less upfront cash**, since
-that is the lower-risk purchase. Sort the report by `safe_mo` descending.
+Keep **one finding per (family, label)**: purchases that pay back first, then
+highest achievable savings; break ties toward the **shorter term**, then the
+**less upfront cash**. Then plan pools as above; the report lists
+recommended rows first.
 
 ### Renewals — a different decision from a new purchase
 
-Implemented in `analyze.analyze_expiry`, which takes `as_of` as a parameter
+Implemented in `expiry.analyze_expiry`, which takes `as_of` as a parameter
 rather than calling `date.today()` so it stays a pure function a test can pin.
 
 The premise: **a lapsing commitment has zero switching cost.** Mid-term, resizing
@@ -523,7 +658,10 @@ Buckets, on `days_remaining = end − as_of`:
 | ≤ 90 | `upcoming` | `EXPIRY_HORIZON_DAYS` |
 | > horizon | counted in `total_active`, kept out of the table | — |
 
-Verdicts, on the family's utilization figure:
+Verdicts, on that **service's** utilization figure — Savings Plans share the
+account's SP figure, and each reservation family uses its own filtered query
+(an unfiltered one reports EC2 only, so an RDS renewal was once judged on EC2's
+99%):
 
 | Utilization | Action | Reasoning |
 |---|---|---|
@@ -531,6 +669,13 @@ Verdicts, on the family's utilization figure:
 | ≥ `RENEW_LAPSE_PCT` (50%) | `renew-smaller` | Partly wasted — renew at the consumed portion, using the free resize point |
 | < 50% | `let-lapse` | Over half unused; re-size from current usage instead of renewing the mistake |
 | `None` | `review` | Stated plainly. A verdict with no utilization behind it is a guess. |
+| any, with a matching **queued** purchase | `renewal-queued` | Already scheduled. Buying again double-commits the usage for a full term. |
+
+Queued purchases (`queued` state, on EC2 RIs and Savings Plans) are
+inventoried and matched to what is expiring on family, service, region,
+instance type and spec — a queued Single-AZ reservation does not renew a
+Multi-AZ one. A partial match says how much it covers. Queued renewals are not
+counted as exposure.
 
 Exposure is quantified in the unit the data is actually in:
 
@@ -552,20 +697,23 @@ renewal deadline is fixed and a purchase is optional.
 
 ### Worked example
 
-`commit_hr = 10.00`, `savings_mo = 1000.00`, `floor_hr = 2.00`,
-`avg_hr = 10.00`, `upfront = 0`:
+One Compute SP detail: `commit = $10.00/hr`, 30% effective discount at 100%
+utilization (`r = 0.70`), on-demand floor `$4.00/hr`, average `$15.00/hr`, no
+upfront:
 
 ```
-ratio      = 2.00 ÷ 10.00 = 0.20         → below 0.50 → spiky, Low confidence
-safe       = min(10.00, 2.00) = $2.00/hr
-scale      = 2.00 ÷ 10.00 = 0.20
-safe_mo    = 1000.00 × 0.20 = $200.00/mo   ← the recommendation
-waste_mo   = (10.00 − 2.00) × 730 = $5,840/mo stranded at the AWS figure
+floor_sp   = 4.00 × 0.70 = $2.80/hr      avg_sp = 15.00 × 0.70 = $10.50/hr
+ratio      = 2.80 ÷ 10.50 = 0.27         → below 0.50 → spiky, Low confidence
+achievable = min(10.00, 2.80) = $2.80/hr
+savings    = $3,128.57 × 0.28 = $876.00/mo   ← the recommendation
+aws_waste  = (10.00 − 2.80) × 730 = $5,256/mo stranded at the AWS size
 break_even = null (no upfront)
 ```
 
-Reported as **$200/mo achievable** against an AWS ceiling of $1,000/mo,
-Low confidence, because the quietest hour runs at 20% of average.
+Reported as **$876/mo achievable** against an AWS ceiling of $3,129/mo, Low
+confidence, because the quietest hour absorbs only 28% of the AWS commitment.
+Comparing the $4.00 on-demand floor against the $10.00 commitment directly
+would have clamped to $4.00 and overstated achievable savings by 43%.
 
 ---
 
@@ -583,14 +731,25 @@ Registered in
 definitions in
 [`src/lambda/mcp/tools.json`](../../src/lambda/mcp/tools.json). Gateway
 tool names are target-prefixed —
-`commitments___generate_commitment_analysis` and its three siblings.
+`commitments___generate_commitment_analysis` and its four siblings.
 
 Deployed as `${PROJECT_TAG}-commitments-tool`: `python3.12`, **300 s**
 timeout, **1024 MB**, both cross-account role aliases wired
-(`CROSS_ACCOUNT_ROLE_ARN` for Cost Explorer,
-`CROSS_ACCOUNT_ROLE_ARN_COH` for Cost Optimization Hub — same split as
-the `cost-optimization-hub` tool, because COH can be enabled on a
-delegated admin account separate from the payer).
+(`CROSS_ACCOUNT_ROLE_ARN` for Cost Explorer and the inventory,
+`CROSS_ACCOUNT_ROLE_ARN_COH` for Cost Optimization Hub). COH uses its own role
+**only when `CROSS_ACCOUNT_ROLE_ARN_COH` is set** — a delegated-admin COH
+account; otherwise it reads in the same account as Cost Explorer, so the
+reconciliation compares like with like.
+
+Clients are built **per invocation**, never cached at module scope: a warm
+container outlives the 15-minute assumed-role credentials, and a cached client
+keeps the expired ones. `shared.cross_account` caches the *session*, re-assumes
+it once it has under 330 s left, and never caches a failed AssumeRole. Every
+client is built with `require_role=True` — if a role is configured but cannot
+be assumed, the call raises `CrossAccountRoleError` instead of silently
+analyzing the ops account — and with `RETRY_CONFIG` (adaptive mode, 10
+attempts), because Cost Explorer throttles with `LimitExceededException`,
+which legacy retry mode does not retry.
 
 ### The five tools
 
@@ -599,13 +758,26 @@ delegated admin account separate from the payer).
 | `generate_commitment_analysis` | Default. Any purchase question. | `report_markdown` (complete report) + structured envelope + posture + blockers + reconciliation + `expiry` when `regions` is passed |
 | `size_savings_plans` | The question is narrowed to Savings Plans | Risk-adjusted SP findings, **no posture gate** |
 | `size_reservations` | The question is narrowed to reservations | Risk-adjusted RI findings in whole units |
-| `get_commitment_posture` | Only existing coverage/utilization is asked about | Coverage, utilization, blockers, `safe_to_buy_more`, COH enrollment, eligible spend |
-| `get_commitment_expiry` | "What's expiring?", "What should we renew?" | Active commitment inventory bucketed urgent/soon/upcoming with a renew / renew-smaller / let-lapse / review verdict each, plus exposure totals and declared blind spots |
+| `get_commitment_posture` | Only existing coverage/utilization is asked about | Per-service coverage and utilization, blockers, `safe_to_buy_more` (`true` / `false` / `null` = not measured), `unmeasured`, COH enrollment, eligible spend |
+| `get_commitment_expiry` | "What's expiring?", "What should we renew?" | Active and queued commitment inventory bucketed urgent/soon/upcoming with a renew / renew-smaller / let-lapse / review / renewal-queued verdict each, plus exposure totals and declared blind spots |
 
 `generate_commitment_analysis` is the preferred path and the agent prompt
 says so. It is one call, and it is the only one that includes both the
-posture gate and the reconciliation the numbers are defensible with. It
-takes up to ~90 s for a full sweep.
+posture gate and the reconciliation the numbers are defensible with.
+
+**Time budget.** The Lambda timeout, the gateway's MCP read and the
+supervisor→leaf delegation (`read_timeout=300` in `shared/registry.py`) all
+share one 300 s ceiling, and the agents still need time to read the result.
+The recommendation sweep therefore runs under `DEFAULT_TIME_BUDGET_SECONDS =
+150`: anything unfinished then is abandoned, reported as a
+`TimeBudgetExceeded` collection warning, and excluded from the totals — a
+partial, labelled report instead of a timeout.
+
+**Failure is not "no opportunity".** When every recommendation query fails
+(AccessDenied, expired credentials, Cost Explorer disabled, a window outside
+its history), the tool returns `{"error", "hint", "collection_warnings"}` and no
+report. A report with zero findings says "real result" only when nothing failed;
+otherwise it says the result is incomplete.
 
 If a sizing tool is called directly, `get_commitment_posture` **must**
 also be called — `size_savings_plans` and `size_reservations`
@@ -623,6 +795,7 @@ deliberately skip the gate, and their responses carry a `note` saying so.
 | `savings_plan_types` | the 4 SP types, or `all` | `all` |
 | `ri_services` | short labels, exact CE names, or `all` | `all` |
 | `posture_days` | integer ≥ 1 | `30` |
+| `ri_services` (posture) | short labels or `all` — which reservation services to measure | `all` |
 | `spend_days` | integer ≥ 1 | `60` |
 | `regions` | AWS region names | `generate_commitment_analysis`: none (expiry skipped); `get_commitment_expiry`: the Lambda's own region |
 | `services` / `inventory_services` | `ec2`, `rds`, `elasticache`, `redshift`, `opensearch`, `memorydb` | all |
@@ -644,21 +817,25 @@ omit it and no inventory call is made at all, so a deployment granted only
 
 ```
 src/lambda/mcp/commitments/
-├── handler.py                 603 lines — event → params → clients → collect
+├── handler.py      event → params → clients → collect
 └── commitments/
-    ├── api.py                 661 — the read-only AWS calls, enums, labels,
-    │                                 InventorySpec table, inventory getters
-    ├── analyze.py             694 — bands, sizing, break-even, posture,
-    │                                 reconcile, expiry buckets + verdicts
-    ├── collect.py             552 — permutation sweep, thread pool, region
-    │                                 validation, expiry sweep, envelope
-    └── report.py              556 — markdown rendering
+    ├── api.py        Cost Explorer + COH reads, paging, request counter,
+    │                 enums, labels, SpecShape table
+    ├── inventory.py  InventorySpec table, Describe* getters, states
+    ├── analyze.py    per-line sizing, SP floor conversion, break-even
+    ├── pools.py      usage pools, selection, recommended vs alternative
+    ├── posture.py    per-service posture gate, COH reconciliation
+    ├── expiry.py     expiry buckets, renewal verdicts, queued matching
+    ├── collect.py    sweep, time budget, posture/expiry snapshots
+    ├── shape.py      envelope, line-item capping, failure diagnosis
+    │                 (re-exported by collect)
+    └── report.py     markdown rendering
 ```
 
 The `commitments/` subpackage stays boto3-free even though the inventory needs
 regional clients. `api.Clients` carries a `make_client: Callable[[str, str], Any]`
-factory as a **defaulted trailing field**, so `collect.py` and `analyze.py` never
-import boto3 and every pre-existing `Clients(...)` construction still works
+factory as a **defaulted trailing field**, so no module but `api.py` imports
+boto3 and every pre-existing `Clients(...)` construction still works
 positionally. When the factory is absent the inventory getters return an
 explained error record rather than raising — a host that granted only `ce:Get*`
 gets a warning, not a crash.
@@ -698,25 +875,38 @@ explicitly labelled a lower bound.
   "lookback": "THIRTY_DAYS",
   "account_scope": "PAYER",
 
-  "recommendations": [ ... ],
+  "recommendations": [ ... ],      // every selected finding, each with a role
   "count": 3,
-  "total_estimated_monthly_savings": 1840.22,
-  "aws_best_case_monthly_savings": 3011.75,
+  "total_estimated_monthly_savings": 1840.22,   // recommended rows only
+  "aws_best_case_monthly_savings": 3011.75,     // recommended rows only
+  "total_upfront_cost": 0.0,
+  "usage_pools": [{"pool": "compute", "recommended_option": "EC2 Instance Savings Plan",
+                   "monthly_savings": 1840.22, "alternatives": {"Compute Savings Plan": 1500.0}}],
 
-  "reconciliation": {"status": "reconciled", "delta_pct": 4.1, ...},
+  "reconciliation": {"status": "reconciled", "delta_pct": 4.1,
+                     "basis": {"term": "THREE_YEARS", "payment": "ALL_UPFRONT"}, ...},
   "existing_commitment_posture": { ... },
-  "blockers": ["Savings Plans utilization 82.0% is below the 95% floor"],
-  "expiry": null,          // populated only when `regions` was passed
-  "queries_run": 48,
+  "safe_to_buy_more": false,       // null when posture could not be measured
+  "blockers": ["Existing Savings Plans are only 82.0% utilized ..."],
+  "expiry": null,                  // populated only when `regions` was passed
+  "queries_run": 57,
+  "estimated_api_cost_usd": 0.57,
   "collection_warnings": [],
   "data_source": "live"
 }
 ```
 
-`queries_run` counts **billable** Cost Explorer recommendation requests only. It
-is derived from `payload["sweep_errors"]`, a snapshot taken before the free
-expiry `Describe*` calls run, so a region with no reservations does not appear
-as $0.07 of nonexistent spend.
+`queries_run` is every Cost Explorer request actually sent — each page
+included — counted at the client by `api.CountingClient`. The free `Describe*`
+inventory calls and Cost Optimization Hub calls are not counted.
+
+When every recommendation query fails the response is instead
+`{"error", "hint", "account_id", "collection_warnings", "queries_run",
+"estimated_api_cost_usd"}`, with no `report_markdown`.
+
+The JSON omits `line_items` here — `report_markdown` carries them — so the
+response is not doubled. `size_savings_plans` / `size_reservations` include
+them.
 
 ### `get_commitment_expiry` response
 
@@ -730,15 +920,19 @@ as $0.07 of nonexistent spend.
   "expiring": [ ... ],       // sorted by days_remaining, then label
   "expired": [ ... ],        // end date passed but still listed active
   "undated": [ ... ],        // no parseable end date — needs manual check
+  "queued": [ ... ],         // scheduled purchases, matched to what expires
   "counts": {"urgent": 1, "soon": 2, "upcoming": 0},
-  "actions": {"renew": 2, "renew-smaller": 1, "let-lapse": 0, "review": 0},
+  "actions": {"renew": 2, "renew-smaller": 1, "let-lapse": 0, "review": 0,
+              "renewal-queued": 0},
   "hourly_commitment_expiring": 5.5,
   "monthly_committed_spend_expiring": 4015.0,
   "reserved_units_expiring": 4.0,
   "blind_spots": ["DynamoDB reserved capacity (no describe API exists)"],
   "renewal_actions": { ... },
+  "utilization_unmeasured": [],
   "collection_warnings": [],
-  "note": "...account-level utilization, read-only...",
+  "queries_run": 4,
+  "note": "...per-service utilization, read-only...",
   "data_source": "live"
 }
 ```
@@ -748,7 +942,7 @@ Per commitment: `family` (`savings-plan` | `reservation`), `service`, `label`,
 `unit`, `region`, `state`, `payment_option`, `start`, `end`, `term_months`,
 `days_remaining`, `urgency` (`urgent` | `soon` | `upcoming` | `expired`),
 `utilization_pct`, `action` (`renew` | `renew-smaller` | `let-lapse` |
-`review`), `rationale`.
+`review` | `renewal-queued`), `rationale`.
 
 `utilization_pct` is `null` when unmeasured — `null` means unmeasured, never
 zero, and `review` is the verdict that goes with it.
@@ -765,24 +959,32 @@ is empty for a Compute Savings Plan by design.
 
 ```
 {
-  "commitment_family": "sp",
+  "commitment_family": "savings-plan",
   "commitment_type": "Compute Savings Plan",
+  "role": "recommended",           // | "alternative" | "do-not-buy"
+  "usage_pool": "compute",
   "term": "ONE_YEAR",
   "payment_option": "NO_UPFRONT",
+  "currency": "USD",
   "aws_recommended_commitment": 10.0,
-  "achievable_commitment": 2.0,
+  "achievable_commitment": 2.8,
   "commitment_unit": "USD/hour",
-  "estimated_monthly_savings": 200.0,
-  "aws_best_case_monthly_savings": 1000.0,
-  "estimated_savings_percentage": 21.4,
-  "upfront_cost": 0.0,
-  "break_even_months": null,
-  "waste_exposure_monthly": 5840.0,
+  "estimated_monthly_savings": 876.0,
+  "aws_best_case_monthly_savings": 3128.57,
+  "estimated_savings_percentage": 30.0,
+  "upfront_cost": 0.0,             // at the achievable size
+  "aws_upfront_cost": 0.0,
+  "break_even_months": null,       // number, "never", or null (no upfront)
+  "waste_exposure_monthly": 0.0,   // at the achievable size
+  "aws_waste_exposure_monthly": 5256.0,
+  "do_not_buy": false,
   "confidence": "Low",
   "spend_profile": "spiky",
-  "implementation_effort": "Low",
+  "implementation_effort": "Medium",
   "rationale": ["..."],
-  "line_items": [ ... ]
+  "line_items_total": 1,
+  "line_items": [ ... ],           // capped at LINE_ITEM_LIMIT = 25
+  "line_items_omitted": 0
 }
 ```
 
@@ -795,11 +997,16 @@ everywhere it goes.
 sums every specification the service returned, and a reservation only discounts
 usage matching its exact `spec` — so quote the item as a budget and its line
 items as the order. Per entry: `spec`, `region`, `commitment_unit`,
-`aws_recommended_commitment`, `achievable_commitment`, `minimum_observed_units`,
-`average_observed_units`, `estimated_monthly_savings`, `upfront_cost`,
-`monthly_on_demand_cost`, `estimated_utilization_percentage` (`null` when AWS did
-not return it), `size_flexible`, `current_generation`, `account_id`. See §5b for
-where each field comes from.
+`aws_recommended_commitment`, `achievable_commitment`, `minimum_observed` and
+`average_observed` (commitment units — SP dollars for a Savings Plan; `null`
+when AWS did not return them), `minimum_hourly_on_demand_spend` (SP, before
+conversion), `estimated_monthly_savings` (achievable), `aws_best_case_monthly_savings`,
+`upfront_cost`, `aws_upfront_cost`, `break_even_months`, `do_not_buy`,
+`confidence`, `spend_profile`, `monthly_on_demand_cost`,
+`aws_estimated_utilization_percentage` (AWS's projection at its own size; `null`
+when not returned), `size_flexible`, `current_generation`, `account_id`. Lines
+are sorted by achievable savings and capped at 25; `line_items_omitted` says
+how many were cut. See §5b for where each field comes from.
 
 Key names deliberately mirror a Cost Optimization Hub recommendation
 list, so a host that already renders those needs no translation layer.
@@ -813,21 +1020,26 @@ mirrored in
 [`reference/output-template.md`](../../skills/discounted-commitments/reference/output-template.md):
 
 1. **Bottom line** — AWS best case vs risk-adjusted achievable vs
-   high-confidence-only, monthly and annual; leads with the urgent-expiry
-   count when there is one
+   high-confidence-only, monthly and annual, over **recommended rows only**
+   (one per usage pool, with the not-stacked caveat); leads with the
+   urgent-expiry count when there is one. With no findings it says "real
+   result" only if no query failed
 2. **Reconciliation against AWS native tools**
 3. **Existing commitment health** — blockers first
 4. **Commitment expiry and renewal** — regions swept, exposure, the
    expiring table (8 columns: ends, days, commitment, **spec**, size, region,
-   utilization, action), the account-level-utilization caveat, per-row
-   reasoning, already-ended commitments with their spec, declared blind
-   spots. Omitted entirely when the inventory did not run.
-5. **Recommended commitments** — summary table, then per-finding detail
-   ending in a **line items** table (`Buy | Region | AWS units | Floor |
-   Achievable | Utilization | Savings/mo`) that names the instance type and
-   deployment option for each purchase, flags size-flexible and
-   previous-generation lines, and discloses any whole-unit rounding shortfall.
-   The table is omitted when no line has anything to buy.
+   utilization, action), the service-level-utilization caveat, per-row
+   reasoning, queued purchases, already-ended commitments with their spec,
+   declared blind spots. Band labels follow the configured horizon. Omitted
+   entirely when the inventory did not run.
+5. **Recommended commitments** — summary table with a **Role** column
+   (*Recommended* / *Alternative — do not stack* / *Do not buy*), then
+   per-finding detail ending in a **line items** table (`Buy | Region | AWS
+   size | Floor | Achievable | Confidence | Achievable savings/mo | AWS best
+   case/mo`) that names the instance type and deployment option for each
+   purchase, flags size-flexible, previous-generation and cannot-pay-back
+   lines, and states how many smaller lines were not shown. The table is
+   omitted when no line has anything to buy.
 6. **Eligible spend**
 7. **Method** — bands restated in-report so figures are auditable
 8. **Collection warnings** — present only when a query failed
@@ -852,9 +1064,14 @@ section, `full_commitment_analysis`, which:
 2. Emits `report_markdown` **verbatim** — no summarizing, truncating,
    re-ordering, or dropping table rows and rationale bullets.
 3. Appends one extra section, **Purchase sequence**: clear every blocker
-   first; then High-confidence rows in descending achievable-savings
-   order; treat Medium as a smaller first tranche and re-measure after 30
-   days; never buy a row whose break-even exceeds its own term.
+   first; buy only *Recommended* rows — *Alternative* rows cover the same
+   usage and are never stacked; High-confidence rows first, in descending
+   achievable-savings order; treat Medium as a smaller first tranche and
+   re-measure after 30 days; never buy a row whose break-even exceeds its own
+   term; confirm no matching purchase is already queued.
+4. If the tool returns `error` instead of `report_markdown`, reports the error
+   and hint verbatim and says no analysis was produced — never "no
+   opportunity".
 
 The template explicitly forbids rebuilding the recommendation table from
 the structured fields — that is what guarantees the risk-adjusted
@@ -926,18 +1143,28 @@ registration.
 
 ```bash
 .venv/bin/python -m pytest tests/unit/test_commitments_*.py -q
-# 331 passed
+# 409 passed
 ```
 
 | File | Covers |
 |---|---|
-| `test_commitments_analyze.py` | Bands at their boundaries, sizing, break-even, posture, reconciliation, selection |
+| `test_commitments_analyze.py` | Bands at their boundaries; SP floor conversion to commitment dollars; per-line RI sizing; cash break-even across discounts and terms; do-not-buy exclusion; usage pools; per-service posture and `safe_to_buy_more`; like-for-like reconciliation; report roles, currency and empty-vs-incomplete wording. Fixtures are priced from a real discount (`sp_rec`) — see below |
 | `test_commitments_api.py` | The Cost Explorer / COH calls, enum validation, response parsing |
-| `test_commitments_collect.py` | Service/type resolvers, permutation sweep, partial-failure handling, envelope key names and units, plus `test_module_builds_no_clients_and_touches_no_files` — the guard that keeps `collect.py` free of clients and filesystem access |
-| `test_commitments_expiry.py` | Per-family field mapping and derived end dates, date coercion across SDK/CLI shapes, expiry buckets and renewal verdicts at their boundaries, unit separation, region validation, expiry rendering, and that the Savings Plans job is **not** multiplied per region |
+| `test_commitments_collect.py` | Service/type resolvers, permutation sweep, partial-failure handling, all-failed diagnosis, the time budget, recommendation paging and the detail-count warning, per-service posture filters, envelope key names, units, roles and line-item capping, plus `test_module_builds_no_clients_and_touches_no_files` — the guard that keeps `collect.py` free of clients and filesystem access |
+| `test_commitments_expiry.py` | Per-family field mapping and derived end dates, date coercion across SDK/CLI shapes, expiry buckets and renewal verdicts at their boundaries, per-service utilization queried only for families found, queued-renewal matching, Redshift's `pending-payment`, inventory pagination (paginator and hand-followed `NextToken`), unit separation, region validation, billed-request counting, expiry rendering, and that the Savings Plans job is **not** multiplied per region |
 | `test_commitments_spec.py` | The per-service spec shapes (all seven, including the OpenSearch two-field type and the DynamoDB container), `MultiAZ` as a boolean, per-line breakdown and ranking, whole-unit rounding and its disclosure, the report's line-items and expiry `Spec` columns, and `line_items` in the envelope |
-| `test_commitments_tool.py` | Handler parameter validation, error normalization, `TestHandlerDiscipline`, and `tools.json` wiring |
+| `test_commitments_tool.py` | Handler parameter validation, per-invocation clients with `require_role` and the retry config, COH role selection, error-not-report on total failure, request counting, opt-in inventory, error normalization, `TestHandlerDiscipline`, and `tools.json` wiring |
+| `test_cross_account.py` | (shared) session refresh near expiry, failures never cached, `require_role` fail-closed vs the default fallback |
 | `test_commitments_contracts.py` | Every AWS field name in `RECOMMENDATION_SPECS` and `RESERVATION_INVENTORY` checked against botocore's shipped service models — see below |
+
+**Why the fixtures derive their numbers.** An earlier version set the SP
+commitment equal to average on-demand spend (a 0% discount) and picked upfront
+figures unrelated to the term. Those fixtures *locked in* two pricing errors —
+break-even divided by net savings, and an SP commitment compared against an
+on-demand floor — instead of catching them. `sp_rec` now prices a detail the
+way Cost Explorer does (commitment, discount, utilization → SP cost, savings,
+upfront by payment option), and the break-even test is parametrized across
+discounts from 10% to 49% on both terms.
 
 The band tests pin the risk-adjustment thresholds *at* their boundaries
 (0.80, 0.50, 95%, 90%, and the 30/60/90-day expiry cutoffs), which is what
@@ -949,8 +1176,9 @@ specifically because their failure modes are silent rather than loud:
   EC2.
 - **One Savings Plans call regardless of region count.** Sweeping SPs per region
   would return the same plans N times and inflate every total by N.
-- **`queries_run` excludes free `Describe*` failures.** Asserted directly,
-  because folding them in overstates a real dollar figure.
+- **`queries_run` equals the Cost Explorer requests actually sent** — coverage,
+  utilization and spend included, free `Describe*` calls excluded. Asserted
+  against a recording stub, because the figure is a real dollar amount.
 
 The spec tests exist for the same reason: a mistyped field name in
 `RECOMMENDATION_SPECS` yields a line with no instance type rather than an
@@ -988,7 +1216,7 @@ end date. Three further assertions pin things a rename would quietly break:
   specification.
 - **`commitment` is still a `string`.** AWS returns `"1.00000000"`, so the
   `float()` conversion is load-bearing; summing without it concatenates.
-- **`ACTIVE_SP_STATES` are valid `SavingsPlanState` enum values.** These go to
+- **`INVENTORY_SP_STATES` (active plus queued) are valid `SavingsPlanState` enum values.** These go to
   the API as a server-side filter, so an invalid one is a ValidationException in
   a Lambda against a live account rather than a red test here.
 
@@ -1012,6 +1240,13 @@ size a reservation against; both rest on the contract tests and unit fixtures.
 That is the guarantee worth having here: a blank spec column can only mean AWS
 omitted the field, never that the field name is wrong.
 
+The contract file also pins the reads added for this review: every inventory
+family either has a botocore paginator or pages on a `NextToken` that
+`_inventory_rows` follows; each `ce_service` is a Cost Explorer reservation
+service; `GetPreferences` models `preferredCommitment`; the reservation
+posture APIs accept `Filter`; and `GetSavingsPlansCoverage` pages on
+`NextToken` while the others use `NextPageToken`.
+
 `test_tools_json_declares_every_dispatched_tool` reads the dispatcher table out
 of `handler.py` rather than restating it, so a tool added to one and not the
 other fails the build in both directions. The skill's markdown copy of the
@@ -1029,13 +1264,21 @@ constants has no test — verify it by hand against `analyze.py` after any chang
 | `TypeError: '>' not supported between instances of 'str' and 'int'` | JMESPath ordering comparison on a money string | Wrap in `to_number()` |
 | `DataUnavailableException` with a blank `Message` | No existing commitment of that kind | Report "no existing commitment of this type", not a blank error |
 | All posture metrics zero | **No commitment exists** — not 0% utilization on a broken one | Say which it is; they are very different findings |
-| A `$0` / no-recommendation result | A real result, not a failure | Check eligible spend and explain there is nothing to commit against |
+| A `$0` / no-recommendation result | A real result **only if no query failed** | Check eligible spend and explain there is nothing to commit against; with collection warnings the result is incomplete |
+| Tool returns `error` + `hint`, no report | Every recommendation query failed (AccessDenied, expired credentials, Cost Explorer disabled, window outside history) | Fix what the hint names; this is not a "no opportunity" result |
+| Headline total far above the on-demand spend | Alternatives summed — Compute SP, EC2 Instance SP and EC2 RIs cover the same usage | Total recommended rows only; the tool marks the rest `alternative` |
+| All-Upfront plan flagged "Do not buy" at a modest discount | Break-even divided by **net** savings | Use cash break-even: upfront ÷ (net + upfront ÷ term) |
+| Spiky SP commitment below the on-demand floor still shows waste | Correct — the floor was converted to commitment dollars | A $4/hr on-demand trough at 55% off absorbs only $1.80/hr |
+| RDS renewal judged on a 99% figure that belongs to EC2 | Reservation utilization queried without a `SERVICE` filter (defaults to EC2) | One filtered query per service |
+| Expiring commitment told to "renew" though already renewed | Queued purchases were not inventoried | `queued` is now inventoried and matched; the verdict reads `renewal-queued` |
+| Warm container fails with `ExpiredToken` after 15 minutes | Clients cached at module scope with static assumed-role credentials | Clients are built per invocation; the shared session re-assumes before expiry |
+| Results describe the ops account in a cross-account deployment | AssumeRole failed and the client fell back to the execution role | The tool passes `require_role=True` and fails with `CrossAccountRoleError` instead |
 | Recommendation figure is not purchasable by the account | `PAYER` scope aggregates the whole org | Re-run with `--account-scope LINKED` |
 | Endpoint resolution failure | Called outside us-east-1 | CE purchase recommendations and COH are us-east-1-only |
 | COH empty or `NOT_ENROLLED` | Not enrolled | Continue; state that figures rest on Cost Explorer alone |
 | Response blows up the context window | `--query` omitted | Always send it — bare responses run to tens of KB of per-instance detail |
-| Unexpectedly large Cost Explorer bill | Wide sweep, repeated | $0.01 per recommendation request; note results as you go and never re-query a number you already have |
-| Tool times out | Full 48-permutation sweep on a slow account | 300 s Lambda timeout; narrow `savings_plan_types` / `ri_services` |
+| Unexpectedly large Cost Explorer bill | Wide sweep, repeated | $0.01 per request — every CE call and page, not just recommendations; read `queries_run`, and never re-query a number you already have |
+| `TimeBudgetExceeded` collection warnings | Sweep still running at the 150 s budget on a slow or throttled account | Narrow `savings_plan_types` / `ri_services` / `terms`; the partial report is labelled a lower bound |
 | Agent reformats or summarizes the report | Model ignoring the verbatim rule | The template and agent prompt both mandate verbatim `report_markdown`; tighten if it recurs |
 | Skill and Lambda disagree on a figure | Band constants drifted between `method.md` and `analyze.py` | They are two copies of one method — reconcile both |
 | Expiry inventory finds nothing on an account that has reservations | Swept the wrong region — reservations only exist in the region they were bought in | Pass every region the account runs in; the report names the regions swept for exactly this reason |
@@ -1044,12 +1287,13 @@ constants has no test — verify it by hand against `analyze.py` after any chang
 | Savings Plan exposure looks ~1000× too small | `commitment` read as a unit count | It is USD/hour — multiply by 730 for monthly |
 | `expiry` is `null` on a `generate_commitment_analysis` response | `regions` was not passed — the inventory is opt-in | Pass `regions`, or call `get_commitment_expiry` |
 | DynamoDB reserved capacity missing from the inventory | No describe API exists for it, in any SDK | Permanent blind spot, declared in `INVENTORY_BLIND_SPOTS` and printed in the report |
-| Every expiring row shows the same utilization | Correct — AWS publishes utilization account-wide, never per commitment | Treat it as the portfolio signal it is; the report states this inline |
+| Every expiring row of one service shows the same utilization | Correct — AWS publishes utilization per service, never per commitment | Treat it as the portfolio signal it is; the report states this inline |
+| A member account's RI is missing from the inventory | `Describe*` lists only the calling account's own purchases, although PAYER coverage and utilization include it | Declared in `INVENTORY_BLIND_SPOTS`; inventory from the purchasing account to see it |
 | A recommendation total cannot be purchased as one reservation | `RecommendationSummary` sums every specification in `details[]` — a single RDS finding routinely spans Multi-AZ and Single-AZ | Quote the total as a budget and buy from `line_items`; each line is one purchasable spec |
 | OpenSearch line has no instance type | `ESInstanceDetails` has no `InstanceType` field | Join `InstanceClass` + `InstanceSize` (`r6g` + `large` → `r6g.large`) |
 | DynamoDB recommendation has an empty spec | Its spec is not under `InstanceDetails` | Read `ReservedCapacityDetails.DynamoDBCapacityDetails` — capacity units and a region, no instance |
 | A Single-AZ reservation renders as Multi-AZ-unknown, or vice versa | `MultiAZ` is a **boolean**, so a truthiness test collapses `False` and absent | Test against `None`: `False` means Single-AZ, absent means AWS did not say |
-| Line items sum below the finding's achievable total | Each line is floored to whole reservations | Expected; the report names the shortfall and the line that should absorb it — do not pad a line or restate the headline |
+| A report shows "N smaller line item(s) not shown" | Line items are capped at 25 per finding | Included in the totals; the full count is `line_items_total` |
 | A line reads `(specification not returned)` | AWS gave a count without the service sub-structure | Treat the line as unpurchasable until confirmed in the console; it is not a spec of nothing |
 | A Compute Savings Plan line shows `any instance family` | Correct — only `EC2_INSTANCE_SP` is pinned to a family and region | A Compute plan commits to dollars, not to a family; an empty spec is not missing data |
 
@@ -1068,13 +1312,17 @@ style preferences:
 - **Never present the AWS best case as achievable.** Quote the
   risk-adjusted figure as the recommendation and the AWS figure as the
   ceiling, in that order.
+- **Never add alternatives together.** Recommendations that discount the same
+  usage pool are alternatives; a total counts one option per pool.
+- **Never report a failed analysis as "no opportunity".**
 - **Never fabricate figures.** Every number traces to a documented call
   or to arithmetic that is shown. A query you did not run is not a number
   you have.
 - **Lead with blockers.** Under-utilized existing commitments come before
-  the savings figure, always. A commitment expiring inside 30 days outranks
+  the savings figure, always. A posture that could not be measured is not a
+  posture that passed. A commitment expiring inside 30 days outranks
   any new purchase — it is a deadline, not an option.
-- **Never imply per-commitment utilization.** AWS publishes it account-wide
+- **Never imply per-commitment utilization.** AWS publishes it per service
   only. Attributing the account figure to one commitment is a fabricated
   attribution, even though the number itself is real.
 - **Never convert reservation unit counts to money.** That needs per-instance

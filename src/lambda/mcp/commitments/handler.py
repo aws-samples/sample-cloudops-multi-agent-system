@@ -4,25 +4,25 @@ AWS Discounted Commitments MCP Tool — Lambda Implementation for AgentCore Gate
 Sizes Savings Plan and Reserved Instance purchases the workload can actually
 sustain, rather than the best case the AWS recommendation APIs return.
 
-Tools (4):
+Tools (5):
 - generate_commitment_analysis: ONE-SHOT aggregator — sweeps every requested
   (term, payment) permutation across Savings Plan types and RI-eligible
-  services in parallel, measures existing commitment posture, reconciles
-  against Cost Optimization Hub, and returns a fully rendered markdown report
-  plus the structured envelope. Preferred fast path for reports.
+  services in parallel, measures existing commitment posture per service,
+  reconciles against Cost Optimization Hub, plans one purchase per usage pool,
+  and returns a fully rendered markdown report plus the structured envelope.
 - size_savings_plans: Savings Plans purchase recommendations only, risk-adjusted.
 - size_reservations: Reserved Instance purchase recommendations only, risk-adjusted.
 - get_commitment_posture: Coverage/utilization of EXISTING commitments, the
   blockers they imply, COH enrollment, and commitment-addressable spend.
+- get_commitment_expiry: Which existing commitments expire soon, and whether
+  to renew each — including renewals already queued.
 
 Design note:
   All of the deterministic work — the permutation sweep, volatility
   classification, floor-based commitment sizing, break-even math, COH
   reconciliation, and markdown rendering — runs in Python here. The agent makes
   ONE tool call and gets a finished report, so the LLM spends its cycles on
-  judgment (which purchase to make, in what order) rather than orchestrating
-  dozens of sequential Cost Explorer calls. Same optimization as the
-  lambda-runtime tool's generate_upgrade_analysis.
+  judgment rather than orchestrating dozens of sequential Cost Explorer calls.
 
   This file owns only the two things that are specific to being a gateway tool:
   turning a caller-supplied JSON event into validated parameters, and building
@@ -32,34 +32,20 @@ Design note:
   tests/unit/test_commitments_{api,analyze,collect}.py do not cover, and
   `TestHandlerDiscipline` fails the build over it.
 
-  The `commitments/` subpackage carries no platform imports, so it stays
-  testable on its own, and it never opens a boto3 Session: the one
-  profile-aware function it defines, `api.build_clients`, is unused here.
-  `_get_clients` below builds the same `api.Clients` record from
-  `shared.cross_account` instead.
+Read-only: every AWS call is a Get*/List*/Describe* operation. Nothing is
+purchased and no billable analysis is started. Cost Explorer does bill $0.01
+per request; every response reports `queries_run` and its estimated cost.
 
-Read-only: every AWS call is a Get*/List* operation. Nothing is purchased and
-no billable analysis is started.
-
-Required IAM Permissions:
-- ce:GetSavingsPlansPurchaseRecommendation
-- ce:GetReservationPurchaseRecommendation
-- ce:GetSavingsPlansCoverage
-- ce:GetSavingsPlansUtilization
-- ce:GetReservationCoverage
-- ce:GetReservationUtilization
-- ce:GetCostAndUsage
-- cost-optimization-hub:ListEnrollmentStatuses
-- cost-optimization-hub:ListRecommendations
-- sts:GetCallerIdentity
+Required IAM permissions: see `iam_actions` for `commitments` in
+src/lambda/mcp/tools.json, and docs/agents/cost-operations.md (Mode B) for the
+cross-account role's trust policy and action list.
 """
 
 import json
 import os
 
 from commitments import api, collect, report
-from commitments.analyze import assess_existing_posture, select_best_findings
-from shared.cross_account import get_aws_client
+from shared.cross_account import CrossAccountRoleError, get_aws_client
 
 # Aliased, not restated. A copy of these values here would let the gateway tool
 # accept a term the shared pipeline rejects (or default to a different sweep
@@ -69,7 +55,7 @@ PAYMENTS = collect.PAYMENTS
 LOOKBACKS = collect.LOOKBACKS
 ACCOUNT_SCOPES = collect.ACCOUNT_SCOPES
 FAMILIES = collect.FAMILIES
-INVENTORY_KEYS = api.INVENTORY_KEYS
+INVENTORY_KEYS = collect.INVENTORY_KEYS
 
 DEFAULT_TERMS = collect.DEFAULT_TERMS
 DEFAULT_PAYMENTS = collect.DEFAULT_PAYMENTS
@@ -81,12 +67,11 @@ DEFAULT_EXPIRY_HORIZON_DAYS = collect.DEFAULT_EXPIRY_HORIZON_DAYS
 
 
 def _default_region() -> str:
-    """The region a reservation sweep defaults to.
+    """The region the standalone expiry tool defaults to.
 
     Reservations are regional and Lambda always sets AWS_REGION, so the tool's
     own region is the one region we can assume is interesting. Widening the
-    sweep multiplies Describe* calls, so it stays opt-in via the `regions`
-    parameter.
+    sweep multiplies Describe* calls, so it stays opt-in via `regions`.
     """
     return os.environ.get("AWS_REGION") or os.environ.get(
         "AWS_DEFAULT_REGION", api.CE_REGION
@@ -109,7 +94,13 @@ def handler(event, context):
     fn = handlers.get(tool_name)
     if fn:
         response = fn(event)
-        print(f"Response: {json.dumps(response, default=str)}")
+        # A summary, not the body: a full report runs to hundreds of KB, past
+        # CloudWatch's 256 KB event limit, and the body is returned anyway.
+        size = len(json.dumps(response, default=str))
+        print(
+            f"Response: {size} bytes, keys={sorted(response)}, "
+            f"error={response.get('error')!r}, queries_run={response.get('queries_run')}"
+        )
         return response
     return {
         "error": f"Unknown tool: {tool_name}",
@@ -121,18 +112,34 @@ def handler(event, context):
 # Clients
 # ---------------------------------------------------------------------------
 
-_clients = None
+
+def _client(service: str, region: str, alias: str | None = None):
+    """One read-only client through the platform's cross-account helper.
+
+    `require_role=True`: when a cross-account role is configured and cannot be
+    assumed, fail loudly. Falling back to the execution role would analyze
+    the ops account and present it as the payer's.
+    """
+    return get_aws_client(
+        service,
+        region_name=region,
+        role_alias=alias,
+        require_role=True,
+        config=api.RETRY_CONFIG,
+    )
 
 
-def _account_id() -> str:
-    """Resolve the account the analysis speaks for.
+def _account_id(alias: str | None = None) -> str:
+    """Resolve the account a role speaks for.
 
     A failure here must not abort the report — the recommendations are still
-    valid, they just carry an unknown account label.
+    valid, they just carry an unknown account label. A role that cannot be
+    assumed at all is different, and propagates.
     """
     try:
-        sts = get_aws_client("sts", region_name=api.CE_REGION)
-        return sts.get_caller_identity()["Account"]
+        return _client("sts", api.CE_REGION, alias).get_caller_identity()["Account"]
+    except CrossAccountRoleError:
+        raise
     except Exception as exc:  # noqa: BLE001 - label only, never fatal
         print(f"Could not resolve account id: {exc}")
         return "unknown"
@@ -141,34 +148,31 @@ def _account_id() -> str:
 def _get_clients() -> api.Clients:
     """Build the `api.Clients` record the analysis package expects.
 
-    The skill's `api.build_clients` is bypassed on purpose: it constructs a
-    profile-based `boto3.Session`, which has no meaning in Lambda. Cross-account
-    role assumption is the platform's concern, so it comes from
-    `shared.cross_account` — the COH client uses the same `COH` role alias as
-    the cost-optimization-hub tool, and Cost Explorer uses the default role.
-    Cached at module scope so a warm container makes no repeat STS calls.
+    Built per invocation, never cached at module scope: a warm container
+    outlives the 15-minute assumed-role credentials, and a cached client keeps
+    the expired ones. The cross-account helper caches the *session* and
+    re-assumes it before expiry, so this costs no extra STS call.
+
+    Cost Optimization Hub uses its own role (`CROSS_ACCOUNT_ROLE_ARN_COH`) only
+    when one is configured — a delegated-admin COH account. Otherwise it reads
+    in the same account as Cost Explorer, so the reconciliation compares like
+    with like.
     """
-    global _clients
-    if _clients is None:
-        _clients = api.Clients(
-            ce=get_aws_client("ce", region_name=api.CE_REGION),
-            coh=get_aws_client(
-                "cost-optimization-hub",
-                region_name=api.COH_REGION,
-                role_alias="COH",
-            ),
-            account_id=_account_id(),
-            profile=None,
-            # Reservation and Savings Plan inventory are regional Describe*
-            # calls with no single fixed client, so the factory routes each
-            # through the same cross-account role Cost Explorer uses. Commitments
-            # live in the payer/linked account being analyzed, not in the ops
-            # account running this Lambda.
-            make_client=lambda service, region: get_aws_client(
-                service, region_name=region
-            ),
-        )
-    return _clients
+    coh_alias = "COH" if os.environ.get("CROSS_ACCOUNT_ROLE_ARN_COH") else None
+    ce = _client("ce", api.CE_REGION)
+    account_id = _account_id()
+    return api.Clients(
+        ce=ce,
+        coh=_client("cost-optimization-hub", api.COH_REGION, coh_alias),
+        account_id=account_id,
+        profile=None,
+        # Reservation and Savings Plan inventory are regional Describe* calls
+        # with no single fixed client, so the factory routes each through the
+        # same cross-account role Cost Explorer uses. Commitments live in the
+        # payer/linked account being analyzed, not in the ops account.
+        make_client=lambda service, region: _client(service, region),
+        coh_account_id=_account_id(coh_alias) if coh_alias else account_id,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -247,16 +251,20 @@ def _resolve_sp_types(spec) -> list[str]:
         raise ParamError(str(exc)) from None
 
 
-def _resolve_regions(spec) -> list[str]:
+def _resolve_regions(spec, default_region: str = "") -> list[str] | None:
     """Adapt the event's region parameter to the shared resolver.
 
     Region strings become part of an SDK endpoint, so they are validated by the
     shared resolver rather than passed through — the same reason the enums
-    above are aliased instead of restated.
+    above are aliased instead of restated. With no `default_region`, an
+    omitted parameter returns None: the full analysis then skips the expiry
+    inventory, as its schema promises.
     """
     values = _as_list(spec, ())
+    if not values and not default_region:
+        return None
     try:
-        return collect.resolve_regions(values, _default_region())
+        return collect.resolve_regions(values, default_region)
     except ValueError as exc:
         raise ParamError(str(exc)) from None
 
@@ -333,30 +341,37 @@ def handle_generate_commitment_analysis(event):
             regions=regions,
             expiry_horizon_days=expiry_horizon_days,
         )
+        cost = {
+            "queries_run": payload["queries_run"],
+            "estimated_api_cost_usd": payload["estimated_api_cost_usd"],
+        }
+        if payload.get("fatal"):
+            return {
+                **payload["fatal"],
+                "account_id": clients.account_id,
+                "collection_warnings": payload["errors"],
+                **cost,
+            }
 
         posture = payload["posture"]
-        errors = payload["errors"]
-        raw = payload["raw"]
         return {
             "report_markdown": report.render(payload),
             "account_id": clients.account_id,
             "generated_at": payload["meta"]["generated_at"],
             "lookback": params["lookback"],
             "account_scope": params["account_scope"],
-            **collect.envelope(payload["findings"]),
+            # The markdown carries the line items; repeating them here doubled
+            # the response for no reader.
+            **collect.envelope(
+                payload["findings"], pools=payload["pools"], include_lines=False
+            ),
             "reconciliation": payload["reconciliation"],
             "existing_commitment_posture": posture,
+            "safe_to_buy_more": payload["safe_to_buy_more"],
             "expiry": payload["expiry"],
             "blockers": posture["blockers"],
-            # Billable Cost Explorer requests only. The expiry Describe* calls
-            # are free and are excluded on purpose — this number is what the
-            # caller is charged $0.01 apiece for.
-            "queries_run": (
-                len(raw["sp_recs"])
-                + len(raw["ri_recs"])
-                + len(payload["sweep_errors"])
-            ),
-            "collection_warnings": errors,
+            **cost,
+            "collection_warnings": payload["errors"],
             "data_source": "live",
         }
     except ValueError as exc:
@@ -382,27 +397,29 @@ def handle_size_savings_plans(event):
 
     try:
         clients = _get_clients()
-        recs, errors = collect.sweep_savings_plans(
+        result = collect.size_commitments(
             clients,
+            "sp",
             sp_types,
             params["terms"],
             params["payments"],
             params["lookback"],
             params["account_scope"],
         )
-        best = select_best_findings(collect.findings_from(recs, []))
+        if result.get("error"):
+            return {"account_id": clients.account_id, **result}
         return {
             "account_id": clients.account_id,
             "lookback": params["lookback"],
             "account_scope": params["account_scope"],
             "savings_plan_types": sp_types,
-            **collect.envelope(best),
-            "collection_warnings": errors,
+            **result,
             "note": (
-                "Achievable figures are risk-adjusted against the measured "
-                "hourly spend floor. Check get_commitment_posture before "
-                "acting — buying on top of an under-utilized commitment "
-                "compounds waste."
+                "Achievable figures are risk-adjusted against each line's "
+                "measured hourly floor, converted to commitment dollars. Only "
+                "rows with role 'recommended' add up; 'alternative' rows cover "
+                "the same usage. Check get_commitment_posture before acting — "
+                "buying on top of an under-utilized commitment compounds waste."
             ),
             "data_source": "live",
         }
@@ -420,25 +437,26 @@ def handle_size_reservations(event):
 
     try:
         clients = _get_clients()
-        recs, errors = collect.sweep_reservations(
+        result = collect.size_commitments(
             clients,
+            "ri",
             ri_services,
             params["terms"],
             params["payments"],
             params["lookback"],
             params["account_scope"],
         )
-        best = select_best_findings(collect.findings_from([], recs))
+        if result.get("error"):
+            return {"account_id": clients.account_id, **result}
         return {
             "account_id": clients.account_id,
             "lookback": params["lookback"],
             "account_scope": params["account_scope"],
             "services": [api.RI_SERVICE_LABELS.get(s, s) for s in ri_services],
-            **collect.envelope(best),
-            "collection_warnings": errors,
+            **result,
             "note": (
                 "Reservation commitments are quoted in whole instance or "
-                "capacity units, rounded down to the level the workload "
+                "capacity units, each line rounded down to the count it "
                 "sustains on its quietest hour."
             ),
             "data_source": "live",
@@ -461,47 +479,29 @@ def handle_get_commitment_posture(event):
         spend_days = _positive_int(
             event.get("spend_days"), "spend_days", DEFAULT_SPEND_DAYS
         )
+        ri_services = _resolve_ri_services(event.get("ri_services"))
     except ParamError as exc:
         return {"error": str(exc)}
 
     try:
         clients = _get_clients()
-        collected = collect.collect_posture(clients, posture_days, spend_days)
-        posture = assess_existing_posture(
-            collected["sp_coverage"],
-            collected["sp_utilization"],
-            collected["ri_coverage"],
-            collected["ri_utilization"],
-        )
-        spend = collected["eligible_spend"]
-        periods = [
-            {"start": p["start"], "end": p["end"], "total": p["total"]}
-            for p in spend.get("periods", [])
-        ]
-        latest = spend.get("periods", [])
-        top_services = (
-            dict(
-                sorted(latest[-1]["by_service"].items(), key=lambda kv: -kv[1])[:10]
-            )
-            if latest
-            else {}
+        snapshot = collect.posture_snapshot(
+            clients, posture_days, spend_days, ri_services
         )
         return {
             "account_id": clients.account_id,
             "window_days": posture_days,
-            "posture": posture,
-            "blockers": posture["blockers"],
-            "safe_to_buy_more": not posture["blockers"],
-            "cost_optimization_hub": collected["coh_enrollment"],
-            "spend_periods": periods,
-            "top_services_latest_period": top_services,
+            **snapshot,
             "spend_note": (
                 "Commitments only apply to compute and database instance "
                 "usage. Serverless, storage, data transfer, and managed-API "
                 "spend cannot be committed against, so a large bill with "
                 "little instance usage correctly yields no recommendation."
             ),
-            "notes": posture.get("notes", []),
+            "safe_to_buy_more_note": (
+                "null means existing commitment health could not be measured "
+                "(see 'unmeasured') — not that it is healthy."
+            ),
             "data_source": "live",
         }
     except Exception as e:
@@ -516,13 +516,13 @@ def handle_get_commitment_posture(event):
 def handle_get_commitment_expiry(event):
     """When existing commitments lapse, and what to renew.
 
-    The one tool here that is not Cost Explorer: expiry dates only exist on the
-    per-service Describe* APIs, and those are regional. Utilization for the
-    renewal call still comes from Cost Explorer, since it is the only source
-    for it.
+    The one tool here that is mostly not Cost Explorer: expiry dates only exist
+    on the per-service Describe* APIs, and those are regional. Utilization for
+    the renewal call still comes from Cost Explorer, one query per service
+    found in the inventory.
     """
     try:
-        regions = _resolve_regions(event.get("regions"))
+        regions = _resolve_regions(event.get("regions"), _default_region())
         services = _resolve_inventory_services(event.get("services"))
         horizon_days = _positive_int(
             event.get("horizon_days"), "horizon_days", DEFAULT_EXPIRY_HORIZON_DAYS
@@ -535,28 +535,14 @@ def handle_get_commitment_expiry(event):
 
     try:
         clients = _get_clients()
-        collected = collect.collect_posture(clients, posture_days, DEFAULT_SPEND_DAYS)
-        posture = assess_existing_posture(
-            collected["sp_coverage"],
-            collected["sp_utilization"],
-            collected["ri_coverage"],
-            collected["ri_utilization"],
-        )
-        expiry, errors = collect.collect_expiry(
-            clients,
-            regions,
-            services,
-            horizon_days,
-            sp_utilization_pct=posture.get("sp_utilization_pct"),
-            ri_utilization_pct=posture.get("ri_utilization_pct"),
+        snapshot = collect.expiry_snapshot(
+            clients, regions, services, horizon_days, posture_days
         )
         return {
             "account_id": clients.account_id,
-            **expiry,
-            "renewal_actions": expiry["actions"],
-            "collection_warnings": errors,
+            **snapshot,
             "note": (
-                "Utilization is account-level (Cost Explorer publishes no "
+                "Utilization is per service (Cost Explorer publishes no "
                 "per-commitment figure), so a renewal verdict is a portfolio "
                 "signal, not a per-commitment measurement. Read-only: this "
                 "reports expiry, it never renews or purchases."
@@ -577,19 +563,30 @@ def handle_get_commitment_expiry(event):
 def _aws_error(exc: Exception) -> dict:
     """Normalize an unexpected failure, calling out the actionable cases."""
     message = str(exc)
+    if isinstance(exc, CrossAccountRoleError):
+        return {
+            "error": message,
+            "hint": (
+                "The payer-account role could not be assumed. Its trust policy "
+                "must name this tool's role (<project>-commitments-tool-role); "
+                "see docs/agents/cost-operations.md, Mode B."
+            ),
+        }
     if "AccessDenied" in message or "UnauthorizedOperation" in message:
         return {
             "error": message,
             "hint": (
-                "The tool role needs ce:GetSavingsPlansPurchaseRecommendation, "
-                "ce:GetReservationPurchaseRecommendation, the coverage and "
-                "utilization reads, and cost-optimization-hub:ListRecommendations. "
-                "Cost Explorer must also be enabled for the payer account. "
-                "Expiry inventory additionally needs "
-                "savingsplans:DescribeSavingsPlans plus the per-service "
-                "Describe* reads (ec2, rds, elasticache, redshift, es, "
-                "memorydb) in each swept region."
+                "The tool role (or, cross-account, the payer-account role) is "
+                "missing a permission. The full action list is `iam_actions` "
+                "for `commitments` in src/lambda/mcp/tools.json; the "
+                "cross-account trust policy is in docs/agents/cost-operations.md, "
+                "Mode B. Cost Explorer must also be enabled for the payer account."
             ),
+        }
+    if "ExpiredToken" in message:
+        return {
+            "error": message,
+            "hint": "Assumed-role credentials expired mid-call. Retry.",
         }
     if "DataUnavailable" in message:
         return {
