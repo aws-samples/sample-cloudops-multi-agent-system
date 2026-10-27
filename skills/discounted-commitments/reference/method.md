@@ -109,7 +109,9 @@ Upfront at 28% off on $1,000/mo on-demand: $8,640 upfront, $280/mo net — 30.9
 months the wrong way, **8.6 months** in cash.) It does not depend on the line's
 size. With no upfront, break-even is **null**, not 0: reporting 0 reads as "pays
 back instantly". If the denominator is ≤ 0 the purchase never pays back. For
-the family, weight each line's break-even by its upfront.
+the family, weight each line's break-even by its upfront at the achievable size,
+over the lines actually bought — a line excluded as do-not-buy is not part of
+the purchase and must not pull the family figure past the term.
 
 ## Reserved Instances
 
@@ -131,7 +133,8 @@ RI-specific differences:
 
 - **Break-even comes from the API** (`break_even_mo`) so it ties to the
   console; compute the cash formula above only when AWS returns none. For the
-  family, **weight by upfront** — an unweighted mean lets a $50 line's two
+  family, **weight by achievable upfront over the lines bought** (excluded
+  lines do not count) — an unweighted mean lets a $50 line's two
   months pull a $50,000 line's eleven down to six and a half.
 - **Waste is priced per idle reservation**, amortized upfront included:
   `unit_cost_mo = (upfront ÷ term_months + monthly) ÷ commit` and

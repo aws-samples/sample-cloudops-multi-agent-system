@@ -526,6 +526,46 @@ def test_reservation_posture_is_queried_per_service_with_a_filter():
 
 
 @pytest.mark.unit
+def test_posture_filter_uses_the_coverage_api_service_names():
+    """The coverage/utilization SERVICE filter rejects two recommendation-API names.
+
+    Cost Explorer's ValidationException lists the filter's supported values;
+    MemoryDB is "Amazon MemoryDB" there (no "Service" suffix) and DynamoDB is
+    not a valid value at all. Pinned here because stub clients accept any
+    string, which is how the mismatch first shipped.
+    """
+
+    class FilterCE(RecordingCE):
+        def __init__(self):
+            super().__init__()
+            self.filters = []
+
+        def get_reservation_utilization(self, **kw):
+            self.filters.append(kw["Filter"]["Dimensions"]["Values"][0])
+            return super().get_reservation_utilization(**kw)
+
+    ce = FilterCE()
+    collected = collect.collect_posture(recording_clients(ce), 30, 60, list(api.RI_SERVICES))
+    supported = {
+        "Amazon Elastic Compute Cloud - Compute", "Amazon Relational Database Service",
+        "Amazon ElastiCache", "Amazon Redshift", "Amazon Elasticsearch Service",
+        "Amazon OpenSearch Service", "Amazon MemoryDB",
+    }
+    assert set(ce.filters) <= supported
+    assert "Amazon MemoryDB" in ce.filters
+    assert collected["ri_unmeasurable"] == ["Amazon DynamoDB Service"]
+
+
+@pytest.mark.unit
+def test_unfilterable_dynamodb_is_a_blind_spot_not_a_failed_gate():
+    snapshot = collect.posture_snapshot(recording_clients(RecordingCE()), 30, 60, list(api.RI_SERVICES))
+    assert not any("DynamoDB" in s for s in snapshot["unmeasured"])
+    assert any("DynamoDB reservation coverage and utilization are not exposed" in n
+               for n in snapshot["notes"])
+    assert snapshot["safe_to_buy_more"] is not None
+
+
+@pytest.mark.unit
 def test_posture_snapshot_is_not_safe_when_nothing_was_measured():
     from botocore.exceptions import ClientError
 

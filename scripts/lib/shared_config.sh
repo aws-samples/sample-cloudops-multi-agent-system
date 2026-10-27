@@ -309,6 +309,10 @@ def set_tool_var(tool, env_key, answer_key):
         tev.setdefault(tool, {})[env_key] = answers[answer_key]
 set_tool_var("cost-explorer", "CROSS_ACCOUNT_ROLE_ARN", "CROSS_ACCOUNT_ROLE_ARN")
 set_tool_var("cost-optimization-hub", "CROSS_ACCOUNT_ROLE_ARN_COH", "CROSS_ACCOUNT_ROLE_ARN_COH")
+# commitments reads Cost Explorer in the payer (same role as cost-explorer) and
+# COH through its own alias, so it needs both — see docs/agents/cost-operations.md.
+set_tool_var("commitments", "CROSS_ACCOUNT_ROLE_ARN", "CROSS_ACCOUNT_ROLE_ARN")
+set_tool_var("commitments", "CROSS_ACCOUNT_ROLE_ARN_COH", "CROSS_ACCOUNT_ROLE_ARN_COH")
 set_tool_var("tag-governance", "CROSS_ACCOUNT_ROLE_ARN_TAG_GOVERNANCE", "CROSS_ACCOUNT_ROLE_ARN_TAG_GOVERNANCE")
 set_tool_var("cloudwatch", "CROSS_ACCOUNT_ROLE_ARN_CLOUDWATCH", "CROSS_ACCOUNT_ROLE_ARN_CLOUDWATCH")
 set_tool_var("cur-athena", "CUR_DATABASE_NAME", "CUR_DATABASE_NAME")

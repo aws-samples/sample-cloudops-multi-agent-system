@@ -146,7 +146,10 @@ on a delegated admin account that's separate from the payer.
      `commitments` in `src/lambda/mcp/tools.json`.
   4. `make reconfigure-shared` — fill in
      `CROSS_ACCOUNT_ROLE_ARN` and (optional)
-     `CROSS_ACCOUNT_ROLE_ARN_COH`.
+     `CROSS_ACCOUNT_ROLE_ARN_COH`. Both values are written to the
+     `cost-explorer` / `cost-optimization-hub` tools **and** to `commitments`
+     (`tool_env_vars` in `terraform/config.auto.tfvars.json`), which is also
+     what scopes each Lambda's `sts:AssumeRole` grant to the role.
   5. `make deploy-auto` in the ops account.
 
 ---

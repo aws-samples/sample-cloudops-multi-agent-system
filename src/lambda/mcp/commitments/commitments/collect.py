@@ -34,6 +34,7 @@ from .analyze import (
 )
 from .api import (
     CE_PRICE_PER_REQUEST,
+    RI_POSTURE_FILTER_VALUES,
     RI_SERVICE_LABELS,
     RI_SERVICES,
     SP_TYPE_LABELS,
@@ -357,8 +358,13 @@ def collect_posture(
 
     Every key is always present; a failed query lands as `{"error": ...}` in its
     own slot so the caller can report partial posture instead of nothing.
+    Services Cost Explorer cannot filter coverage/utilization by (DynamoDB) are
+    not queried; they come back under `ri_unmeasurable` so the report can
+    declare the blind spot without treating it as a failed gate.
     """
-    services = list(dict.fromkeys(ri_services or []))
+    requested = list(dict.fromkeys(ri_services or []))
+    services = [s for s in requested if s in RI_POSTURE_FILTER_VALUES]
+    unmeasurable = [s for s in requested if s not in RI_POSTURE_FILTER_VALUES]
     jobs: dict[str, Callable[[], dict]] = {
         "eligible_spend": lambda: get_eligible_spend(clients, spend_days),
     }
@@ -378,6 +384,7 @@ def collect_posture(
         "sp_utilization": collected.get("sp_utilization", {}),
         "ri_coverage": {s: collected[f"ri_coverage:{s}"] for s in services},
         "ri_utilization": {s: collected[f"ri_utilization:{s}"] for s in services},
+        "ri_unmeasurable": unmeasurable,
         "coh_enrollment": collected.get("coh_enrollment", {}),
         "coh_preferences": collected.get("coh_preferences", {}),
         "eligible_spend": collected["eligible_spend"],
@@ -385,12 +392,20 @@ def collect_posture(
 
 
 def posture_from(collected: dict) -> dict:
-    return assess_existing_posture(
+    posture = assess_existing_posture(
         collected["sp_coverage"],
         collected["sp_utilization"],
         collected["ri_coverage"],
         collected["ri_utilization"],
     )
+    # A known blind spot, not a failed query: it must not null the gate.
+    for service in collected.get("ri_unmeasurable", []):
+        label = RI_SERVICE_LABELS.get(service, service)
+        posture["notes"].append(
+            f"{label} reservation coverage and utilization are not exposed by "
+            "Cost Explorer, so existing reservations for it were not checked."
+        )
+    return posture
 
 
 def collect_inventory(

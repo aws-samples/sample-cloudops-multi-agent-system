@@ -165,7 +165,7 @@ aws ce get-savings-plans-utilization --region us-east-1 \
   --time-period Start=2026-08-04,End=2026-09-03 --granularity MONTHLY \
   --query 'Total.Utilization.[UtilizationPercentage,UnusedCommitment]' --output text
 
-SVC="Amazon Relational Database Service"   # repeat per service
+SVC="Amazon Relational Database Service"   # repeat per service; filter names differ, see below
 aws ce get-reservation-coverage --region us-east-1 \
   --time-period Start=2026-08-04,End=2026-09-03 --granularity MONTHLY \
   --filter "{\"Dimensions\":{\"Key\":\"SERVICE\",\"Values\":[\"$SVC\"]}}" \
@@ -176,6 +176,8 @@ aws ce get-reservation-utilization --region us-east-1 \
   --filter "{\"Dimensions\":{\"Key\":\"SERVICE\",\"Values\":[\"$SVC\"]}}" \
   --query 'Total.[UtilizationPercentage,PurchasedHours,UnusedHours,RealizedSavings]' --output text
 ```
+
+The coverage/utilization `SERVICE` filter does **not** take the purchase-recommendation names: use `Amazon MemoryDB` (no ` Service` suffix) for MemoryDB, and skip DynamoDB — the filter has no value for it, so DynamoDB reserved capacity posture cannot be measured; say so rather than reporting the gate as failed. The other six names are the same in both places.
 
 All-zero results mean **no commitment exists**, not 0% utilization on a broken one. Say which it is. `DataUnavailableException` means the same — nothing held. Any *other* error (AccessDenied, a window older than Cost Explorer retains) means posture could **not** be measured: say so, and do not treat the gate as passed.
 
@@ -334,7 +336,7 @@ Interpret what they return; if it carries an error (no credentials, `AccessDenie
 ## Common mistakes
 
 - **The 4th Savings Plan type is `DATABASE_SP`.** Not `MACHINE_LEARNING_SP` — that value does not exist and the call fails.
-- **Do not guess RI service names.** They are inconsistent: `Amazon MemoryDB Service` and `Amazon DynamoDB Service` carry a ` Service` suffix that `Amazon Redshift` does not. SageMaker, Lambda, Fargate, Aurora, CloudFront, S3, Neptune, DocumentDB, MSK, Kinesis and Timestream are all rejected.
+- **Do not guess RI service names.** They are inconsistent: `Amazon MemoryDB Service` and `Amazon DynamoDB Service` carry a ` Service` suffix that `Amazon Redshift` does not — and the coverage/utilization `SERVICE` filter spells MemoryDB `Amazon MemoryDB` and has no DynamoDB value at all (§3). SageMaker, Lambda, Fargate, Aurora, CloudFront, S3, Neptune, DocumentDB, MSK, Kinesis and Timestream are all rejected.
 - **Cost Explorer returns money and percentages as JSON strings**, and `""` for absent values. Treat empty string as "no data", not zero.
 - **`OfferingClass` is EC2-only.** Sending it elsewhere is a `ValidationException`.
 - **`PAYER` aggregates the organization.** A member account cannot purchase a payer-scoped recommendation.

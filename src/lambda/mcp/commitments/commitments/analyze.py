@@ -305,17 +305,20 @@ def _blend_confidence(lines: list[LineItem]) -> str:
 
 
 def _weighted_break_even(lines: list[LineItem]) -> float | None:
-    """Upfront-weighted break-even across lines.
+    """Upfront-weighted break-even across the lines actually bought.
 
     An unweighted mean lets a $50 line with a 2-month break-even pull a
-    $50,000 line's 11 months down to 6.5.
+    $50,000 line's 11 months down to 6.5. Lines excluded as do-not-buy are not
+    part of the purchase, so they must not pull the figure up either; the
+    weight is each line's upfront at the achievable size for the same reason.
     """
     weighted = [
-        (line.break_even_months, line.aws_upfront_cost)
+        (line.break_even_months, line.upfront_cost)
         for line in lines
-        if line.break_even_months is not None
+        if not line.do_not_buy
+        and line.break_even_months is not None
         and math.isfinite(line.break_even_months)
-        and line.aws_upfront_cost > 0
+        and line.upfront_cost > 0
     ]
     total = sum(w for _, w in weighted)
     if total <= 0:

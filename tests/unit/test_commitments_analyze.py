@@ -422,6 +422,10 @@ def test_an_ri_line_that_cannot_pay_back_is_excluded_not_averaged():
     assert excluded[0].achievable == 0
     assert not f.do_not_buy
     assert f.safe_monthly_savings == pytest.approx(400.0)
+    # The rejected 40-month line is not bought, so it must not drag the
+    # finding's break-even past the 12-month term (equal upfront would
+    # otherwise report 24 months on a purchase that pays back in 8).
+    assert f.break_even_months == pytest.approx(8.0)
 
 
 @pytest.mark.unit

@@ -62,6 +62,21 @@ RI_SERVICE_LABELS = {
     "Amazon DynamoDB Service": "DynamoDB",
 }
 
+# The coverage/utilization SERVICE filter accepts a DIFFERENT set of names than
+# the purchase-recommendation `Service` parameter above, read back the same way
+# (ValidationException "Supported values for Service Filter are ..."). MemoryDB
+# drops the "Service" suffix, and DynamoDB reserved capacity has no filter
+# value at all, so its coverage and utilization cannot be measured.
+RI_POSTURE_FILTER_VALUES = {
+    "Amazon Elastic Compute Cloud - Compute": "Amazon Elastic Compute Cloud - Compute",
+    "Amazon Relational Database Service": "Amazon Relational Database Service",
+    "Amazon Redshift": "Amazon Redshift",
+    "Amazon ElastiCache": "Amazon ElastiCache",
+    "Amazon Elasticsearch Service": "Amazon Elasticsearch Service",
+    "Amazon OpenSearch Service": "Amazon OpenSearch Service",
+    "Amazon MemoryDB Service": "Amazon MemoryDB",
+}
+
 SP_TYPES = ("COMPUTE_SP", "EC2_INSTANCE_SP", "SAGEMAKER_SP", "DATABASE_SP")
 
 SP_TYPE_LABELS = {
@@ -543,7 +558,13 @@ def get_sp_utilization(clients: Clients, days: int) -> dict[str, Any]:
 
 
 def _service_filter(service: str) -> dict[str, Any]:
-    return {"Dimensions": {"Key": "SERVICE", "Values": [service]}}
+    """Coverage/utilization filter for a recommendation-API service name."""
+    return {
+        "Dimensions": {
+            "Key": "SERVICE",
+            "Values": [RI_POSTURE_FILTER_VALUES[service]],
+        }
+    }
 
 
 def get_ri_coverage(clients: Clients, days: int, service: str) -> dict[str, Any]:

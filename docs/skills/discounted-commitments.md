@@ -220,11 +220,15 @@ every response carries `queries_run` and `estimated_api_cost_usd`.
 | Skill default (`COMPUTE_SP` × 2 terms × 2 payments, plus 4 posture calls) | 8 | $0.08 |
 | MCP tool default (4 SP types + 8 RI services, × 2 terms × 2 payments) | 48 recommendations + 3 posture/spend + 2 per reservation service measured | ~$0.51–0.67 |
 | Adding `PARTIAL_UPFRONT` to the tool default | 72 + 3 + 2 per service | ~$0.75–0.91 |
-| `get_commitment_posture` default (all 8 reservation services) | 2 SP + 16 RI + 1 spend | $0.19 |
+| `get_commitment_posture` default (all 7 measurable reservation services) | 2 SP + 14 RI + 1 spend | $0.17 |
 
 Reservation posture is two requests per service because Cost Explorer only
 reports reservation utilization and coverage for one service per query (§6,
-*Posture gate*). `generate_commitment_analysis` measures only the services
+*Posture gate*). The coverage/utilization `SERVICE` filter takes different
+names than the recommendation API (`Amazon MemoryDB`, not
+`Amazon MemoryDB Service`) and has no value for DynamoDB, so DynamoDB
+reservation posture is not queried — it is declared as a blind spot in the
+notes and does not null the gate. `generate_commitment_analysis` measures only the services
 that produced a finding or appear in the inventory; `get_commitment_posture`
 takes `ri_services` to narrow it.
 
@@ -542,7 +546,9 @@ Same per-line sizing in whole units, with three differences:
 
 - **Break-even comes from the API** (`EstimatedBreakEvenInMonths`) so it ties
   out to the console, falling back to the cash formula when AWS omits it. The
-  family figure is **weighted by upfront** — an unweighted mean lets a $50
+  family figure is **weighted by achievable upfront over the lines actually
+  bought** — a do-not-buy line is excluded rather than averaged in, so it
+  cannot push the figure past the term — and an unweighted mean lets a $50
   line's 2 months pull a $50,000 line's 11 months down to 6.5.
 - **Waste is priced per idle reservation** at
   `(upfront ÷ term_months + RecurringStandardMonthlyCost) ÷ recommended`.
@@ -1287,6 +1293,7 @@ constants has no test — verify it by hand against `analyze.py` after any chang
 | Savings Plan exposure looks ~1000× too small | `commitment` read as a unit count | It is USD/hour — multiply by 730 for monthly |
 | `expiry` is `null` on a `generate_commitment_analysis` response | `regions` was not passed — the inventory is opt-in | Pass `regions`, or call `get_commitment_expiry` |
 | DynamoDB reserved capacity missing from the inventory | No describe API exists for it, in any SDK | Permanent blind spot, declared in `INVENTORY_BLIND_SPOTS` and printed in the report |
+| `ValidationException: Supported values for Service Filter are …` on reservation coverage/utilization | Used a purchase-recommendation service name in the `SERVICE` filter | Map through `RI_POSTURE_FILTER_VALUES`: MemoryDB is `Amazon MemoryDB` there, and DynamoDB has no filter value (not queried) |
 | Every expiring row of one service shows the same utilization | Correct — AWS publishes utilization per service, never per commitment | Treat it as the portfolio signal it is; the report states this inline |
 | A member account's RI is missing from the inventory | `Describe*` lists only the calling account's own purchases, although PAYER coverage and utilization include it | Declared in `INVENTORY_BLIND_SPOTS`; inventory from the purchasing account to see it |
 | A recommendation total cannot be purchased as one reservation | `RecommendationSummary` sums every specification in `details[]` — a single RDS finding routinely spans Multi-AZ and Single-AZ | Quote the total as a budget and buy from `line_items`; each line is one purchasable spec |
