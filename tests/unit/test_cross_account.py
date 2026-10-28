@@ -210,3 +210,77 @@ class TestDynamicPerAccount:
         with patch("shared.cross_account.boto3.client", return_value=sts):
             result = ca.assume_role_for_account("123", "Missing")
         assert result is None
+
+
+class TestSessionLifetime:
+    """Warm containers outlive 15-minute credentials; failures must not stick."""
+
+    def _sts(self, expiration):
+        sts = MagicMock()
+        sts.assume_role.return_value = {
+            "Credentials": {
+                "AccessKeyId": "AK",
+                "SecretAccessKey": "SK",
+                "SessionToken": "TK",
+                "Expiration": expiration,
+            }
+        }
+        return sts
+
+    def test_a_session_near_expiry_is_reassumed(self, monkeypatch):
+        from datetime import datetime, timedelta, timezone
+
+        monkeypatch.setenv("CROSS_ACCOUNT_ROLE_ARN", "arn:aws:iam::111:role/X")
+        soon = datetime.now(timezone.utc) + timedelta(seconds=60)
+        sts = self._sts(soon)
+        with patch("shared.cross_account.boto3.client", return_value=sts):
+            ca.get_cross_account_session()
+            ca.get_cross_account_session()
+        assert sts.assume_role.call_count == 2
+
+    def test_a_fresh_session_is_reused(self, monkeypatch):
+        from datetime import datetime, timedelta, timezone
+
+        monkeypatch.setenv("CROSS_ACCOUNT_ROLE_ARN", "arn:aws:iam::111:role/X")
+        later = datetime.now(timezone.utc) + timedelta(minutes=15)
+        sts = self._sts(later)
+        with patch("shared.cross_account.boto3.client", return_value=sts):
+            first = ca.get_cross_account_session()
+            second = ca.get_cross_account_session()
+        assert first is second
+        assert sts.assume_role.call_count == 1
+
+    def test_a_failed_assume_role_is_retried_not_cached(self, monkeypatch):
+        """lru_cache once pinned a transient STS failure for the container's life."""
+        monkeypatch.setenv("CROSS_ACCOUNT_ROLE_ARN", "arn:aws:iam::111:role/X")
+        sts = MagicMock()
+        sts.assume_role.side_effect = [
+            RuntimeError("Throttling"),
+            {"Credentials": {"AccessKeyId": "AK", "SecretAccessKey": "SK", "SessionToken": "TK"}},
+        ]
+        with patch("shared.cross_account.boto3.client", return_value=sts):
+            assert ca.get_cross_account_session() is None
+            assert ca.get_cross_account_session() is not None
+        assert sts.assume_role.call_count == 2
+
+
+class TestRequireRole:
+    def test_configured_but_unassumable_role_raises_when_required(self, monkeypatch):
+        monkeypatch.setenv("CROSS_ACCOUNT_ROLE_ARN", "arn:aws:iam::111:role/X")
+        sts = MagicMock()
+        sts.assume_role.side_effect = RuntimeError("AccessDenied")
+        with patch("shared.cross_account.boto3.client", return_value=sts):
+            with pytest.raises(ca.CrossAccountRoleError, match="refusing to fall back"):
+                ca.get_aws_client("ce", require_role=True)
+
+    def test_default_keeps_the_historical_fallback(self, monkeypatch):
+        monkeypatch.setenv("CROSS_ACCOUNT_ROLE_ARN", "arn:aws:iam::111:role/X")
+        sts = MagicMock()
+        sts.assume_role.side_effect = RuntimeError("AccessDenied")
+        with patch("shared.cross_account.boto3.client", return_value=sts):
+            assert ca.get_aws_client("ce") is sts
+
+    def test_no_role_configured_is_not_an_error_even_when_required(self):
+        with patch("shared.cross_account.boto3.client") as mock_client:
+            mock_client.return_value = "EXEC"
+            assert ca.get_aws_client("ce", require_role=True) == "EXEC"

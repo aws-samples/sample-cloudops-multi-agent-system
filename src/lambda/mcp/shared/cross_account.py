@@ -5,8 +5,8 @@ Two scenarios are supported:
 1. **Static targets, known at deploy time.** The Lambda reads
    ``CROSS_ACCOUNT_ROLE_ARN`` (or ``CROSS_ACCOUNT_ROLE_ARN_<ALIAS>``
    when a single Lambda needs multiple named roles) from its env and
-   assumes that role once per cold start. ``get_aws_client(service,
-   role_alias=...)`` is the main entry point.
+   assumes that role, re-assuming before the credentials expire.
+   ``get_aws_client(service, role_alias=...)`` is the main entry point.
 
 2. **Dynamic spoke accounts, discovered at runtime.** Same role name is
    provisioned in many accounts (e.g. via a CloudFormation StackSet over
@@ -17,7 +17,12 @@ Two scenarios are supported:
 Both paths degrade gracefully: if no env var is set (Scenario 1) or the
 AssumeRole call fails (Scenario 2), Scenario 1 falls back to the Lambda
 execution role and Scenario 2 returns ``None`` so the caller can skip
-that account without aborting the broader discovery.
+that account without aborting the broader discovery. A Scenario 1 caller
+that must not answer for the wrong account passes ``require_role=True``
+and gets ``CrossAccountRoleError`` instead of the fallback.
+
+Assumed sessions are cached per container and re-assumed before their
+15-minute credentials expire; a failed AssumeRole is never cached.
 
 Env vars:
 
@@ -42,7 +47,8 @@ from __future__ import annotations
 
 import logging
 import os
-from functools import lru_cache
+import threading
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import boto3
@@ -50,9 +56,29 @@ import boto3
 logger = logging.getLogger(__name__)
 
 # Duration matches the old network-resilience bespoke helper (15 min).
-# Short lifetime keeps credential exposure bounded; Lambda containers are
-# typically warm for <15 min between invocations anyway.
+# Short lifetime keeps credential exposure bounded.
 _ASSUME_ROLE_DURATION_SECONDS = 900
+
+# A cached session is re-assumed once it has less than this left. A warm
+# container can outlive the 15-minute credentials many times over, and a
+# session handed out with seconds to spare expires mid-invocation — so the
+# margin covers the longest tool timeout (300 s) with room to spare.
+_REFRESH_MARGIN_SECONDS = 330
+
+# Successful sessions only, with their expiry. A failed AssumeRole is never
+# cached: caching it (as ``lru_cache`` did) pinned a transient STS failure for
+# the life of the container.
+_session_cache: dict[tuple, tuple[boto3.Session, datetime]] = {}
+_session_lock = threading.Lock()
+
+
+class CrossAccountRoleError(RuntimeError):
+    """A configured cross-account role could not be assumed.
+
+    Raised only when the caller passes ``require_role=True``: for a tool whose
+    answer is only meaningful in the target account, quietly falling back to
+    the execution role would answer for the wrong account.
+    """
 
 
 # ---------------------------------------------------------------------------
@@ -72,15 +98,23 @@ def _external_id_env_key(alias: Optional[str]) -> str:
     return "CROSS_ACCOUNT_EXTERNAL_ID"
 
 
-@lru_cache(maxsize=8)
 def _assume_role_session_cached(
     role_arn: str, external_id: str, session_name: str
 ) -> Optional[boto3.Session]:
-    """Internal cache key: (role_arn, external_id, session_name).
+    """Return a cached assumed-role session, re-assuming near expiry.
 
-    ``lru_cache`` reuses the assumed session across invocations within
-    the same container, avoiding an STS call per request.
+    Cache key: (role_arn, external_id, session_name). A session is reused
+    across invocations in the same container until it is within
+    ``_REFRESH_MARGIN_SECONDS`` of expiring, then replaced. Failures return
+    ``None`` and are not cached, so the next call retries.
     """
+    key = (role_arn, external_id, session_name)
+    now = datetime.now(timezone.utc)
+    with _session_lock:
+        cached = _session_cache.get(key)
+    if cached and cached[1] - now > timedelta(seconds=_REFRESH_MARGIN_SECONDS):
+        return cached[0]
+
     sts = boto3.client("sts")
     params: dict = {
         "RoleArn": role_arn,
@@ -98,11 +132,19 @@ def _assume_role_session_cached(
         )
         return None
 
-    return boto3.Session(
+    expiry = creds.get("Expiration")
+    if not isinstance(expiry, datetime):
+        expiry = now + timedelta(seconds=_ASSUME_ROLE_DURATION_SECONDS)
+    elif expiry.tzinfo is None:
+        expiry = expiry.replace(tzinfo=timezone.utc)
+    session = boto3.Session(
         aws_access_key_id=creds["AccessKeyId"],
         aws_secret_access_key=creds["SecretAccessKey"],
         aws_session_token=creds["SessionToken"],
     )
+    with _session_lock:
+        _session_cache[key] = (session, expiry)
+    return session
 
 
 def get_cross_account_session(
@@ -128,6 +170,7 @@ def get_aws_client(
     service_name: str,
     region_name: Optional[str] = None,
     role_alias: Optional[str] = None,
+    require_role: bool = False,
     **kwargs,
 ):
     """Return a boto3 client — assumed-role if configured, else execution-role.
@@ -137,9 +180,19 @@ def get_aws_client(
         region_name: Optional region. Pass explicitly for us-east-1-only APIs.
         role_alias: Optional alias that selects ``CROSS_ACCOUNT_ROLE_ARN_<ALIAS>``
             from env. Omit to use the default unnamed role.
+        require_role: When a role ARN IS configured but cannot be assumed,
+            raise ``CrossAccountRoleError`` instead of falling back to the
+            execution role. Default ``False`` keeps the historical fallback.
         **kwargs: Forwarded to ``boto3.client`` (endpoint_url, config, etc.).
     """
     session = get_cross_account_session(role_alias)
+    if session is None and require_role and os.environ.get(_role_env_key(role_alias)):
+        raise CrossAccountRoleError(
+            f"Could not assume {os.environ[_role_env_key(role_alias)]} "
+            f"({_role_env_key(role_alias)}); refusing to fall back to the "
+            "execution role, which would read the wrong account. Check the "
+            "role's trust policy names this tool's role."
+        )
     client_kwargs = {"region_name": region_name} if region_name else {}
     client_kwargs.update(kwargs)
 
@@ -153,7 +206,6 @@ def get_aws_client(
 # ---------------------------------------------------------------------------
 
 
-@lru_cache(maxsize=128)
 def _assume_role_for_account_cached(
     account_id: str,
     role_name: str,
@@ -162,8 +214,8 @@ def _assume_role_for_account_cached(
 ) -> Optional[boto3.Session]:
     """Cache key: (account_id, role_name, external_id, session_name).
 
-    ``maxsize=128`` covers most Orgs; beyond that LRU evicts the oldest
-    sessions, which is fine because STS is cheap when needed.
+    Delegates to ``_assume_role_session_cached``, which caches successes only
+    and re-assumes near expiry.
     """
     role_arn = f"arn:aws:iam::{account_id}:role/{role_name}"
     return _assume_role_session_cached(role_arn, external_id, session_name)
@@ -219,5 +271,5 @@ def assume_role_for_account(
 
 
 def _reset_caches_for_testing() -> None:
-    _assume_role_session_cached.cache_clear()
-    _assume_role_for_account_cached.cache_clear()
+    with _session_lock:
+        _session_cache.clear()

@@ -180,6 +180,28 @@ PY
 )
 assert_eq "$(echo "$RESULT" | sed -n '1p')" "[]" "empty CSV produces empty list"
 
+# -----------------------------------------------------------------------------
+# Test 4: the payer roles reach the commitments Lambda, not only cost-explorer
+# and cost-optimization-hub. Terraform reads Lambda env (and the scoped
+# sts:AssumeRole grant) only from tool_env_vars, so without this the tool
+# silently analyzes the ops account in Mode B.
+# -----------------------------------------------------------------------------
+ANS_CROSS_ACCOUNT_ROLE_ARN="arn:aws:iam::777777777777:role/PayerReader"
+ANS_CROSS_ACCOUNT_ROLE_ARN_COH="arn:aws:iam::888888888888:role/COHReader"
+export ANS_CROSS_ACCOUNT_ROLE_ARN ANS_CROSS_ACCOUNT_ROLE_ARN_COH
+
+shared_config_write_tfvars
+
+RESULT=$(.venv/bin/python - <<'PY'
+import json
+tev = json.load(open("terraform/config.auto.tfvars.json")).get("tool_env_vars", {})
+print(json.dumps(tev.get("commitments", {}), sort_keys=True))
+print(tev.get("cost-explorer", {}).get("CROSS_ACCOUNT_ROLE_ARN", ""))
+PY
+)
+assert_eq "$(echo "$RESULT" | sed -n '1p')" '{"CROSS_ACCOUNT_ROLE_ARN": "arn:aws:iam::777777777777:role/PayerReader", "CROSS_ACCOUNT_ROLE_ARN_COH": "arn:aws:iam::888888888888:role/COHReader"}' "commitments receives both payer roles"
+assert_eq "$(echo "$RESULT" | sed -n '2p')" "arn:aws:iam::777777777777:role/PayerReader" "cost-explorer still receives the payer role"
+
 echo
 echo "----------------------------------------"
 echo "Ran $TESTS_RUN tests, $TESTS_FAILED failed."
