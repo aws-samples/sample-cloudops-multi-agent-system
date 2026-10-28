@@ -1,0 +1,457 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Lambda Runtime Upgrade MCP server: Bedrock AgentCore Gateway (SigV4) + read-only Lambda
+  tool that discovers deprecated Lambda runtimes, reads function code, and detects breaking changes. Console-only
+  deploy; no CLI needed.'
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+    - Label:
+        default: Deployment package
+      Parameters:
+      - CodeBucket
+      - CodeKey
+    - Label:
+        default: Naming
+      Parameters:
+      - Prefix
+      - LogRetentionDays
+    - Label:
+        default: Cross-account scanning (optional)
+      Parameters:
+      - CrossAccountRoleArn
+      - CrossAccountExternalId
+    - Label:
+        default: AWS DevOps Agent integration (optional)
+      Parameters:
+      - CreateDevOpsAgentRole
+      - DevOpsAgentAccountId
+    ParameterLabels:
+      CodeBucket:
+        default: S3 bucket containing lambda-runtime-tool.zip
+      CodeKey:
+        default: S3 key of the zip
+      Prefix:
+        default: Resource name prefix
+      LogRetentionDays:
+        default: CloudWatch Logs retention (days)
+      CrossAccountRoleArn:
+        default: Role ARN to assume in a target account
+      CrossAccountExternalId:
+        default: External ID for that role
+      CreateDevOpsAgentRole:
+        default: Create IAM role for AWS DevOps Agent?
+      DevOpsAgentAccountId:
+        default: Account ID that owns the DevOps Agent Space
+Parameters:
+  CodeBucket:
+    Type: String
+    Description: Name of the S3 bucket where you uploaded lambda-runtime-tool.zip. Must be in the same
+      region as this stack.
+  CodeKey:
+    Type: String
+    Default: lambda-runtime-tool.zip
+    Description: Object key (path) of the zip inside the bucket.
+  Prefix:
+    Type: String
+    Default: lambda-upgrade
+    AllowedPattern: ^[a-z][a-z0-9-]{1,30}$
+    ConstraintDescription: lowercase letters, digits, hyphens; 2-31 chars; must start with a letter
+    Description: Prefix for all resource names (gateway, Lambda, roles).
+  LogRetentionDays:
+    Type: Number
+    Default: 30
+    AllowedValues:
+    - 7
+    - 14
+    - 30
+    - 60
+    - 90
+    - 180
+    - 365
+  CrossAccountRoleArn:
+    Type: String
+    Default: ''
+    Description: Optional. IAM role ARN in another account for the tool to assume (read-only Lambda/EC2
+      permissions). Leave blank to scan this account only.
+  CrossAccountExternalId:
+    Type: String
+    Default: ''
+    NoEcho: true
+    Description: Optional. External ID required by the cross-account role, if any.
+  CreateDevOpsAgentRole:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+    - 'true'
+    - 'false'
+    Description: Create the IAM role that AWS DevOps Agent assumes to call this gateway (SigV4).
+  DevOpsAgentAccountId:
+    Type: String
+    Default: ''
+    AllowedPattern: ^$|^[0-9]{12}$
+    Description: Account that owns the DevOps Agent Space. Leave blank to use this account.
+Conditions:
+  HasCrossAccountRole:
+    Fn::Not:
+    - Fn::Equals:
+      - Ref: CrossAccountRoleArn
+      - ''
+  CreateDevOpsRole:
+    Fn::Equals:
+    - Ref: CreateDevOpsAgentRole
+    - 'true'
+  DevOpsAccountIsThisAccount:
+    Fn::Equals:
+    - Ref: DevOpsAgentAccountId
+    - ''
+Resources:
+  ToolLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName:
+        Fn::Sub: /aws/lambda/${Prefix}-lambda-runtime-tool
+      RetentionInDays:
+        Ref: LogRetentionDays
+  ToolRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName:
+        Fn::Sub: ${Prefix}-lambda-runtime-tool-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: lambda.amazonaws.com
+          Action: sts:AssumeRole
+      Policies:
+      - PolicyName: lambda-runtime-tool-readonly
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - lambda:ListFunctions
+            - lambda:GetFunction
+            - lambda:GetFunctionConfiguration
+            - ec2:DescribeRegions
+            - cloudwatch:GetMetricData
+            Resource: '*'
+          - Effect: Allow
+            Action:
+            - logs:CreateLogStream
+            - logs:PutLogEvents
+            Resource:
+              Fn::Sub: arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${Prefix}-lambda-runtime-tool:*
+  ToolRoleCrossAccountPolicy:
+    Type: AWS::IAM::Policy
+    Condition: HasCrossAccountRole
+    Properties:
+      PolicyName: lambda-runtime-tool-assume-cross-account
+      Roles:
+      - Ref: ToolRole
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Action: sts:AssumeRole
+          Resource:
+            Ref: CrossAccountRoleArn
+  ToolFunction:
+    Type: AWS::Lambda::Function
+    DependsOn:
+    - ToolLogGroup
+    Properties:
+      FunctionName:
+        Fn::Sub: ${Prefix}-lambda-runtime-tool
+      Description: Lambda Runtime Upgrade MCP tool (read-only). Discovers deprecated runtimes, downloads
+        code, detects breaking changes.
+      Runtime: python3.12
+      Handler: handler.handler
+      Timeout: 120
+      MemorySize: 512
+      Role:
+        Fn::GetAtt:
+        - ToolRole
+        - Arn
+      Code:
+        S3Bucket:
+          Ref: CodeBucket
+        S3Key:
+          Ref: CodeKey
+      Environment:
+        Variables:
+          CROSS_ACCOUNT_ROLE_ARN:
+            Ref: CrossAccountRoleArn
+          CROSS_ACCOUNT_EXTERNAL_ID:
+            Ref: CrossAccountExternalId
+  GatewayRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName:
+        Fn::Sub: ${Prefix}-agentcore-gateway-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - bedrock-agentcore.amazonaws.com
+            - bedrock.amazonaws.com
+          Action: sts:AssumeRole
+          Condition:
+            StringEquals:
+              aws:SourceAccount:
+                Ref: AWS::AccountId
+      Policies:
+      - PolicyName: invoke-tool-lambda
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action: lambda:InvokeFunction
+            Resource:
+              Fn::GetAtt:
+              - ToolFunction
+              - Arn
+  Gateway:
+    Type: AWS::BedrockAgentCore::Gateway
+    Properties:
+      Name:
+        Fn::Sub: ${Prefix}-gateway
+      Description: MCP gateway for the Lambda Runtime Upgrade tool (SigV4 auth)
+      ProtocolType: MCP
+      AuthorizerType: AWS_IAM
+      RoleArn:
+        Fn::GetAtt:
+        - GatewayRole
+        - Arn
+  GatewayTarget:
+    Type: AWS::BedrockAgentCore::GatewayTarget
+    Properties:
+      GatewayIdentifier:
+        Fn::GetAtt:
+        - Gateway
+        - GatewayIdentifier
+      Name: lambda-runtime
+      Description: Lambda runtime upgrade discovery, code analysis, migration guidance
+      CredentialProviderConfigurations:
+      - CredentialProviderType: GATEWAY_IAM_ROLE
+      TargetConfiguration:
+        Mcp:
+          Lambda:
+            LambdaArn:
+              Fn::GetAtt:
+              - ToolFunction
+              - Arn
+            ToolSchema:
+              InlinePayload:
+              - Name: generate_upgrade_analysis
+                Description: 'ONE-SHOT fast path for upgrade reports. In a single call, discovers regions
+                  (or uses the ones you pass), scans them all in parallel for deprecated/EOL functions,
+                  enriches each with an effort bucket (green=direct flip / yellow=dependency-or-native
+                  rebuild / red=SDK migration), a test-artifact flag, and days-since-last-invocation (CloudWatch),
+                  then downloads code for the top code-change-risk functions and runs deterministic breaking-change
+                  detection. Returns a pre-analyzed dataset: summary (counts by priority/effort/region/runtime),
+                  deletion_candidates (test/idle functions), grouping (quick_wins/dependency_rebuilds/sdk_migrations),
+                  top_inventory (capped sample), and detailed_analysis (per-function code findings with
+                  file/line/fix). PREFER THIS over calling other tools separately — it is far faster and
+                  avoids many round-trips. Render the report from the counts and groups; do NOT print
+                  every function individually.'
+                InputSchema:
+                  Type: object
+                  Properties:
+                    regions:
+                      Type: array
+                      Description: Regions to scan (e.g., ['us-east-1','eu-west-1']). Omit to auto-discover
+                        all regions with Lambda functions.
+                      Items:
+                        Type: string
+                    max_functions_to_analyze:
+                      Type: integer
+                      Description: 'How many top-priority functions to download code for and deep-analyze
+                        (default: 5, max: 10). Others get inventory-only entries.'
+                    include_approaching_deprecation:
+                      Type: boolean
+                      Description: 'Include functions approaching deprecation within 6 months (default:
+                        true).'
+              - Name: discover_lambda_regions
+                Description: Discover which AWS regions have Lambda functions deployed. Scans all enabled
+                  regions in parallel and returns each region's function count plus how many are on deprecated
+                  or end-of-life runtimes. Use this FIRST to let the user choose which regions to include
+                  in a report.
+                InputSchema:
+                  Type: object
+              - Name: list_functions_by_runtime
+                Description: List Lambda functions with their runtime status. Optionally filter by runtime
+                  identifier or region. Returns function name, current runtime, support status, and recommended
+                  upgrade target.
+                InputSchema:
+                  Type: object
+                  Properties:
+                    runtime:
+                      Type: string
+                      Description: Filter by specific runtime (e.g., python3.9, nodejs18.x, java11)
+                    region:
+                      Type: string
+                      Description: 'AWS region to scan (default: current region)'
+                    max_results:
+                      Type: integer
+                      Description: 'Maximum functions to return (default: 100, max: 500)'
+              - Name: get_function_configuration
+                Description: Get detailed configuration for a specific Lambda function including runtime,
+                  handler, layers, memory, timeout, architecture, and environment variable keys. Use this
+                  before code analysis to understand the function's setup.
+                InputSchema:
+                  Type: object
+                  Required:
+                  - function_name
+                  Properties:
+                    function_name:
+                      Type: string
+                      Description: Lambda function name or ARN
+                    region:
+                      Type: string
+                      Description: AWS region (optional)
+              - Name: get_function_code
+                Description: Download and return the source code files from a Lambda function's deployment
+                  package. Extracts .py, .js, .ts, .java, .cs, .rb, .go files plus dependency manifests
+                  (requirements.txt, package.json, pom.xml, etc.). Skips node_modules, __pycache__, and
+                  vendor directories. Use this to analyze code for runtime compatibility issues.
+                InputSchema:
+                  Type: object
+                  Required:
+                  - function_name
+                  Properties:
+                    function_name:
+                      Type: string
+                      Description: Lambda function name or ARN
+                    region:
+                      Type: string
+                      Description: AWS region (optional)
+                    max_file_size_kb:
+                      Type: integer
+                      Description: 'Max size per file in KB (default: 50). Files exceeding this are skipped.'
+                    include_patterns:
+                      Type: array
+                      Description: Only include files matching these substrings (e.g., ['handler', 'main'])
+                      Items:
+                        Type: string
+              - Name: get_runtime_support_status
+                Description: Get support status for all AWS Lambda runtimes including active, deprecated,
+                  and end-of-life runtimes with their deprecation dates and recommended upgrade targets.
+                  Optionally filter by runtime family.
+                InputSchema:
+                  Type: object
+                  Properties:
+                    family:
+                      Type: string
+                      Description: 'Filter by runtime family: python, nodejs, java, dotnet, ruby, custom'
+              - Name: get_deprecated_functions
+                Description: Find all Lambda functions using deprecated or end-of-life runtimes in a SINGLE
+                  region. Returns functions grouped by runtime with upgrade recommendations. For multi-region
+                  scanning, use get_deprecated_functions_multi_region instead.
+                InputSchema:
+                  Type: object
+                  Properties:
+                    region:
+                      Type: string
+                      Description: 'AWS region to scan (default: current region)'
+                    include_approaching_deprecation:
+                      Type: boolean
+                      Description: 'Include functions with runtimes approaching deprecation within 6 months
+                        (default: false)'
+                    max_results:
+                      Type: integer
+                      Description: 'Maximum functions to return (default: 200, max: 500)'
+              - Name: get_deprecated_functions_multi_region
+                Description: Find all Lambda functions using deprecated or end-of-life runtimes across
+                  MULTIPLE regions in parallel. Much faster than calling get_deprecated_functions repeatedly.
+                  Use this for multi-region upgrade reports.
+                InputSchema:
+                  Type: object
+                  Required:
+                  - regions
+                  Properties:
+                    regions:
+                      Type: array
+                      Description: List of AWS regions to scan (e.g., ['us-east-1', 'eu-west-1', 'ap-southeast-1'])
+                      Items:
+                        Type: string
+                    include_approaching_deprecation:
+                      Type: boolean
+                      Description: 'Include functions with runtimes approaching deprecation within 6 months
+                        (default: false)'
+                    max_results_per_region:
+                      Type: integer
+                      Description: 'Maximum functions per region (default: 100, max: 500)'
+  DevOpsAgentInvokeRole:
+    Type: AWS::IAM::Role
+    Condition: CreateDevOpsRole
+    Properties:
+      RoleName:
+        Fn::Sub: ${Prefix}-devops-agent-gateway-invoke
+      Description: Assumed by AWS DevOps Agent to SigV4-sign MCP calls to the gateway
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: aidevops.amazonaws.com
+          Action: sts:AssumeRole
+          Condition:
+            StringEquals:
+              aws:SourceAccount:
+                Fn::If:
+                - DevOpsAccountIsThisAccount
+                - Ref: AWS::AccountId
+                - Ref: DevOpsAgentAccountId
+      Policies:
+      - PolicyName: invoke-gateway
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action: bedrock-agentcore:InvokeGateway
+            Resource:
+              Fn::GetAtt:
+              - Gateway
+              - GatewayArn
+Outputs:
+  GatewayEndpointUrl:
+    Description: MCP endpoint. Register this in AWS DevOps Agent (Capability Providers > MCP Server) or
+      any MCP client.
+    Value:
+      Fn::GetAtt:
+      - Gateway
+      - GatewayUrl
+  GatewayArn:
+    Value:
+      Fn::GetAtt:
+      - Gateway
+      - GatewayArn
+  GatewayId:
+    Value:
+      Fn::GetAtt:
+      - Gateway
+      - GatewayIdentifier
+  ToolFunctionArn:
+    Value:
+      Fn::GetAtt:
+      - ToolFunction
+      - Arn
+  DevOpsAgentRoleArn:
+    Condition: CreateDevOpsRole
+    Description: 'Select this role when registering the MCP server in DevOps Agent with SigV4 auth. Service
+      name: bedrock-agentcore.'
+    Value:
+      Fn::GetAtt:
+      - DevOpsAgentInvokeRole
+      - Arn
+  SigV4ServiceName:
+    Value: bedrock-agentcore
+  ToolsExposed:
+    Value: generate_upgrade_analysis, discover_lambda_regions, list_functions_by_runtime, get_function_configuration,
+      get_function_code, get_runtime_support_status, get_deprecated_functions, get_deprecated_functions_multi_region
