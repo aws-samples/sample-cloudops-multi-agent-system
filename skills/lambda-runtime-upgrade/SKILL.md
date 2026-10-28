@@ -19,17 +19,47 @@ This skill is designed to be **fast** through two mechanisms:
 This skill works in three environments. Decide which path you are on **before** you start.
 
 ```
-Are lambda-runtime MCP tools available (discover_lambda_regions,
-get_deprecated_functions_multi_region, get_function_code, etc.)?
-├── Yes → Path M (use MCP tools — fastest, handles cross-account + parallel scan)
+Are lambda-runtime MCP tools available (generate_upgrade_analysis,
+discover_lambda_regions, get_function_code, etc.)?
+├── Yes → Path M (use MCP tools — fastest, handles cross-account + parallel scan).
+│         This is the ONLY path you need. The MCP tools do the region scan,
+│         the code download, the unzip, and the breaking-change analysis for
+│         you — SERVER-SIDE — and return source text and a finished report
+│         INLINE in their JSON response. You do NOT need a shell, curl, unzip,
+│         a filesystem, or a coding agent. If you have these tools, STOP
+│         reading about Path A / Path B — they do not apply to you.
 └── No
-    ├── Can you run `aws --version`?
+    ├── Can you run `aws --version`? (i.e. you have a real shell)
     │   ├── Yes → Path A (AWS CLI directly — parallelize with background jobs)
     │   └── No
     │       ├── Is a coding agent enabled? → Path B (delegate — see Appendix)
-    │       └── No → Stop. Tell the user to deploy with DEPLOY_MODE=gateway-only
-    │                    and connect the gateway, or run in a shell-capable agent.
+    │       └── No → Stop. Do NOT improvise with your own native AWS API tools
+    │                    (e.g. lambda:GetFunction) — that only returns a presigned
+    │                    Code.Location URL you cannot open, so you cannot analyze
+    │                    code and must not guess. Tell the user exactly this:
+    │                    "The lambda-runtime MCP tools aren't in my tool list. Register
+    │                    the CloudOps AgentCore gateway as an MCP server in this agent's
+    │                    capabilities (SigV4, service name bedrock-agentcore) and
+    │                    allowlist generate_upgrade_analysis + get_function_code, then
+    │                    re-run." You may still produce a runtime INVENTORY (names +
+    │                    runtimes + priority from the KB) using native ListFunctions,
+    │                    clearly labelled as inventory-only with no code analysis.
 ```
+
+> **Hosted agents (AWS DevOps Agent, Quick, etc.):** you can only reach Path M
+> if the CloudOps gateway is registered as an MCP capability provider in your
+> Agent Space and its lambda-runtime tools are allowlisted. Check your tool list
+> for `generate_upgrade_analysis` first. If it's absent, you are on the "No"
+> branch above — say so, don't work around it.
+
+> **If you are a hosted agent with MCP tools but no shell (e.g. the CloudOps
+> DevOps/supervisor agent): you are on Path M.** Never try to `curl`/`unzip` a
+> presigned URL or read a file from disk — that is a Path A (shell) technique
+> and it will fail for you. On Path M the code arrives as text inside the tool
+> response. If you ever catch yourself thinking "I can't download/unzip/read
+> the source — no shell or file tool," that is the signal that you picked the
+> wrong path: switch to the MCP tools below (`generate_upgrade_analysis` or
+> `get_function_code`), which hand you the source directly.
 
 ## Interactive Q&A flow (do this on every path)
 
@@ -57,31 +87,50 @@ Once you have the answers, run the rest without further questions.
 
 ## Path M — MCP Tools (preferred)
 
-When these tools are available, use them directly. They handle cross-account access and run region scans in parallel server-side.
+When these tools are available, use them directly. They handle cross-account access, run region scans in parallel, **and download + unzip + read the function source server-side.** Every tool returns its results — including source code — as text inside the JSON response. There is no separate download step for you to perform.
 
 | Tool | Use for |
 |------|---------|
-| `discover_lambda_regions` | Find all regions with Lambda functions + per-region deprecated/EOL counts. Runs a parallel scan across all enabled regions. Call this for Q2. |
-| `get_deprecated_functions_multi_region` | Scan MULTIPLE regions in parallel for deprecated/EOL functions. The main workhorse — pass the user's selected regions. |
-| `get_deprecated_functions` | Scan a SINGLE region (use only if the user picked exactly one region). |
+| `generate_upgrade_analysis` | **One-shot, preferred.** Discovers regions, scans them in parallel, downloads and analyzes code for the top functions, and returns a fully-rendered `report_markdown` plus structured data — all in a single call. Use this for any "generate a report" / "find deprecated functions" request. See workflow below. |
+| `discover_lambda_regions` | Find all regions with Lambda functions + per-region deprecated/EOL counts. Runs a parallel scan across all enabled regions. Use for Q2 only when you want the user to hand-pick regions before running the analysis. |
+| `get_deprecated_functions_multi_region` | Scan MULTIPLE regions in parallel for deprecated/EOL functions (no code analysis). Use only if you deliberately want scan-without-code. |
+| `get_deprecated_functions` | Scan a SINGLE region for deprecated/EOL functions. |
 | `list_functions_by_runtime` | List functions filtered by runtime/region with status. |
 | `get_function_configuration` | Function setup — runtime, handler, layers, memory, architecture, env var keys. |
-| `get_function_code` | Download source + dependency manifests for compatibility analysis. |
+| `get_function_code` | Returns the function's **source code as text**, inline in the response under `source_files` (a `{filename: contents}` map), plus dependency manifests. The tool has already downloaded and unzipped the deployment package for you — you just read the strings it returns. Use for the single-function flow, or to inspect a function `generate_upgrade_analysis` didn't deep-scan. |
 | `get_runtime_support_status` | All runtimes with deprecation/EOL dates and upgrade targets. |
 
-### Workflow
+**How code reaches you on Path M (read this if you think you "can't access the code"):** you call `get_function_code` (or `generate_upgrade_analysis`, which calls it internally) and the tool's JSON response contains the source directly — e.g. `source_files: {"lambda_function.py": "import boto3\n..."}`. You analyze those strings. You do **not** call `aws lambda get-function`, you do **not** fetch a `Code.Location` presigned URL, and you do **not** run `curl` or `unzip`. If a response ever contains a URL instead of source, you are looking at raw-CLI output, not an MCP tool result — use the MCP tools instead.
+
+### Workflow (preferred — one-shot)
 
 1. **Q&A** — run the interactive flow above to scope regions and depth.
+2. **Analyze in one call** — call `generate_upgrade_analysis`:
+   - Pass `regions=[...]` if the user named specific regions; omit `regions` to auto-discover all enabled regions.
+   - Leave `include_approaching_deprecation=true` (default) to also catch runtimes deprecating within 6 months.
+   - The tool scans every selected region in parallel, downloads + analyzes code for all CRITICAL functions (plus the top HIGH ones), runs deterministic breaking-change detection, and returns:
+     - `report_markdown` — a complete, ready-to-emit report body.
+     - `summary`, `critical_functions_by_region`, `deletion_candidates`, `grouping` — structured data if you want to reshape the output.
+3. **Emit the report** — output the `report_markdown` field **verbatim** as the report body, then append a short **Migration Playbook** and **Rollback Plan** (see template). Do not add a demo/mock-data disclaimer — the data is live from the account.
+
+### Workflow (manual — only if you need step-by-step control)
+
+1. **Q&A** — scope regions and depth.
 2. **Discover** (if needed) — `discover_lambda_regions`, present the region table, get the user's selection.
 3. **Scan (parallel)** — `get_deprecated_functions_multi_region` with the selected regions and `include_approaching_deprecation=true`.
-4. **Analyze (selective, for speed)** — for the **top 5** CRITICAL/HIGH priority functions only, call `get_function_configuration` then `get_function_code`, and check the code against `reference/runtime-migration-kb.md`. For MEDIUM/LOW functions, give guidance from the knowledge base without downloading code.
+4. **Analyze (selective, for speed)** — for the **top 5** CRITICAL/HIGH priority functions only, call `get_function_configuration` then `get_function_code`, and check the returned `source_files` against `reference/runtime-migration-kb.md`. For MEDIUM/LOW functions, give guidance from the knowledge base without downloading code.
 5. **Report** — format using the output template below.
 
 ### Single-function flow
 
-If the user named one function: `get_function_configuration` → `get_function_code` → analyze against the KB → produce just that function's section (skip the executive summary and region grouping).
+If the user named one function: `get_function_configuration` → `get_function_code` (read the returned `source_files` strings) → analyze against the KB → produce just that function's section (skip the executive summary and region grouping).
 
 ## Path A — AWS CLI
+
+> **Shell-only path.** Everything in this section requires a real shell with
+> the `aws` CLI, `curl`, and `unzip`. If you are on Path M (MCP tools, no
+> shell), do NOT use any command in this section — the equivalent work is done
+> for you server-side by `generate_upgrade_analysis` / `get_function_code`.
 
 If MCP tools aren't available but the AWS CLI is. **Parallelize** per-region calls with background jobs to stay fast.
 
@@ -136,6 +185,8 @@ Ships with the skill in the `reference/` folder. **Read it when you need it — 
 | File | When to load |
 |------|--------------|
 | `reference/runtime-migration-kb.md` | Before classifying runtimes (Path A must map status manually) and before analyzing code. Authoritative deprecation/EOL dates, upgrade targets, and per-family breaking changes for Python, Node.js, Java, .NET, Ruby, and custom runtimes. |
+
+**Deployment asset (not for reading during a task):** `mcp-server/` holds a CloudFormation template and a prebuilt Lambda zip that deploy the MCP tools Path M uses. If the user has no `lambda-runtime` tools and wants Path M, point them to `mcp-server/README.md`. Don't load the YAML or the zip into context.
 
 ## Output Template
 
@@ -215,7 +266,8 @@ Adapt the template — for a single-function request, emit just that function's 
 ## Constraints — do not violate
 
 - **Read-only.** Only call `lambda:ListFunctions`, `lambda:GetFunction`, `lambda:GetFunctionConfiguration`, and `ec2:DescribeRegions`. Never call `UpdateFunctionConfiguration`, `UpdateFunctionCode`, `DeleteFunction`, `PublishVersion`, or any other mutating API. This skill only *recommends* upgrades — it never performs them.
-- **Never fabricate.** Only list code changes you can VERIFY from actual downloaded source. If code can't be downloaded (container image), say so and give generic KB-based guidance. Don't invent library versions, deprecation dates, or breaking changes.
+- **Never fabricate.** Only list code changes you can VERIFY from actual source. On Path M the source is the `source_files` text returned by `get_function_code` / `generate_upgrade_analysis`; on Path A it's the unzipped files. If code can't be obtained (container image), say so and give generic KB-based guidance. Don't invent library versions, deprecation dates, or breaking changes.
+- **Use the right code-access path.** On Path M (MCP tools), read the source from the tool response's `source_files` / `report_markdown`. Never attempt `aws lambda get-function`, a `Code.Location` presigned URL, `curl`, `unzip`, or a filesystem read on Path M — you have no shell and those will fail. "I can't download/unzip the source" is never a valid outcome on Path M; it means you should have called `generate_upgrade_analysis` or `get_function_code` and read the strings they return.
 - **Deprecation dates come from the KB.** Use `reference/runtime-migration-kb.md` as the source of truth — the AWS CLI/API does not return runtime support status.
 - **No credential exfiltration.** Never put access keys, session tokens, or SSO refresh tokens in output. Account ID is fine.
 - **Scope before scanning.** Always run the region-selection Q&A before a multi-region scan. Don't scan every region unprompted when the user only cares about one.
@@ -227,7 +279,8 @@ Adapt the template — for a single-function request, emit just that function's 
 |-----------|----------|
 | `aws sts get-caller-identity` fails | Stop. Tell the user to authenticate (`aws sso login` or set credentials). Do not produce a report. |
 | One region returns AccessDenied | Continue. Log the gap. Mark that region as "data unavailable" and scan the rest. |
-| `get_function_code` returns empty / ImageUri | Container-image packaging — code isn't downloadable. Note it, give generic KB guidance for that function. |
+| `get_function_code` returns empty / ImageUri, or `generate_upgrade_analysis` marks a function's `code_analysis.status` as `skipped` | Container-image packaging — code isn't downloadable. Note it, give generic KB guidance for that function. This is expected, not a tool failure. |
+| You think "I can't download/unzip/read the source — no shell/file tool" | You are on Path M and reached for a shell technique. There is nothing to download. Call `generate_upgrade_analysis` (or `get_function_code`) and read the `source_files` / `report_markdown` strings it returns. |
 | Runtime not in the KB table | Label it "unknown status" — don't guess a deprecation date. Suggest checking the AWS Lambda runtime docs. |
 | No deprecated functions found | Report "All scanned functions are on active runtimes" — don't invent issues. |
 | Cross-account role not configured (Path A) | Results are single-account only — inform the user. |
