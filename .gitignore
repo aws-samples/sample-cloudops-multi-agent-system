@@ -101,3 +101,6 @@ Makefile.local
 
 # Playwright MCP runtime artifacts (snapshot yaml, console logs per test run)
 .playwright-mcp/
+
+# AgentCore Evaluations run output (contains correlation ids; restricted)
+evals/results/

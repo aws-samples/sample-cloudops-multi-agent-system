@@ -217,6 +217,11 @@ make test-integration  # End-to-end against a deployed stack (requires Cognito c
 Integration tests need `COGNITO_USERNAME` and `COGNITO_PASSWORD` in
 `scripts/.env`.
 
+Quality evaluations with Amazon Bedrock AgentCore Evaluations are opt-in and
+paid, and never run as part of `make test`. Fixture-backed scenarios:
+`make eval-fixtures`. Live read-only scenarios against the deployed stack:
+`EVAL_LIVE=1 make eval-live`. See [docs/evaluations.md](docs/evaluations.md).
+
 ---
 
 ## Teardown
@@ -294,6 +299,9 @@ make run-local-bypass     Frontend without auth (dev only)
 
 make test                 Unit tests
 make test-integration     Integration tests (requires deployed stack)
+make eval-dry-run         Validate evaluation suites (no AWS calls)
+make eval-fixtures        AgentCore Evaluations, fixture scenarios (paid)
+EVAL_LIVE=1 make eval-live  AgentCore Evaluations, live read-only scenarios (paid)
 
 make destroy              terraform destroy
 make destroy-all          Full teardown including state backend
