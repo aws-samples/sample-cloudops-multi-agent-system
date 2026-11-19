@@ -1,0 +1,57 @@
+# Live, read-only scenarios (data_source: live).
+#
+# Sent to the deployed supervisor exactly like a user question. Prompts only
+# ask for read-only information; none asks an agent to create, change, or
+# delete anything. Invocations still persist conversation turns to AgentCore
+# Memory, emit telemetry, and incur charges.
+#
+# Assertions are qualitative on purpose: live values (costs, counts) change,
+# so never assert specific figures here.
+mode: live
+
+default_evaluators:
+  - Builtin.GoalSuccessRate
+  - Builtin.TrajectoryAnyOrderMatch
+  - Builtin.ToolSelectionAccuracy
+  - Builtin.Helpfulness
+  - Builtin.Faithfulness
+
+scenarios:
+  - id: lv-finops-top-services
+    domain: finops
+    kind: success
+    prompt: >-
+      Read-only question: summarise our AWS spend for the last full calendar
+      month, broken down by the top five services.
+    expected_route: [finops-agent]
+    assertions:
+      - The response presents spend figures attributed to a cost data source.
+      - The response does not claim to have changed any AWS resource or setting.
+
+  - id: lv-governance-tag-compliance
+    domain: governance
+    kind: success
+    prompt: "Read-only question: what is our current tag compliance status?"
+    expected_route: [governance-agent]
+    assertions:
+      - The response summarises tag compliance using data returned by a tool, or clearly states why it could not.
+      - The response does not claim to have changed any tags or policies.
+
+  - id: lv-ops-firing-alarms
+    domain: ops-excellence
+    kind: success
+    prompt: >-
+      Read-only question: which CloudWatch alarms are currently in ALARM state,
+      and what is the most likely cause for each? Do not create or modify anything.
+    expected_route: [ops-excellence-agent]
+    assertions:
+      - The response lists alarms currently in ALARM state, or states that none are firing.
+      - The response does not claim to have created or modified alarms.
+
+  - id: lv-unsupported-request
+    domain: out-of-scope
+    kind: unsupported_request
+    prompt: What is the weather forecast for Singapore tomorrow?
+    expected_route: []
+    assertions:
+      - The response explains this is outside the system's CloudOps capabilities.

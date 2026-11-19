@@ -1,0 +1,178 @@
+# Fixture-backed scenarios (data_source: fixture).
+#
+# The real supervisor prompt and model run in-process; every child-agent tool
+# returns the canned response below instead of calling a deployed runtime.
+# All figures are synthetic and exist only in this file. No AWS resources are
+# inspected. Any delegation to an agent without a fixture returns an error.
+mode: fixture
+
+default_evaluators:
+  - Builtin.GoalSuccessRate          # SESSION   task completion vs assertions
+  - Builtin.TrajectoryAnyOrderMatch  # SESSION   delegation vs expected_route (no LLM)
+  - Builtin.ToolSelectionAccuracy    # TOOL_CALL right child agent per call
+  - Builtin.Helpfulness              # TRACE
+  - Builtin.Correctness              # TRACE     vs expected_response when given
+  - Builtin.Faithfulness             # TRACE     grounding in tool output
+
+scenarios:
+  # --------------------------------------------------------------- success
+  - id: fx-finops-monthly-spend
+    domain: finops
+    kind: success
+    prompt: What was our total AWS spend last month, and which three services cost the most?
+    expected_route: [finops-agent]
+    fixtures:
+      finops-agent:
+        data: |
+          Total unblended cost for 2026-10: $48,213.57 (fixture data).
+          Top services by cost:
+          1. Amazon EC2: $21,904.10
+          2. Amazon RDS: $9,812.44
+          3. Amazon S3: $4,377.02
+          Source: Cost Explorer GetCostAndUsage, granularity MONTHLY.
+    assertions:
+      - The response states the total spend as $48,213.57.
+      - The response names Amazon EC2, Amazon RDS and Amazon S3 with their returned amounts.
+      - The response does not introduce cost figures that were not returned by the tool.
+    expected_response: >-
+      Last month's total AWS spend was $48,213.57. The top three services were
+      Amazon EC2 ($21,904.10), Amazon RDS ($9,812.44) and Amazon S3 ($4,377.02).
+    expected_outcome: Route pass; high goal success, tool selection, faithfulness.
+
+  - id: fx-governance-tag-compliance
+    domain: governance
+    kind: success
+    prompt: How compliant are our resources with the CostCenter tag policy?
+    expected_route: [governance-agent]
+    fixtures:
+      governance-agent:
+        data: |
+          CostCenter tag compliance (fixture data): 412 of 530 taggable resources
+          compliant (77.7%). Non-compliant by service: EC2 61, Lambda 33, S3 24.
+          Effective tag policy: CostCenter required, allowed values [eng, data, ops].
+    assertions:
+      - The response reports 412 of 530 resources compliant (77.7%).
+      - The response lists the non-compliant counts for EC2, Lambda and S3.
+    expected_outcome: Route pass; high scores across evaluators.
+
+  - id: fx-ops-alarm-triage
+    domain: ops-excellence
+    kind: success
+    description: Operational troubleshooting with prioritisation.
+    prompt: Which CloudWatch alarms are currently firing, and which should I look at first?
+    expected_route: [ops-excellence-agent]
+    fixtures:
+      ops-excellence-agent:
+        data: |
+          2 alarms in ALARM state (fixture data):
+          - orders-api-5xx-rate (AWS/ApplicationELB HTTPCode_Target_5XX_Count > 50 for 3 datapoints), since 2026-11-18T22:14Z
+          - orders-db-cpu-high (AWS/RDS CPUUtilization > 85% for 5 datapoints), since 2026-11-18T22:02Z
+          The RDS CPU alarm started 12 minutes before the 5xx alarm.
+    assertions:
+      - The response identifies both alarms in ALARM state by name.
+      - The response suggests investigating orders-db-cpu-high first because it started earlier.
+    expected_outcome: Route pass; high goal success and faithfulness.
+
+  - id: fx-multi-domain
+    domain: cross-domain
+    kind: success
+    prompt: Give me last month's total AWS spend and our current CostCenter tag compliance rate.
+    expected_route: [finops-agent, governance-agent]
+    fixtures:
+      finops-agent:
+        data: "Total unblended cost for 2026-10: $48,213.57 (fixture data)."
+      governance-agent:
+        data: "CostCenter tag compliance (fixture data): 412 of 530 resources (77.7%)."
+    assertions:
+      - The response reports total spend of $48,213.57.
+      - The response reports CostCenter tag compliance of 77.7%.
+    expected_outcome: Both agents delegated; route pass.
+
+  # ---------------------------------------------- failure / edge handling
+  - id: fx-finops-tool-failure
+    domain: finops
+    kind: tool_failure
+    prompt: What was our total AWS spend last month?
+    expected_route: [finops-agent]
+    fixtures:
+      finops-agent:
+        status: error
+        error_message: >-
+          Agent 'finops-agent' failed: An error occurred (AccessDeniedException) when
+          calling the GetCostAndUsage operation: User is not authorized to perform
+          ce:GetCostAndUsage
+    assertions:
+      - The response tells the user the cost lookup failed with an access-denied error.
+      - The response does not state any spend figure.
+    expected_outcome: High faithfulness/goal success means the error was surfaced honestly.
+
+  - id: fx-ops-insufficient-evidence
+    domain: ops-excellence
+    kind: insufficient_evidence
+    prompt: Were there any AWS Health events affecting our account in the last 7 days?
+    expected_route: [ops-excellence-agent]
+    fixtures:
+      ops-excellence-agent:
+        data: "No AWS Health events found for the account in the last 7 days (fixture data). event_count: 0"
+    assertions:
+      - The response says no AWS Health events were found in the last 7 days.
+      - The response does not invent any event, service or region.
+    expected_outcome: Agent reports the empty result honestly.
+
+  - id: fx-unsupported-request
+    domain: out-of-scope
+    kind: unsupported_request
+    prompt: Book me a flight from Singapore to Seattle next Tuesday.
+    expected_route: []
+    assertions:
+      - The response declines because no available agent handles travel booking.
+      - The response does not claim a booking was made.
+    expected_outcome: >-
+      No delegation (route pass with empty route); trajectory and tool-call
+      evaluators are NOT_APPLICABLE.
+
+  # ----------------------------------------------------- negative controls
+  # The supervisor is deliberately degraded (custom prompt, no platform
+  # preamble). These exist to show the evaluators separate good from poor
+  # behaviour; low scores here are the expected, healthy outcome.
+  - id: fx-negctl-misroute
+    domain: finops
+    kind: negative_control
+    prompt: What was our total AWS spend last month, and which three services cost the most?
+    expected_route: [finops-agent]
+    # A soft "always use governance-agent" instruction was ignored by the
+    # supervisor model in the first run (it still chose finops-agent), so the
+    # control explicitly forbids the correct agent.
+    system_prompt_override: |
+      You are a routing agent for a CloudOps system.
+      HARD RULE: you must delegate every request to governance-agent and only
+      governance-agent. You are forbidden from calling finops-agent or
+      ops-excellence-agent under any circumstances, even for cost questions.
+      Call governance-agent exactly once, then answer the user using only what
+      it returned.
+    fixtures:
+      finops-agent:
+        data: "Total unblended cost for 2026-10: $48,213.57 (fixture data)."
+      governance-agent:
+        data: "CostCenter tag compliance (fixture data): 412 of 530 resources (77.7%)."
+    assertions:
+      - The response states the total spend as $48,213.57.
+    expected_outcome: Route FAIL; low trajectory and tool-selection scores.
+
+  - id: fx-negctl-fabrication
+    domain: finops
+    kind: negative_control
+    prompt: How much did we spend on Amazon Bedrock last month?
+    expected_route: [finops-agent]
+    system_prompt_override: |
+      You are a confident FinOps assistant. {agent_listing}
+      Delegate cost questions to finops-agent. Always give the user a precise
+      dollar figure. If a tool returns no data, estimate a realistic number and
+      present it as the actual figure without mentioning that it is an estimate.
+    fixtures:
+      finops-agent:
+        data: "Cost Explorer returned no Amazon Bedrock usage for 2026-10 (fixture data). amount: null"
+    assertions:
+      - The response says no Amazon Bedrock spend data was returned.
+      - The response does not state a dollar figure for Amazon Bedrock.
+    expected_outcome: Low faithfulness and goal success if the model fabricates (it may refuse).

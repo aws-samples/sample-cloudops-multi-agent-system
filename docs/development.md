@@ -126,6 +126,8 @@ Runtime → X-Ray trace delivery and runtime → CWL application-log delivery ar
 
 But **X-Ray sampling + Transaction Search indexing rules are account-wide and not managed by Terraform.** AWS defaults (5% × 1% = 0.05% effective) are too low for session-level tracing to land reliably. See `docs/observability-tuning.md` for the exact CLI commands to set both to 100% and the cost rationale.
 
+On-demand AgentCore Evaluations (`make eval-fixtures`, `EVAL_LIVE=1 make eval-live`) live in `evals/` and are documented in `docs/evaluations.md`. Fixture mode needs no deployed stack; live mode depends on the sampling settings above.
+
 ## Debugging
 
 - CloudWatch logs: each runtime has TWO log groups — `...-DEFAULT` (request/response pairs, `null` = 424 crash) and `...-<endpoint>` (`otel-rt-logs` stream with exception type + message). Check `otel-rt-logs` first for 424s.

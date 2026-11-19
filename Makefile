@@ -3,7 +3,7 @@
 # Common commands for development, testing, and deployment.
 # Run `make help` to see all available targets.
 
-.PHONY: help setup configure quickstart reconfigure-shared nuke-shared-config test test-unit test-integration test-topology test-scripts lint plan deploy deploy-auto destroy destroy-all package build-agents clean
+.PHONY: help setup configure quickstart reconfigure-shared nuke-shared-config test test-unit test-integration test-topology test-scripts eval-dry-run eval-fixtures eval-live lint plan deploy deploy-auto destroy destroy-all package build-agents clean
 
 SHELL := /bin/bash
 
@@ -80,6 +80,27 @@ test-topology: ## Run ONLY the topology tests (slice + terraform validate, no AW
 
 test-scripts: ## Run shell-level unit tests for scripts/lib/* (auth.sh, cmd_setup, ...)
 	@for t in tests/scripts/test_*.sh; do echo "==> $$t"; bash "$$t" || exit 1; done
+
+# ---------------------------------------------------------------------------
+# AgentCore Evaluations (opt-in, paid; never part of `make test`)
+# See docs/evaluations.md. Pass extra flags via EVAL_ARGS, e.g.
+#   make eval-fixtures EVAL_ARGS="--scenario fx-finops-monthly-spend"
+# ---------------------------------------------------------------------------
+EVAL_ARGS ?=
+
+eval-dry-run: ## Validate evaluation suites and print the plan (no AWS calls)
+	$(PYTHON) -m evals.runner --mode fixture --dry-run $(EVAL_ARGS)
+	$(PYTHON) -m evals.runner --mode live --dry-run $(EVAL_ARGS)
+
+eval-fixtures: ## Fixture-backed AgentCore Evaluations run (Bedrock + Evaluations charges, no deployed stack needed)
+	$(PYTHON) -m evals.runner --mode fixture $(EVAL_ARGS)
+
+eval-live: ## Live read-only AgentCore Evaluations run against the deployed stack (requires EVAL_LIVE=1)
+	@if [ "$$EVAL_LIVE" != "1" ]; then \
+		echo "eval-live invokes the deployed supervisor and incurs charges. Re-run with EVAL_LIVE=1 make eval-live"; \
+		exit 1; \
+	fi
+	EVAL_LIVE=1 $(PYTHON) -m evals.runner --mode live $(EVAL_ARGS)
 
 # ---------------------------------------------------------------------------
 # Deployment
