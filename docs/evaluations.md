@@ -210,10 +210,46 @@ suite creates no evaluators, configurations, or other AWS resources.
   worth reading: the deterministic check is ground truth for *which* agents
   were called; the evaluator judges whether each call was reasonable.
 
-### Baseline
+- Session/tool-level evaluators and trace-level evaluators answer different
+  questions. In the mis-routing control the supervisor called the wrong
+  agent (route FAIL; GoalSuccessRate, Trajectory, ToolSelectionAccuracy all
+  0.00), yet Helpfulness, Correctness and Faithfulness scored 1.00 because
+  the final answer honestly reported the irrelevant data it received.
+  Trace-level scores judge the answer *given its evidence*, not whether the
+  evidence came from the right place. Read them together.
+- Expect judge variance: across two otherwise identical baseline runs,
+  Helpfulness for `fx-unsupported-request` moved 0.50 → 1.00.
 
-_To be recorded from the first full fixture and live runs (date, commit,
-model, summary table)._
+### Baseline (fixture, 2026-11-19)
+
+Supervisor model `global.anthropic.claude-opus-4-6-v1` (from
+`hierarchy.json`), region us-east-1, `bedrock-agentcore` 1.18.1,
+`strands-agents` 1.40.0. Evaluator usage for the full suite: ~49K input /
+~8K output tokens (≈ $0.21 at built-in evaluator pricing), plus supervisor
+model calls.
+
+| Scenario | Kind | Route | GoalSuccess | Trajectory | ToolSelection | Helpfulness | Correctness | Faithfulness |
+|---|---|---|---|---|---|---|---|---|
+| `fx-finops-monthly-spend` | success | pass | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 |
+| `fx-governance-tag-compliance` | success | pass | 1.00 | 1.00 | 1.00 | 0.83 | 1.00 | 1.00 |
+| `fx-ops-alarm-triage` | success | pass | 1.00 | 1.00 | 1.00 | 0.83 | 1.00 | 1.00 |
+| `fx-multi-domain` | success | pass | 1.00 | 1.00 | 1.00 (n=2) | 1.00 | 1.00 | 1.00 |
+| `fx-finops-tool-failure` | tool_failure | pass | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 |
+| `fx-ops-insufficient-evidence` | insufficient_evidence | pass | 1.00 | 1.00 | 1.00 | 0.83 | 1.00 | 1.00 |
+| `fx-unsupported-request` | unsupported_request | pass | 1.00 | n/a | n/a | 1.00 | 1.00 | 1.00 |
+| `fx-negctl-misroute` | negative_control | **FAIL** | **0.00** | **0.00** | **0.00** | 1.00 | 1.00 | 1.00 |
+| `fx-negctl-fabrication` | negative_control | pass | **0.00** | 1.00 | 1.00 | **0.00** | **0.00** | **0.00** |
+
+Reading it: every non-control scenario, including tool failure, empty
+evidence, and the unsupported request, is handled well. Both negative
+controls separate cleanly from their success counterparts on the
+evaluators that target the degraded behaviour (routing for mis-routing;
+grounding/correctness for fabrication), which is evidence the evaluators
+discriminate. The first version of the mis-routing control used a soft
+instruction that the supervisor model ignored, and scored like a success;
+it now forbids the correct agent explicitly.
+
+Live baseline: not yet recorded.
 
 ## Access control (pending #29)
 
