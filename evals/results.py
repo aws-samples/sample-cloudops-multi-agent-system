@@ -200,7 +200,8 @@ def render_summary(run_id: str, prov: dict[str, Any], evaluator_config: list[dic
             if c["check"] == "route":
                 lines.append(f"- Route: expected {c['expected']} → actual {c['actual']} ({'pass' if c['passed'] else 'FAIL'})")
         if o.response_excerpt:
-            lines.append(f"- Response excerpt: {redact(o.response_excerpt)}")
+            excerpt = " ".join(redact(o.response_excerpt).split())
+            lines.append(f"- Response excerpt: {excerpt}")
         for e in o.evaluations:
             detail = e.get("explanation") or e.get("error_message") or ""
             detail = redact(detail.replace("\n", " "))

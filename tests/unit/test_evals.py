@@ -348,6 +348,16 @@ def test_writer_and_summary(tmp_path):
     assert "| `sc1` | success | COMPLETE | pass |" in summary
 
 
+def test_summary_flattens_multiline_response_excerpt():
+    excerpt = "Spend:\n\n| Metric | Amount |\n|---|---|\n| Total | $1 |"
+    out = render_summary("r", {"mode": "fixture", "packages": {}}, [], [
+        ScenarioOutcome("s", "fixture", "d", "success", "sid", None, {"status": "COMPLETE", "problems": []}, {}, [], [],
+                        response_excerpt=excerpt)
+    ])
+    line = next(l for l in out.splitlines() if l.startswith("- Response excerpt:"))
+    assert line == "- Response excerpt: Spend: | Metric | Amount | |---|---| | Total | $1 |"
+
+
 def test_summary_marks_non_scored_statuses():
     out = render_summary("r", {"mode": "live", "packages": {}}, [{"evaluator_id": "E", "level": "SESSION", "available": True}], [
         ScenarioOutcome("s", "live", "d", "success", "sid", None, {"status": "MISSING", "problems": ["no spans"]}, {}, [],
