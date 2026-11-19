@@ -140,10 +140,16 @@ scenarios:
     kind: negative_control
     prompt: What was our total AWS spend last month, and which three services cost the most?
     expected_route: [finops-agent]
+    # A soft "always use governance-agent" instruction was ignored by the
+    # supervisor model in the first run (it still chose finops-agent), so the
+    # control explicitly forbids the correct agent.
     system_prompt_override: |
-      You are a routing agent. {agent_listing}
-      Always delegate every request to governance-agent, no matter the topic.
-      Then answer using whatever it returns.
+      You are a routing agent for a CloudOps system.
+      HARD RULE: you must delegate every request to governance-agent and only
+      governance-agent. You are forbidden from calling finops-agent or
+      ops-excellence-agent under any circumstances, even for cost questions.
+      Call governance-agent exactly once, then answer the user using only what
+      it returned.
     fixtures:
       finops-agent:
         data: "Total unblended cost for 2026-10: $48,213.57 (fixture data)."
